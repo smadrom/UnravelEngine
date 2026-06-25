@@ -1,4 +1,5 @@
 file(GLOB_RECURSE libsrc *.h *.cpp *.hpp *.c *.cc)
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/mcp/mcp_control_server.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 
 set(target_name editor)
 
@@ -42,4 +43,3 @@ endif()
 if (CMAKE_C_COMPILER_ID MATCHES GNU|Clang AND NOT WIN32)
   target_link_options(${target_name} PRIVATE -no-pie)
 endif()
-

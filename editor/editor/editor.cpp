@@ -14,6 +14,7 @@
 #include "events.h"
 #include "hub/hub.h"
 #include "imgui/imgui_interface.h"
+#include "mcp/mcp_system.h"
 #include "system/project_manager.h"
 #include "system/version_manager.h"
 #include <filedialog/filedialog.h>
@@ -53,6 +54,7 @@ auto editor::create(rtti::context& ctx, cmd_line::parser& parser) -> bool
     ctx.add<hub>(ctx);
     ctx.add<editing_manager>();
     ctx.add<picking_manager>();
+    ctx.add<mcp_system>();
     ctx.add<thumbnail_manager>();
     ctx.add<asset_watcher>();
     ctx.add<version_manager>();
@@ -168,6 +170,12 @@ auto editor::init(const cmd_line::parser& parser) -> bool
         return false;
     }
 
+    ls.begin_module("MCP");
+    if(!ls.check(ctx.get_cached<mcp_system>().init(ctx)))
+    {
+        return false;
+    }
+
     ls.begin_module("Thumbnails");
     if(!ls.check(ctx.get_cached<thumbnail_manager>().init(ctx)))
     {
@@ -204,6 +212,10 @@ auto editor::deinit() -> bool
 {
     auto& ctx = engine::context();
 
+    if(!ctx.get_cached<mcp_system>().deinit(ctx))
+    {
+        return false;
+    }
 
     if(!ctx.get_cached<thumbnail_manager>().deinit(ctx))
     {
@@ -262,6 +274,7 @@ auto editor::destroy() -> bool
     ctx.remove<asset_watcher>();
     ctx.remove<thumbnail_manager>();
     ctx.remove<picking_manager>();
+    ctx.remove<mcp_system>();
     ctx.remove<editing_manager>();
 
     ctx.remove<hub>();

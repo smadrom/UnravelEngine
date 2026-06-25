@@ -171,7 +171,9 @@ if (MSVC)
 
 endif()
 
-set(UNRAVEL_UNITY_BUILD ON)
+if(NOT DEFINED UNRAVEL_UNITY_BUILD)
+  set(UNRAVEL_UNITY_BUILD ON)
+endif()
 
 add_subdirectory(deps)
 #add_subdirectory(version)
@@ -413,4 +415,3 @@ if(UNIX AND NOT APPLE)
 endif()
 # Include CPack
 include(CPack)
-
