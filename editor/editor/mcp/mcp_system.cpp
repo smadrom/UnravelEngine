@@ -37,6 +37,8 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace unravel
 {
@@ -119,14 +121,41 @@ auto read_material_texture_ref(const std::string& content_root, const std::strin
     return texture_ref;
 }
 
-auto read_login_terrain_albedo_ref(const std::string& content_root) -> std::string
+void add_unique_terrain_albedo_ref(std::vector<std::string>& refs, std::string ref)
 {
+    if(ref.empty())
+    {
+        return;
+    }
+    if(std::find(refs.begin(), refs.end(), ref) == refs.end())
+    {
+        refs.emplace_back(std::move(ref));
+    }
+}
+
+auto read_login_terrain_albedo_refs(const std::string& content_root) -> std::vector<std::string>
+{
+    std::vector<std::string> refs;
     try
     {
         const auto layers_doc = read_json_asset(make_asset_key(content_root, "terrain/login/layers.json"));
+        if(layers_doc.contains("bakedAlbedo") && layers_doc["bakedAlbedo"].is_object())
+        {
+            const auto& baked_albedo = layers_doc["bakedAlbedo"];
+            if(baked_albedo.contains("path") && baked_albedo["path"].is_string())
+            {
+                const auto baked_albedo_ref = baked_albedo["path"].get<std::string>();
+                if(!baked_albedo_ref.empty())
+                {
+                    APPLOG_INFO("load_login terrain albedo baked preference: ref='{}'", baked_albedo_ref);
+                    add_unique_terrain_albedo_ref(refs, baked_albedo_ref);
+                }
+            }
+        }
+
         if(!layers_doc.contains("layers") || !layers_doc["layers"].is_array())
         {
-            return {};
+            return refs;
         }
 
         for(const auto& layer : layers_doc["layers"])
@@ -145,7 +174,7 @@ auto read_login_terrain_albedo_ref(const std::string& content_root) -> std::stri
             const auto albedo_ref = albedo["path"].get<std::string>();
             if(!albedo_ref.empty())
             {
-                return albedo_ref;
+                add_unique_terrain_albedo_ref(refs, albedo_ref);
             }
         }
     }
@@ -153,7 +182,7 @@ auto read_login_terrain_albedo_ref(const std::string& content_root) -> std::stri
     {
     }
 
-    return {};
+    return refs;
 }
 
 auto read_vec3_member(const json& item, const char* key) -> math::vec3
@@ -380,54 +409,57 @@ auto load_login_terrain_albedo(rtti::context& ctx, const std::string& content_ro
 {
     try
     {
-        const auto albedo_ref = read_login_terrain_albedo_ref(content_root);
-        if(albedo_ref.empty())
+        const auto albedo_refs = read_login_terrain_albedo_refs(content_root);
+        if(albedo_refs.empty())
         {
-            return {};
-        }
-
-        const auto texture_key = fs::has_known_protocol(albedo_ref) ? albedo_ref : make_asset_key(content_root, albedo_ref);
-        const auto texture_path = fs::resolve_protocol(texture_key);
-        fs::error_code exists_ec;
-        if(!fs::exists(texture_path, exists_ec) || exists_ec)
-        {
-            APPLOG_INFO("load_login terrain albedo missing: ref='{}' key='{}' path='{}'",
-                        albedo_ref,
-                        texture_key,
-                        texture_path.generic_string());
             return {};
         }
 
         auto& am = ctx.get_cached<asset_manager>();
-        auto texture_handle = am.get_asset<gfx::texture>(texture_key, load_flags::standard);
-        texture_handle.submit();
-
-        auto texture_instance = texture_handle.is_valid() ? texture_handle.get(true) : std::shared_ptr<gfx::texture>{};
-        const bool texture_loaded = static_cast<bool>(texture_instance);
-        const bool native_valid = texture_instance && texture_instance->is_valid();
-        const auto native_idx = native_valid ? texture_instance->native_handle().idx : bgfx::kInvalidHandle;
-        const auto width = texture_instance ? texture_instance->info.width : 0;
-        const auto height = texture_instance ? texture_instance->info.height : 0;
-        const auto format = texture_instance ? static_cast<int>(texture_instance->info.format) : -1;
-        const bool texture_usable = native_valid && width > 0 && height > 0;
-
-        APPLOG_INFO("load_login terrain albedo requested: ref='{}' key='{}' handle_valid={} ready={} loaded={} "
-                    "native_valid={} native_idx={} width={} height={} format={} usable={}",
-                    albedo_ref,
-                    texture_key,
-                    texture_handle.is_valid(),
-                    texture_handle.is_ready(),
-                    texture_loaded,
-                    native_valid,
-                    native_idx,
-                    width,
-                    height,
-                    format,
-                    texture_usable);
-
-        if(texture_usable)
+        for(const auto& albedo_ref : albedo_refs)
         {
-            return texture_handle;
+            const auto texture_key = fs::has_known_protocol(albedo_ref) ? albedo_ref : make_asset_key(content_root, albedo_ref);
+            const auto texture_path = fs::resolve_protocol(texture_key);
+            fs::error_code exists_ec;
+            if(!fs::exists(texture_path, exists_ec) || exists_ec)
+            {
+                APPLOG_INFO("load_login terrain albedo missing: ref='{}' key='{}' path='{}'",
+                            albedo_ref,
+                            texture_key,
+                            texture_path.generic_string());
+                continue;
+            }
+
+            auto texture_handle = am.get_asset<gfx::texture>(texture_key, load_flags::standard);
+            texture_handle.submit();
+
+            auto texture_instance = texture_handle.is_valid() ? texture_handle.get(true) : std::shared_ptr<gfx::texture>{};
+            const bool texture_loaded = static_cast<bool>(texture_instance);
+            const bool native_valid = texture_instance && texture_instance->is_valid();
+            const auto native_idx = native_valid ? texture_instance->native_handle().idx : bgfx::kInvalidHandle;
+            const auto width = texture_instance ? texture_instance->info.width : 0;
+            const auto height = texture_instance ? texture_instance->info.height : 0;
+            const auto format = texture_instance ? static_cast<int>(texture_instance->info.format) : -1;
+            const bool texture_usable = native_valid && width > 0 && height > 0;
+
+            APPLOG_INFO("load_login terrain albedo requested: ref='{}' key='{}' handle_valid={} ready={} loaded={} "
+                        "native_valid={} native_idx={} width={} height={} format={} usable={}",
+                        albedo_ref,
+                        texture_key,
+                        texture_handle.is_valid(),
+                        texture_handle.is_ready(),
+                        texture_loaded,
+                        native_valid,
+                        native_idx,
+                        width,
+                        height,
+                        format,
+                        texture_usable);
+
+            if(texture_usable)
+            {
+                return texture_handle;
+            }
         }
         return {};
     }
