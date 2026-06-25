@@ -119,6 +119,43 @@ auto read_material_texture_ref(const std::string& content_root, const std::strin
     return texture_ref;
 }
 
+auto read_login_terrain_albedo_ref(const std::string& content_root) -> std::string
+{
+    try
+    {
+        const auto layers_doc = read_json_asset(make_asset_key(content_root, "terrain/login/layers.json"));
+        if(!layers_doc.contains("layers") || !layers_doc["layers"].is_array())
+        {
+            return {};
+        }
+
+        for(const auto& layer : layers_doc["layers"])
+        {
+            if(!layer.is_object() || !layer.contains("albedo") || !layer["albedo"].is_object())
+            {
+                continue;
+            }
+
+            const auto& albedo = layer["albedo"];
+            if(!albedo.contains("path") || !albedo["path"].is_string())
+            {
+                continue;
+            }
+
+            const auto albedo_ref = albedo["path"].get<std::string>();
+            if(!albedo_ref.empty())
+            {
+                return albedo_ref;
+            }
+        }
+    }
+    catch(const std::exception&)
+    {
+    }
+
+    return {};
+}
+
 auto read_vec3_member(const json& item, const char* key) -> math::vec3
 {
     if(!item.contains(key) || !item[key].is_array() || item[key].size() < 3)
@@ -339,6 +376,68 @@ auto create_login_terrain_debug_albedo(rtti::context& ctx, const terrain_heightf
     return am.get_asset_from_instance<gfx::texture>("app:/generated/login_terrain_debug_albedo", texture);
 }
 
+auto load_login_terrain_albedo(rtti::context& ctx, const std::string& content_root) -> asset_handle<gfx::texture>
+{
+    try
+    {
+        const auto albedo_ref = read_login_terrain_albedo_ref(content_root);
+        if(albedo_ref.empty())
+        {
+            return {};
+        }
+
+        const auto texture_key = fs::has_known_protocol(albedo_ref) ? albedo_ref : make_asset_key(content_root, albedo_ref);
+        const auto texture_path = fs::resolve_protocol(texture_key);
+        fs::error_code exists_ec;
+        if(!fs::exists(texture_path, exists_ec) || exists_ec)
+        {
+            APPLOG_INFO("load_login terrain albedo missing: ref='{}' key='{}' path='{}'",
+                        albedo_ref,
+                        texture_key,
+                        texture_path.generic_string());
+            return {};
+        }
+
+        auto& am = ctx.get_cached<asset_manager>();
+        auto texture_handle = am.get_asset<gfx::texture>(texture_key, load_flags::standard);
+        texture_handle.submit();
+
+        auto texture_instance = texture_handle.is_valid() ? texture_handle.get(true) : std::shared_ptr<gfx::texture>{};
+        const bool texture_loaded = static_cast<bool>(texture_instance);
+        const bool native_valid = texture_instance && texture_instance->is_valid();
+        const auto native_idx = native_valid ? texture_instance->native_handle().idx : bgfx::kInvalidHandle;
+        const auto width = texture_instance ? texture_instance->info.width : 0;
+        const auto height = texture_instance ? texture_instance->info.height : 0;
+        const auto format = texture_instance ? static_cast<int>(texture_instance->info.format) : -1;
+        const bool texture_usable = native_valid && width > 0 && height > 0;
+
+        APPLOG_INFO("load_login terrain albedo requested: ref='{}' key='{}' handle_valid={} ready={} loaded={} "
+                    "native_valid={} native_idx={} width={} height={} format={} usable={}",
+                    albedo_ref,
+                    texture_key,
+                    texture_handle.is_valid(),
+                    texture_handle.is_ready(),
+                    texture_loaded,
+                    native_valid,
+                    native_idx,
+                    width,
+                    height,
+                    format,
+                    texture_usable);
+
+        if(texture_usable)
+        {
+            return texture_handle;
+        }
+        return {};
+    }
+    catch(const std::exception&)
+    {
+    }
+
+    return {};
+}
+
 auto positions_match(const math::vec3& lhs, const math::vec3& rhs) -> bool
 {
     const auto delta = lhs - rhs;
@@ -413,7 +512,7 @@ auto make_login_buildings(const std::string& content_root, const terrain_heightf
     return result;
 }
 
-void create_login_terrain(rtti::context& ctx, const terrain_heightfield& terrain)
+void create_login_terrain(rtti::context& ctx, const std::string& content_root, const terrain_heightfield& terrain)
 {
     auto terrain_mesh = std::make_shared<mesh>();
     const bool created = terrain_mesh->create_heightfield(gfx::mesh_vertex::get_layout(),
@@ -438,10 +537,21 @@ void create_login_terrain(rtti::context& ctx, const terrain_heightfield& terrain
     material_instance->set_metalness(0.0f);
     material_instance->set_roughness(0.85f);
     material_instance->set_cull_type(cull_type::none);
-    auto terrain_albedo = create_login_terrain_debug_albedo(ctx, terrain);
+
+    auto terrain_albedo = load_login_terrain_albedo(ctx, content_root);
     if(terrain_albedo.is_valid())
     {
         material_instance->set_color_map(terrain_albedo);
+        APPLOG_INFO("load_login terrain albedo selected: imported");
+    }
+    else
+    {
+        terrain_albedo = create_login_terrain_debug_albedo(ctx, terrain);
+        if(terrain_albedo.is_valid())
+        {
+            material_instance->set_color_map(terrain_albedo);
+            APPLOG_INFO("load_login terrain albedo selected: generated debug fallback");
+        }
     }
 
     model terrain_model;
@@ -858,7 +968,7 @@ void mcp_system::service_login_loader(rtti::context& ctx)
         {
             if(!login_.terrain_created)
             {
-                create_login_terrain(ctx, login_.terrain);
+                create_login_terrain(ctx, login_.content_root, login_.terrain);
                 login_.terrain_created = true;
             }
 
