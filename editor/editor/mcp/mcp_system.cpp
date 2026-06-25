@@ -59,6 +59,21 @@ auto normalize_content_root(std::string root) -> std::string
     {
         root.pop_back();
     }
+
+    if(!fs::has_known_protocol(root))
+    {
+        const auto protocol_root = fs::convert_to_protocol(root).generic_string();
+        if(fs::has_known_protocol(protocol_root))
+        {
+            root = protocol_root;
+        }
+    }
+
+    if(!fs::has_known_protocol(root))
+    {
+        throw std::runtime_error("load_login: content_root must use a known asset protocol, got '" + root + "'");
+    }
+
     return root;
 }
 
@@ -224,6 +239,106 @@ struct login_buildings_parse_result
     uint32_t duplicate_skipped = 0;
 };
 
+struct terrain_rgb
+{
+    uint8_t r = 0;
+    uint8_t g = 0;
+    uint8_t b = 0;
+};
+
+auto mix_channel(uint8_t a, uint8_t b, float t) -> uint8_t
+{
+    const float clamped = std::clamp(t, 0.0f, 1.0f);
+    return static_cast<uint8_t>(std::round(static_cast<float>(a) + (static_cast<float>(b) - static_cast<float>(a)) * clamped));
+}
+
+auto mix_color(terrain_rgb a, terrain_rgb b, float t) -> terrain_rgb
+{
+    return {mix_channel(a.r, b.r, t), mix_channel(a.g, b.g, t), mix_channel(a.b, b.b, t)};
+}
+
+auto terrain_height_color(float h) -> terrain_rgb
+{
+    h = std::clamp(h, 0.0f, 1.0f);
+
+    constexpr terrain_rgb low{78, 93, 55};
+    constexpr terrain_rgb grass{103, 122, 63};
+    constexpr terrain_rgb earth{132, 104, 70};
+    constexpr terrain_rgb rock{137, 132, 119};
+    constexpr terrain_rgb high{176, 173, 158};
+
+    if(h < 0.28f)
+    {
+        return mix_color(low, grass, h / 0.28f);
+    }
+    if(h < 0.55f)
+    {
+        return mix_color(grass, earth, (h - 0.28f) / 0.27f);
+    }
+    if(h < 0.82f)
+    {
+        return mix_color(earth, rock, (h - 0.55f) / 0.27f);
+    }
+    return mix_color(rock, high, (h - 0.82f) / 0.18f);
+}
+
+auto create_login_terrain_debug_albedo(rtti::context& ctx, const terrain_heightfield& terrain) -> asset_handle<gfx::texture>
+{
+    if(!terrain.is_valid())
+    {
+        return {};
+    }
+
+    std::vector<uint8_t> pixels(static_cast<size_t>(terrain.width) * static_cast<size_t>(terrain.height) * 4u, 255u);
+    const auto sample_normalized = [&terrain](uint32_t x, uint32_t y) -> float
+    {
+        x = std::min(x, terrain.width - 1u);
+        y = std::min(y, terrain.height - 1u);
+        return terrain.heights[static_cast<size_t>(y) * static_cast<size_t>(terrain.width) + static_cast<size_t>(x)];
+    };
+
+    for(uint32_t y = 0; y < terrain.height; ++y)
+    {
+        for(uint32_t x = 0; x < terrain.width; ++x)
+        {
+            const float h = sample_normalized(x, y);
+            const float hx0 = sample_normalized(x > 0 ? x - 1u : x, y);
+            const float hx1 = sample_normalized(std::min(x + 1u, terrain.width - 1u), y);
+            const float hy0 = sample_normalized(x, y > 0 ? y - 1u : y);
+            const float hy1 = sample_normalized(x, std::min(y + 1u, terrain.height - 1u));
+            const float slope = std::clamp(std::sqrt((hx1 - hx0) * (hx1 - hx0) + (hy1 - hy0) * (hy1 - hy0)) * 18.0f,
+                                           0.0f,
+                                           1.0f);
+
+            auto color = terrain_height_color(h);
+            color = mix_color(color, terrain_rgb{128, 128, 118}, slope * 0.55f);
+            const float shade = 0.82f + h * 0.20f;
+
+            const size_t offset = (static_cast<size_t>(y) * static_cast<size_t>(terrain.width) + static_cast<size_t>(x)) * 4u;
+            pixels[offset + 0u] = static_cast<uint8_t>(std::clamp(std::round(static_cast<float>(color.r) * shade), 0.0f, 255.0f));
+            pixels[offset + 1u] = static_cast<uint8_t>(std::clamp(std::round(static_cast<float>(color.g) * shade), 0.0f, 255.0f));
+            pixels[offset + 2u] = static_cast<uint8_t>(std::clamp(std::round(static_cast<float>(color.b) * shade), 0.0f, 255.0f));
+            pixels[offset + 3u] = 255u;
+        }
+    }
+
+    const auto* mem = gfx::copy(pixels.data(), static_cast<uint32_t>(pixels.size()));
+    auto texture = std::make_shared<gfx::texture>(static_cast<uint16_t>(terrain.width),
+                                                  static_cast<uint16_t>(terrain.height),
+                                                  false,
+                                                  1,
+                                                  gfx::texture_format::RGBA8,
+                                                  BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
+                                                  mem);
+    if(!texture || !texture->is_valid())
+    {
+        return {};
+    }
+
+    auto& am = ctx.get_cached<asset_manager>();
+    return am.get_asset_from_instance<gfx::texture>("app:/generated/login_terrain_debug_albedo", texture);
+}
+
 auto positions_match(const math::vec3& lhs, const math::vec3& rhs) -> bool
 {
     const auto delta = lhs - rhs;
@@ -323,6 +438,11 @@ void create_login_terrain(rtti::context& ctx, const terrain_heightfield& terrain
     material_instance->set_metalness(0.0f);
     material_instance->set_roughness(0.85f);
     material_instance->set_cull_type(cull_type::none);
+    auto terrain_albedo = create_login_terrain_debug_albedo(ctx, terrain);
+    if(terrain_albedo.is_valid())
+    {
+        material_instance->set_color_map(terrain_albedo);
+    }
 
     model terrain_model;
     terrain_model.set_lod(terrain_handle, 0);
@@ -577,6 +697,12 @@ void mcp_system::request_screenshot(const std::string& path, uint32_t w, uint32_
     pending_.active = true;
     pending_.readback_started = false;
     pending_.pixels.clear();
+    pending_.last_path = path;
+    pending_.last_error.clear();
+    pending_.last_w = w;
+    pending_.last_h = h;
+    pending_.completed = false;
+    ++pending_.request_id;
 }
 
 void mcp_system::start_login_load(const std::string& content_root, uint32_t buildings_per_frame, bool restart)
@@ -586,7 +712,7 @@ void mcp_system::start_login_load(const std::string& content_root, uint32_t buil
     {
         return;
     }
-    if(login_.active && login_.content_root != normalized_root)
+    if(!restart && login_.active && login_.content_root != normalized_root)
     {
         throw std::runtime_error("load_login: another content_root is already loading");
     }
@@ -614,6 +740,18 @@ auto mcp_system::get_login_load_status() const -> login_load_status
     result.created = login_.created;
     result.skipped = login_.skipped;
     result.terrain = login_.terrain_created;
+    result.current_index = login_.cursor;
+
+    if(login_.cursor < login_.buildings.size())
+    {
+        const auto& current = login_.buildings[login_.cursor];
+        result.has_current = true;
+        result.current_attempts = current.attempts;
+        result.current_name = current.name;
+        result.current_model = current.model;
+        result.current_texture = current.texture;
+        result.current_position = current.position;
+    }
 
     if(!login_.error.empty())
     {
@@ -629,6 +767,51 @@ auto mcp_system::get_login_load_status() const -> login_load_status
     }
 
     return result;
+}
+
+auto mcp_system::get_screenshot_status() const -> screenshot_status
+{
+    screenshot_status result;
+    result.path = pending_.active ? pending_.path : pending_.last_path;
+    result.error = pending_.last_error;
+    result.w = pending_.active ? pending_.w : pending_.last_w;
+    result.h = pending_.active ? pending_.h : pending_.last_h;
+    result.frames_left = pending_.frames_left;
+    result.readback_frames_left = pending_.readback_frames_left;
+    result.active = pending_.active;
+    result.readback_started = pending_.readback_started;
+    result.completed = pending_.completed;
+    result.request_id = pending_.request_id;
+
+    if(pending_.active)
+    {
+        result.status = pending_.readback_started ? "readback" : "rendering";
+    }
+    else if(!pending_.last_error.empty())
+    {
+        result.status = "error";
+    }
+    else if(pending_.completed)
+    {
+        result.status = "done";
+    }
+
+    return result;
+}
+
+auto mcp_system::has_login_terrain() const -> bool
+{
+    return login_.terrain.is_valid();
+}
+
+auto mcp_system::sample_login_terrain(float world_x, float world_z, float& out_height) const -> bool
+{
+    return login_.terrain.sample_terrain_height(world_x, world_z, out_height);
+}
+
+auto mcp_system::get_login_terrain() const -> const terrain_heightfield&
+{
+    return login_.terrain;
 }
 
 void mcp_system::service_login_loader(rtti::context& ctx)
@@ -732,6 +915,11 @@ void mcp_system::service_pending_screenshot(rtti::context& ctx)
                                     &err);
                 bx::close(&writer);
 
+                pending_.last_path = pending_.path;
+                pending_.last_w = pending_.w;
+                pending_.last_h = pending_.h;
+                pending_.last_error.clear();
+                pending_.completed = true;
                 clear_pending_readback();
                 pending_.active = false;
             }
@@ -783,8 +971,23 @@ void mcp_system::service_pending_screenshot(rtti::context& ctx)
             pending_.readback_frames_left = 3;
         }
     }
+    catch(const std::exception& e)
+    {
+        pending_.last_path = pending_.path;
+        pending_.last_w = pending_.w;
+        pending_.last_h = pending_.h;
+        pending_.last_error = e.what();
+        pending_.completed = false;
+        clear_pending_readback();
+        pending_.active = false;
+    }
     catch(...)
     {
+        pending_.last_path = pending_.path;
+        pending_.last_w = pending_.w;
+        pending_.last_h = pending_.h;
+        pending_.last_error = "screenshot: unknown failure";
+        pending_.completed = false;
         clear_pending_readback();
         pending_.active = false;
     }

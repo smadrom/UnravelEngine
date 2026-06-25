@@ -28,7 +28,29 @@ public:
         uint32_t total = 0;
         uint32_t created = 0;
         uint32_t skipped = 0;
+        uint32_t current_index = 0;
+        uint32_t current_attempts = 0;
+        std::string current_name;
+        std::string current_model;
+        std::string current_texture;
+        math::vec3 current_position{};
+        bool has_current = false;
         bool terrain = false;
+    };
+
+    struct screenshot_status
+    {
+        std::string status = "idle";
+        std::string path;
+        std::string error;
+        uint32_t w = 0;
+        uint32_t h = 0;
+        int frames_left = 0;
+        int readback_frames_left = 0;
+        bool active = false;
+        bool readback_started = false;
+        bool completed = false;
+        uint64_t request_id = 0;
     };
 
     struct login_building
@@ -56,6 +78,10 @@ public:
     void request_screenshot(const std::string& path, uint32_t w, uint32_t h);
     void start_login_load(const std::string& content_root, uint32_t buildings_per_frame, bool restart);
     auto get_login_load_status() const -> login_load_status;
+    auto get_screenshot_status() const -> screenshot_status;
+    auto has_login_terrain() const -> bool;
+    auto sample_login_terrain(float world_x, float world_z, float& out_height) const -> bool;
+    auto get_login_terrain() const -> const terrain_heightfield&;
 
 private:
     void service_pending_screenshot(rtti::context& ctx);
@@ -77,6 +103,12 @@ private:
         bool readback_started = false;
         bgfx::TextureHandle readback_texture = BGFX_INVALID_HANDLE;
         std::vector<uint8_t> pixels;
+        std::string last_path;
+        std::string last_error;
+        uint32_t last_w = 0;
+        uint32_t last_h = 0;
+        bool completed = false;
+        uint64_t request_id = 0;
     };
 
     pending_screenshot pending_;
