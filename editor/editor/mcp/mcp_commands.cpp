@@ -286,7 +286,7 @@ auto make_load_map_result(rtti::context& ctx, mcp_system& sys, const json& param
     return result;
 }
 
-auto make_pw_login_status_result(const mcp_system::pw_login_load_status& status) -> json
+auto make_login_status_result(const mcp_system::login_load_status& status) -> json
 {
     json result;
     result["status"] = status.status;
@@ -303,7 +303,7 @@ auto make_pw_login_status_result(const mcp_system::pw_login_load_status& status)
     return result;
 }
 
-auto make_load_pw_login_result(mcp_system& sys, const json& params) -> json
+auto make_load_login_result(mcp_system& sys, const json& params) -> json
 {
     std::string content_root = "app:/data/login";
     if(params.contains("content_root") && params["content_root"].is_string())
@@ -318,12 +318,12 @@ auto make_load_pw_login_result(mcp_system& sys, const json& params) -> json
     const int chunk_size = params.value("chunk_size", 3);
     if(chunk_size <= 0)
     {
-        throw std::runtime_error("load_pw_login: 'chunk_size' must be positive");
+        throw std::runtime_error("load_login: 'chunk_size' must be positive");
     }
 
     const bool restart = params.value("restart", false);
-    sys.start_pw_login_load(content_root, static_cast<uint32_t>(chunk_size), restart);
-    return make_pw_login_status_result(sys.get_pw_login_load_status());
+    sys.start_login_load(content_root, static_cast<uint32_t>(chunk_size), restart);
+    return make_login_status_result(sys.get_login_load_status());
 }
 } // namespace
 
@@ -375,9 +375,9 @@ auto dispatch(rtti::context& ctx, const std::string& req_json, mcp_system& sys) 
         {
             result = make_load_map_result(ctx, sys, params);
         }
-        else if(method == "load_pw_login")
+        else if(method == "load_login")
         {
-            result = make_load_pw_login_result(sys, params);
+            result = make_load_login_result(sys, params);
         }
         else
         {

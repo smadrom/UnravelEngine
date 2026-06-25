@@ -30,6 +30,7 @@
 #include <bx/file.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <fstream>
@@ -42,7 +43,8 @@ namespace unravel
 namespace
 {
 constexpr auto kMcpFrameDt = delta_t(0.016667f);
-constexpr uint32_t kPwLoginMaxAssetWaitFrames = 900;
+constexpr uint32_t kLoginMaxAssetWaitFrames = 900;
+constexpr float kDuplicatePositionEpsilon = 0.01f;
 
 using json = nlohmann::json;
 
@@ -76,13 +78,13 @@ auto read_json_asset(const std::string& asset_key) -> json
     std::ifstream file(path);
     if(!file)
     {
-        throw std::runtime_error("load_pw_login: failed to open '" + asset_key + "'");
+        throw std::runtime_error("load_login: failed to open '" + asset_key + "'");
     }
 
     auto doc = json::parse(file, nullptr, false);
     if(doc.is_discarded())
     {
-        throw std::runtime_error("load_pw_login: failed to parse '" + asset_key + "'");
+        throw std::runtime_error("load_login: failed to parse '" + asset_key + "'");
     }
     return doc;
 }
@@ -97,7 +99,7 @@ auto read_material_texture_ref(const std::string& content_root, const std::strin
     }
     if(texture_ref.empty())
     {
-        throw std::runtime_error("load_pw_login: material '" + material_ref + "' has no textureRef");
+        throw std::runtime_error("load_login: material '" + material_ref + "' has no textureRef");
     }
     return texture_ref;
 }
@@ -106,20 +108,20 @@ auto read_vec3_member(const json& item, const char* key) -> math::vec3
 {
     if(!item.contains(key) || !item[key].is_array() || item[key].size() < 3)
     {
-        throw std::runtime_error(std::string("load_pw_login: building has no valid '") + key + "'");
+        throw std::runtime_error(std::string("load_login: building has no valid '") + key + "'");
     }
 
     return {item[key][0].get<float>(), item[key][1].get<float>(), item[key][2].get<float>()};
 }
 
-auto map_pw_position_to_unravel(const math::vec3& pw_pos) -> math::vec3
+auto map_source_position_to_unravel(const math::vec3& source_pos) -> math::vec3
 {
-    return {pw_pos.x, pw_pos.y, -pw_pos.z};
+    return {source_pos.x, source_pos.y, -source_pos.z};
 }
 
-auto map_pw_forward_to_unravel(const math::vec3& pw_dir) -> math::vec3
+auto map_source_forward_to_unravel(const math::vec3& source_dir) -> math::vec3
 {
-    math::vec3 forward{pw_dir.x, pw_dir.y, -pw_dir.z};
+    math::vec3 forward{source_dir.x, source_dir.y, -source_dir.z};
     if(math::dot(forward, forward) <= 0.000001f)
     {
         return {0.0f, 0.0f, 1.0f};
@@ -134,7 +136,7 @@ auto decode_r16_heightmap(const std::string& heightmap_key, uint32_t& width, uin
     auto* image = imageLoad(bx::FilePath(resolved.c_str()), bgfx::TextureFormat::Count);
     if(image == nullptr || image->m_data == nullptr)
     {
-        throw std::runtime_error("load_pw_login: failed to decode '" + heightmap_key + "'");
+        throw std::runtime_error("load_login: failed to decode '" + heightmap_key + "'");
     }
 
     width = image->m_width;
@@ -182,14 +184,14 @@ auto decode_r16_heightmap(const std::string& heightmap_key, uint32_t& width, uin
         }
         default:
             bimg::imageFree(image);
-            throw std::runtime_error("load_pw_login: unsupported heightmap format for '" + heightmap_key + "'");
+            throw std::runtime_error("load_login: unsupported heightmap format for '" + heightmap_key + "'");
     }
 
     bimg::imageFree(image);
     return heights;
 }
 
-auto load_pw_login_terrain_heightfield(const std::string& content_root) -> pw_terrain_heightfield
+auto load_login_terrain_heightfield(const std::string& content_root) -> terrain_heightfield
 {
     const auto layers_doc = read_json_asset(make_asset_key(content_root, "terrain/login/layers.json"));
     const auto heightmap_doc = layers_doc.contains("heightmap") && layers_doc["heightmap"].is_object()
@@ -198,7 +200,7 @@ auto load_pw_login_terrain_heightfield(const std::string& content_root) -> pw_te
 
     const auto heightmap_ref = heightmap_doc.value("path", std::string("terrain/login/height.r16.png"));
 
-    pw_terrain_heightfield terrain;
+    terrain_heightfield terrain;
     terrain.height_min = heightmap_doc.value("heightMin", 134.59677124023438f);
     terrain.height_max = heightmap_doc.value("heightMax", 424.2374267578125f);
     terrain.world_width = layers_doc.contains("world") && layers_doc["world"].is_object()
@@ -210,22 +212,34 @@ auto load_pw_login_terrain_heightfield(const std::string& content_root) -> pw_te
     terrain.heights = decode_r16_heightmap(make_asset_key(content_root, heightmap_ref), terrain.width, terrain.height);
     if(!terrain.is_valid())
     {
-        throw std::runtime_error("load_pw_login: heightmap is too small or invalid");
+        throw std::runtime_error("load_login: heightmap is too small or invalid");
     }
 
     return terrain;
 }
 
-auto make_pw_login_buildings(const std::string& content_root, const pw_terrain_heightfield& terrain)
-    -> std::vector<mcp_system::pw_login_building>
+struct login_buildings_parse_result
+{
+    std::vector<mcp_system::login_building> buildings;
+    uint32_t duplicate_skipped = 0;
+};
+
+auto positions_match(const math::vec3& lhs, const math::vec3& rhs) -> bool
+{
+    const auto delta = lhs - rhs;
+    return math::dot(delta, delta) <= kDuplicatePositionEpsilon * kDuplicatePositionEpsilon;
+}
+
+auto make_login_buildings(const std::string& content_root, const terrain_heightfield& terrain) -> login_buildings_parse_result
 {
     const auto scene_doc = read_json_asset(make_asset_key(content_root, "maps/login/scene.eds.json"));
     if(!scene_doc.contains("buildings") || !scene_doc["buildings"].is_array())
     {
-        throw std::runtime_error("load_pw_login: scene.eds.json has no buildings[]");
+        throw std::runtime_error("load_login: scene.eds.json has no buildings[]");
     }
 
-    std::vector<mcp_system::pw_login_building> buildings;
+    login_buildings_parse_result result;
+    std::vector<math::vec3> accepted_positions;
     for(const auto& item : scene_doc["buildings"])
     {
         if(!item.contains("openFormat") || !item["openFormat"].is_object())
@@ -246,27 +260,45 @@ auto make_pw_login_buildings(const std::string& content_root, const pw_terrain_h
             continue;
         }
 
-        mcp_system::pw_login_building building;
-        building.name = item.value("name", std::string("PW Login Building ") + std::to_string(buildings.size()));
+        const auto source_position = read_vec3_member(item, "pos");
+        const auto mapped_position = map_source_position_to_unravel(source_position);
+        const bool duplicate = std::any_of(accepted_positions.begin(),
+                                           accepted_positions.end(),
+                                           [&](const math::vec3& accepted)
+                                           {
+                                               return positions_match(accepted, mapped_position);
+                                           });
+        if(duplicate)
+        {
+            ++result.duplicate_skipped;
+            continue;
+        }
+
+        mcp_system::login_building building;
+        building.name = item.value("name", std::string("Login Building ") + std::to_string(result.buildings.size()));
         building.model = model_ref;
         building.texture = read_material_texture_ref(content_root, material_ref);
-        const auto pw_position = read_vec3_member(item, "pos");
-        building.position = map_pw_position_to_unravel(pw_position);
-        building.forward = map_pw_forward_to_unravel(read_vec3_member(item, "dir"));
-        building.pw_position_y = pw_position.y;
+        building.position = mapped_position;
+        building.forward = map_source_forward_to_unravel(read_vec3_member(item, "dir"));
+        building.source_position_y = source_position.y;
         building.terrain_sample_valid =
-            terrain.sample_terrain_height(building.position.x, building.position.z, building.sampled_terrain_y);
+            terrain.sample_terrain_height(building.position.x, building.position.z, building.terrain_surface_y);
         if(building.terrain_sample_valid)
         {
-            building.position.y = building.sampled_terrain_y;
+            building.position.y = building.terrain_surface_y;
         }
-        buildings.emplace_back(std::move(building));
+        accepted_positions.emplace_back(mapped_position);
+        result.buildings.emplace_back(std::move(building));
     }
 
-    return buildings;
+    APPLOG_INFO("load_login parsed buildings: placed={} skipped={}",
+                result.buildings.size(),
+                result.duplicate_skipped);
+
+    return result;
 }
 
-void create_pw_login_terrain(rtti::context& ctx, const pw_terrain_heightfield& terrain)
+void create_login_terrain(rtti::context& ctx, const terrain_heightfield& terrain)
 {
     auto terrain_mesh = std::make_shared<mesh>();
     const bool created = terrain_mesh->create_heightfield(gfx::mesh_vertex::get_layout(),
@@ -275,16 +307,16 @@ void create_pw_login_terrain(rtti::context& ctx, const pw_terrain_heightfield& t
                                                           terrain.height - 1,
                                                           terrain.world_width * 0.5f,
                                                           terrain.world_depth * 0.5f,
-                                                          terrain.height_max - terrain.height_min,
+                                                          terrain.heightfield_mesh_scale(),
                                                           mesh_create_origin::center,
                                                           true);
     if(!created)
     {
-        throw std::runtime_error("load_pw_login: failed to create terrain heightfield");
+        throw std::runtime_error("load_login: failed to create terrain heightfield");
     }
 
     auto& am = ctx.get_cached<asset_manager>();
-    auto terrain_handle = am.get_asset_from_instance<mesh>("app:/generated/pw_login_terrain", terrain_mesh);
+    auto terrain_handle = am.get_asset_from_instance<mesh>("app:/generated/login_terrain", terrain_mesh);
 
     auto material_instance = std::make_shared<pbr_material>();
     material_instance->set_base_color({1.0f, 1.0f, 1.0f, 1.0f});
@@ -304,8 +336,8 @@ void create_pw_login_terrain(rtti::context& ctx, const pw_terrain_heightfield& t
     }
 
     auto& scn = ctx.get_cached<ecs>().get_scene();
-    auto entity = scene::create_entity(*scn.registry, "PW Login Terrain");
-    entity.get<transform_component>().set_position_local({0.0f, terrain.height_min, 0.0f});
+    auto entity = scene::create_entity(*scn.registry, "Login Terrain");
+    entity.get<transform_component>().set_position_local({0.0f, terrain.heightfield_entity_y(), 0.0f});
     entity.emplace<model_component>().set_model(terrain_model);
 }
 
@@ -323,18 +355,18 @@ auto scene_has_entity_named(scene& scn, const std::string& name) -> bool
     return false;
 }
 
-void create_pw_login_environment(rtti::context& ctx)
+void create_login_environment(rtti::context& ctx)
 {
     auto& scn = ctx.get_cached<ecs>().get_scene();
 
-    if(!scene_has_entity_named(scn, "PW Volume"))
+    if(!scene_has_entity_named(scn, "Volume"))
     {
-        defaults::create_volume_entity(ctx, scn, "PW Volume", volume_mode::global);
+        defaults::create_volume_entity(ctx, scn, "Volume", volume_mode::global);
     }
 
-    if(!scene_has_entity_named(scn, "PW Sun Light"))
+    if(!scene_has_entity_named(scn, "Sun Light"))
     {
-        auto sun = defaults::create_light_entity(ctx, scn, light_type::directional, "PW Sun");
+        auto sun = defaults::create_light_entity(ctx, scn, light_type::directional, "Sun");
 
         auto& transform = sun.get<transform_component>();
         transform.set_rotation_euler_local({50.0f, -30.0f, 0.0f});
@@ -344,9 +376,9 @@ void create_pw_login_environment(rtti::context& ctx)
         skylight.set_irradiance_intensity(0.20f);
     }
 
-    if(!scene_has_entity_named(scn, "Reflection Probe PW Global"))
+    if(!scene_has_entity_named(scn, "Reflection Probe Global"))
     {
-        auto probe_entity = defaults::create_reflection_probe_entity(ctx, scn, probe_type::sphere, " PW Global");
+        auto probe_entity = defaults::create_reflection_probe_entity(ctx, scn, probe_type::sphere, " Global");
         auto& reflection_comp = probe_entity.get_or_emplace<reflection_probe_component>();
         auto probe = reflection_comp.get_probe();
         probe.method = reflect_method::environment;
@@ -355,10 +387,10 @@ void create_pw_login_environment(rtti::context& ctx)
     }
 }
 
-auto create_pw_login_building(rtti::context& ctx,
-                              const std::string& content_root,
-                              mcp_system::pw_login_building& building,
-                              bool allow_untextured) -> bool
+auto create_login_building(rtti::context& ctx,
+                           const std::string& content_root,
+                           mcp_system::login_building& building,
+                           bool allow_untextured) -> bool
 {
     auto& am = ctx.get_cached<asset_manager>();
     const auto mesh_key = make_asset_key(content_root, building.model);
@@ -384,7 +416,7 @@ auto create_pw_login_building(rtti::context& ctx,
     texture_handle.submit();
     if(!building.texture_request_logged)
     {
-        APPLOG_INFO("load_pw_login texture requested: building='{}' key='{}' handle_valid={} ready={} loading={}",
+        APPLOG_INFO("load_login texture requested: building='{}' key='{}' handle_valid={} ready={} loading={}",
                     building.name,
                     texture_key,
                     texture_handle.is_valid(),
@@ -404,7 +436,7 @@ auto create_pw_login_building(rtti::context& ctx,
 
     if(!building.texture_ready_logged && (texture_handle.is_ready() || allow_untextured))
     {
-        APPLOG_INFO("load_pw_login texture resolved: building='{}' key='{}' handle_valid={} ready={} loaded={} "
+        APPLOG_INFO("load_login texture resolved: building='{}' key='{}' handle_valid={} ready={} loaded={} "
                     "native_valid={} native_idx={} width={} height={} format={} usable={}",
                     building.name,
                     texture_key,
@@ -449,19 +481,30 @@ auto create_pw_login_building(rtti::context& ctx,
     auto entity = scene::create_entity(*scn.registry, building.name);
     auto& transform = entity.get<transform_component>();
     auto position = building.position;
-    float base_offset = 0.0f;
+    const auto& local_bounds = mesh_instance->get_bounds();
+    building.local_min_y = local_bounds.is_populated() && std::isfinite(local_bounds.min.y) ? local_bounds.min.y : 0.0f;
+    if(building.terrain_sample_valid)
+    {
+        position.y = building.terrain_surface_y - building.local_min_y;
+    }
+    else
+    {
+        position.y = building.source_position_y - building.local_min_y;
+    }
+    const float base_y = position.y + building.local_min_y;
 
     if(!building.placement_logged)
     {
-        APPLOG_INFO("load_pw_login placement: building='{}' x={} z={} sampled_terrain_y={} final_y={} pw_y={} "
-                    "base_offset={} sample_valid={}",
+        APPLOG_INFO("load_login placement: building='{}' x={} z={} terrain_surface_y={} final_y={} source_y={} "
+                    "local_min_y={} base_y={} sample_valid={}",
                     building.name,
                     position.x,
                     position.z,
-                    building.sampled_terrain_y,
+                    building.terrain_surface_y,
                     position.y,
-                    building.pw_position_y,
-                    base_offset,
+                    building.source_position_y,
+                    building.local_min_y,
+                    base_y,
                     building.terrain_sample_valid);
         building.placement_logged = true;
     }
@@ -498,7 +541,7 @@ auto mcp_system::deinit(rtti::context& ctx) -> bool
 void mcp_system::on_frame_end(rtti::context& ctx, delta_t dt)
 {
     (void)dt;
-    service_pw_login_loader(ctx);
+    service_login_loader(ctx);
     service_pending_screenshot(ctx);
     server_.Drain([&](const std::string& req)
     {
@@ -536,49 +579,51 @@ void mcp_system::request_screenshot(const std::string& path, uint32_t w, uint32_
     pending_.pixels.clear();
 }
 
-void mcp_system::start_pw_login_load(const std::string& content_root, uint32_t buildings_per_frame, bool restart)
+void mcp_system::start_login_load(const std::string& content_root, uint32_t buildings_per_frame, bool restart)
 {
     const auto normalized_root = normalize_content_root(content_root);
-    if(!restart && (pw_login_.active || pw_login_.completed) && pw_login_.content_root == normalized_root)
+    if(!restart && (login_.active || login_.completed) && login_.content_root == normalized_root)
     {
         return;
     }
-    if(pw_login_.active && pw_login_.content_root != normalized_root)
+    if(login_.active && login_.content_root != normalized_root)
     {
-        throw std::runtime_error("load_pw_login: another content_root is already loading");
+        throw std::runtime_error("load_login: another content_root is already loading");
     }
 
-    pw_login_ = {};
-    pw_login_.content_root = normalized_root;
-    pw_login_.buildings_per_frame = std::clamp(buildings_per_frame, 1u, 8u);
-    pw_login_.terrain = load_pw_login_terrain_heightfield(pw_login_.content_root);
-    pw_login_.buildings = make_pw_login_buildings(pw_login_.content_root, pw_login_.terrain);
-    pw_login_.active = true;
-    pw_login_.completed = false;
-    pw_login_.status = "loading";
+    login_ = {};
+    login_.content_root = normalized_root;
+    login_.buildings_per_frame = std::clamp(buildings_per_frame, 1u, 8u);
+    login_.terrain = load_login_terrain_heightfield(login_.content_root);
+    auto parsed = make_login_buildings(login_.content_root, login_.terrain);
+    login_.skipped = parsed.duplicate_skipped;
+    login_.buildings = std::move(parsed.buildings);
+    login_.active = true;
+    login_.completed = false;
+    login_.status = "loading";
 }
 
-auto mcp_system::get_pw_login_load_status() const -> pw_login_load_status
+auto mcp_system::get_login_load_status() const -> login_load_status
 {
-    pw_login_load_status result;
-    result.status = pw_login_.status;
-    result.content_root = pw_login_.content_root;
-    result.error = pw_login_.error;
-    result.done = pw_login_.cursor;
-    result.total = static_cast<uint32_t>(pw_login_.buildings.size());
-    result.created = pw_login_.created;
-    result.skipped = pw_login_.skipped;
-    result.terrain = pw_login_.terrain_created;
+    login_load_status result;
+    result.status = login_.status;
+    result.content_root = login_.content_root;
+    result.error = login_.error;
+    result.done = login_.cursor;
+    result.total = static_cast<uint32_t>(login_.buildings.size());
+    result.created = login_.created;
+    result.skipped = login_.skipped;
+    result.terrain = login_.terrain_created;
 
-    if(!pw_login_.error.empty())
+    if(!login_.error.empty())
     {
         result.status = "error";
     }
-    else if(pw_login_.completed)
+    else if(login_.completed)
     {
         result.status = "done";
     }
-    else if(!pw_login_.active && pw_login_.buildings.empty())
+    else if(!login_.active && login_.buildings.empty())
     {
         result.status = "idle";
     }
@@ -586,9 +631,9 @@ auto mcp_system::get_pw_login_load_status() const -> pw_login_load_status
     return result;
 }
 
-void mcp_system::service_pw_login_loader(rtti::context& ctx)
+void mcp_system::service_login_loader(rtti::context& ctx)
 {
-    if(!pw_login_.active)
+    if(!login_.active)
     {
         return;
     }
@@ -596,56 +641,57 @@ void mcp_system::service_pw_login_loader(rtti::context& ctx)
     try
     {
         uint32_t processed_this_frame = 0;
-        pw_login_.status = "loading";
+        login_.status = "loading";
 
-        if(!pw_login_.environment_created)
+        if(!login_.environment_created)
         {
-            create_pw_login_environment(ctx);
-            pw_login_.environment_created = true;
+            create_login_environment(ctx);
+            login_.environment_created = true;
         }
 
-        while(pw_login_.cursor < pw_login_.buildings.size() && processed_this_frame < pw_login_.buildings_per_frame)
+        while(login_.cursor < login_.buildings.size() && processed_this_frame < login_.buildings_per_frame)
         {
-            auto& building = pw_login_.buildings[pw_login_.cursor];
-            const bool wait_limit_reached = building.attempts >= kPwLoginMaxAssetWaitFrames;
-            if(!create_pw_login_building(ctx, pw_login_.content_root, building, wait_limit_reached))
+            auto& building = login_.buildings[login_.cursor];
+            const bool wait_limit_reached = building.attempts >= kLoginMaxAssetWaitFrames;
+            if(!create_login_building(ctx, login_.content_root, building, wait_limit_reached))
             {
-                if(building.attempts < kPwLoginMaxAssetWaitFrames)
+                if(building.attempts < kLoginMaxAssetWaitFrames)
                 {
-                    pw_login_.status = "waiting_assets";
+                    login_.status = "waiting_assets";
                     return;
                 }
 
-                ++pw_login_.skipped;
-                ++pw_login_.cursor;
+                ++login_.skipped;
+                ++login_.cursor;
                 continue;
             }
 
-            ++pw_login_.created;
-            ++pw_login_.cursor;
+            ++login_.created;
+            ++login_.cursor;
             ++processed_this_frame;
         }
 
-        if(pw_login_.cursor >= pw_login_.buildings.size())
+        if(login_.cursor >= login_.buildings.size())
         {
-            if(!pw_login_.terrain_created)
+            if(!login_.terrain_created)
             {
-                create_pw_login_terrain(ctx, pw_login_.terrain);
-                pw_login_.terrain_created = true;
+                create_login_terrain(ctx, login_.terrain);
+                login_.terrain_created = true;
             }
 
-            pw_login_.active = false;
-            pw_login_.completed = true;
-            pw_login_.status = "done";
+            login_.active = false;
+            login_.completed = true;
+            login_.status = "done";
+            APPLOG_INFO("load_login done: placed={} skipped={}", login_.created, login_.skipped);
             invalidate_camera();
         }
     }
     catch(const std::exception& e)
     {
-        pw_login_.active = false;
-        pw_login_.completed = false;
-        pw_login_.status = "error";
-        pw_login_.error = e.what();
+        login_.active = false;
+        login_.completed = false;
+        login_.status = "error";
+        login_.error = e.what();
     }
 }
 

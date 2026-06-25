@@ -1,4 +1,4 @@
-#include "editor/editor/mcp/pw_terrain_height_sampler.h"
+#include "editor/editor/mcp/terrain_height_sampler.h"
 
 #include <cassert>
 #include <cmath>
@@ -14,7 +14,7 @@ void expect_near(float actual, float expected)
 
 int main()
 {
-    unravel::pw_terrain_heightfield terrain;
+    unravel::terrain_heightfield terrain;
     terrain.heights = {
         0.0f, 0.5f, 1.0f,
         0.25f, 0.75f, 1.0f,
@@ -30,13 +30,20 @@ int main()
     float sampled = 0.0f;
 
     assert(terrain.sample_terrain_height(-2.0f, -2.0f, sampled));
-    expect_near(sampled, 10.0f);
+    expect_near(sampled, 20.0f);
 
     assert(terrain.sample_terrain_height(2.0f, 2.0f, sampled));
     expect_near(sampled, 30.0f);
 
     assert(terrain.sample_terrain_height(0.0f, 0.0f, sampled));
     expect_near(sampled, 25.0f);
+
+    assert(terrain.sample_terrain_height(0.5f, 1.0f, sampled));
+    expect_near(sampled, 25.0f);
+
+    expect_near(terrain.height_range(), 20.0f);
+    expect_near(terrain.heightfield_entity_y(), 10.0f);
+    expect_near(terrain.heightfield_mesh_scale(), -20.0f);
 
     assert(!terrain.sample_terrain_height(2.1f, 0.0f, sampled));
     return 0;
