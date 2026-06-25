@@ -12,6 +12,8 @@
 #include <engine/rendering/ecs/components/camera_component.h>
 #include <engine/rendering/ecs/components/light_component.h>
 #include <engine/rendering/ecs/components/model_component.h>
+#include <engine/rendering/ecs/components/reflection_probe_component.h>
+#include <engine/rendering/ecs/components/volume_component.h>
 #include <graphics/graphics.h>
 #include <uuid/uuid.h>
 #include <version/version.h>
@@ -42,6 +44,11 @@ auto make_scene_list(rtti::context& ctx) -> json
     auto& reg = *scn.registry;
 
     json entities = json::array();
+    const auto vec3_json = [](const math::vec3& v)
+    {
+        return json::array({v.x, v.y, v.z});
+    };
+
     auto view = reg.view<tag_component>();
     for(auto e : view)
     {
@@ -55,6 +62,9 @@ auto make_scene_list(rtti::context& ctx) -> json
         const bool has_transform = reg.all_of<transform_component>(e);
         const bool has_model = reg.all_of<model_component>(e);
         const bool has_light = reg.all_of<light_component>(e);
+        const bool has_skylight = reg.all_of<skylight_component>(e);
+        const bool has_reflection_probe = reg.all_of<reflection_probe_component>(e);
+        const bool has_volume = reg.all_of<volume_component>(e);
         const bool has_camera = reg.all_of<camera_component>(e);
 
         if(has_transform)
@@ -68,6 +78,18 @@ auto make_scene_list(rtti::context& ctx) -> json
         if(has_light)
         {
             components.push_back("light");
+        }
+        if(has_skylight)
+        {
+            components.push_back("skylight");
+        }
+        if(has_reflection_probe)
+        {
+            components.push_back("reflection_probe");
+        }
+        if(has_volume)
+        {
+            components.push_back("volume");
         }
         if(has_camera)
         {
@@ -83,8 +105,21 @@ auto make_scene_list(rtti::context& ctx) -> json
             {"transform", has_transform},
             {"model", has_model},
             {"light", has_light},
+            {"skylight", has_skylight},
+            {"reflection_probe", has_reflection_probe},
+            {"volume", has_volume},
             {"camera", has_camera},
         };
+        if(has_transform)
+        {
+            const auto& transform = reg.get<transform_component>(e);
+            entity["transform"] = {
+                {"position_local", vec3_json(transform.get_position_local())},
+                {"position_global", vec3_json(transform.get_position_global())},
+                {"rotation_local", vec3_json(transform.get_rotation_euler_local())},
+                {"scale_local", vec3_json(transform.get_scale_local())},
+            };
+        }
         entities.push_back(entity);
     }
 
@@ -166,6 +201,12 @@ auto make_camera_set_result(rtti::context& ctx, mcp_system& sys, const json& par
         transform_comp.set_rotation_euler_local(rot);
     }
 
+    math::vec3 target{};
+    if(read_vec3(params, "target", target))
+    {
+        transform_comp.look_at(target, {0.0f, 1.0f, 0.0f});
+    }
+
     if(params.contains("fov"))
     {
         camera_comp.set_fov(params["fov"].get<float>());
@@ -244,6 +285,46 @@ auto make_load_map_result(rtti::context& ctx, mcp_system& sys, const json& param
     result["path"] = path;
     return result;
 }
+
+auto make_pw_login_status_result(const mcp_system::pw_login_load_status& status) -> json
+{
+    json result;
+    result["status"] = status.status;
+    result["content_root"] = status.content_root;
+    result["done"] = status.done;
+    result["total"] = status.total;
+    result["created"] = status.created;
+    result["skipped"] = status.skipped;
+    result["terrain"] = status.terrain;
+    if(!status.error.empty())
+    {
+        result["error"] = status.error;
+    }
+    return result;
+}
+
+auto make_load_pw_login_result(mcp_system& sys, const json& params) -> json
+{
+    std::string content_root = "app:/data/login";
+    if(params.contains("content_root") && params["content_root"].is_string())
+    {
+        content_root = params["content_root"].get<std::string>();
+    }
+    else if(params.contains("content-root") && params["content-root"].is_string())
+    {
+        content_root = params["content-root"].get<std::string>();
+    }
+
+    const int chunk_size = params.value("chunk_size", 3);
+    if(chunk_size <= 0)
+    {
+        throw std::runtime_error("load_pw_login: 'chunk_size' must be positive");
+    }
+
+    const bool restart = params.value("restart", false);
+    sys.start_pw_login_load(content_root, static_cast<uint32_t>(chunk_size), restart);
+    return make_pw_login_status_result(sys.get_pw_login_load_status());
+}
 } // namespace
 
 namespace mcp_commands
@@ -293,6 +374,10 @@ auto dispatch(rtti::context& ctx, const std::string& req_json, mcp_system& sys) 
         else if(method == "load_map")
         {
             result = make_load_map_result(ctx, sys, params);
+        }
+        else if(method == "load_pw_login")
+        {
+            result = make_load_pw_login_result(sys, params);
         }
         else
         {

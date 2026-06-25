@@ -37,8 +37,13 @@
 
 #include <engine/scripting/ecs/systems/script_system.h>
 #include <engine/profiler/profiler.h>
+#include <algorithm>
+#include <array>
+#include <cstdint>
 #include <fstream>
+#include <iterator>
 #include <monopp/mono_jit.h>
+#include <optional>
 #include <regex>
 #include <subprocess/subprocess.hpp>
 
@@ -172,6 +177,222 @@ bool copy_compiled_file(const fs::path& from, const fs::path& to)
     }
 
     return !err;
+}
+
+auto is_passthrough_texture_container(const fs::path& input_path) -> bool
+{
+    const auto extension = input_path.extension().generic_string();
+    return extension == ".dds" || extension == ".ktx";
+}
+
+auto read_u32_le(const std::vector<uint8_t>& data, size_t offset) -> uint32_t
+{
+    if(offset + 4 > data.size())
+    {
+        return 0;
+    }
+
+    return uint32_t(data[offset]) | (uint32_t(data[offset + 1]) << 8) | (uint32_t(data[offset + 2]) << 16) |
+           (uint32_t(data[offset + 3]) << 24);
+}
+
+auto read_u64_le(const std::vector<uint8_t>& data, size_t offset) -> uint64_t
+{
+    if(offset + 8 > data.size())
+    {
+        return 0;
+    }
+
+    uint64_t value = 0;
+    for(size_t i = 0; i < 8; ++i)
+    {
+        value |= uint64_t(data[offset + i]) << (i * 8);
+    }
+    return value;
+}
+
+void write_u32_le(std::ostream& output, uint32_t value)
+{
+    const std::array<char, 4> bytes{
+        static_cast<char>(value & 0xffu),
+        static_cast<char>((value >> 8) & 0xffu),
+        static_cast<char>((value >> 16) & 0xffu),
+        static_cast<char>((value >> 24) & 0xffu),
+    };
+    output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
+struct ktx2_dds_format
+{
+    uint32_t dxgi_format = 0;
+    uint32_t block_bytes = 0;
+};
+
+auto get_ktx2_bc_dds_format(uint32_t vk_format) -> std::optional<ktx2_dds_format>
+{
+    // Vulkan KTX2 format ids mapped to DDS DX10 ids accepted by bimg.
+    switch(vk_format)
+    {
+        case 131: return ktx2_dds_format{71, 8};  // VK_FORMAT_BC1_RGB_UNORM_BLOCK
+        case 132: return ktx2_dds_format{72, 8};  // VK_FORMAT_BC1_RGB_SRGB_BLOCK
+        case 133: return ktx2_dds_format{71, 8};  // VK_FORMAT_BC1_RGBA_UNORM_BLOCK
+        case 134: return ktx2_dds_format{72, 8};  // VK_FORMAT_BC1_RGBA_SRGB_BLOCK
+        case 135: return ktx2_dds_format{74, 16}; // VK_FORMAT_BC2_UNORM_BLOCK
+        case 136: return ktx2_dds_format{75, 16}; // VK_FORMAT_BC2_SRGB_BLOCK
+        case 137: return ktx2_dds_format{77, 16}; // VK_FORMAT_BC3_UNORM_BLOCK
+        case 138: return ktx2_dds_format{78, 16}; // VK_FORMAT_BC3_SRGB_BLOCK
+        case 139: return ktx2_dds_format{80, 8};  // VK_FORMAT_BC4_UNORM_BLOCK
+        case 141: return ktx2_dds_format{83, 16}; // VK_FORMAT_BC5_UNORM_BLOCK
+        case 143: return ktx2_dds_format{95, 16}; // VK_FORMAT_BC6H_UFLOAT_BLOCK
+        case 144: return ktx2_dds_format{96, 16}; // VK_FORMAT_BC6H_SFLOAT_BLOCK
+        case 145: return ktx2_dds_format{98, 16}; // VK_FORMAT_BC7_UNORM_BLOCK
+        case 146: return ktx2_dds_format{99, 16}; // VK_FORMAT_BC7_SRGB_BLOCK
+        default: return std::nullopt;
+    }
+}
+
+auto get_bc_mip_size(uint32_t width, uint32_t height, uint32_t block_bytes) -> uint64_t
+{
+    const uint64_t blocks_w = std::max<uint32_t>(1, (width + 3) / 4);
+    const uint64_t blocks_h = std::max<uint32_t>(1, (height + 3) / 4);
+    return blocks_w * blocks_h * block_bytes;
+}
+
+auto wrap_ktx2_bc_as_dds(const fs::path& input_path, const fs::path& output_path) -> bool
+{
+    if(input_path.extension().generic_string() != ".ktx2")
+    {
+        return false;
+    }
+
+    std::ifstream input(input_path, std::ios::binary);
+    if(!input)
+    {
+        return false;
+    }
+
+    std::vector<uint8_t> data((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    static constexpr std::array<uint8_t, 12> ktx2_identifier{
+        0xab, 0x4b, 0x54, 0x58, 0x20, 0x32, 0x30, 0xbb, 0x0d, 0x0a, 0x1a, 0x0a};
+    if(data.size() < 80 || !std::equal(ktx2_identifier.begin(), ktx2_identifier.end(), data.begin()))
+    {
+        return false;
+    }
+
+    const uint32_t vk_format = read_u32_le(data, 12);
+    const uint32_t width = read_u32_le(data, 20);
+    const uint32_t height = read_u32_le(data, 24);
+    const uint32_t depth = read_u32_le(data, 28);
+    const uint32_t layer_count = read_u32_le(data, 32);
+    const uint32_t face_count = read_u32_le(data, 36);
+    const uint32_t level_count = read_u32_le(data, 40);
+    const uint32_t supercompression_scheme = read_u32_le(data, 44);
+    const auto format = get_ktx2_bc_dds_format(vk_format);
+
+    if(!format || width == 0 || height == 0 || depth != 0 || layer_count > 1 || face_count != 1 ||
+       level_count == 0 || supercompression_scheme != 0 || data.size() < 80ull + uint64_t(level_count) * 24ull)
+    {
+        return false;
+    }
+
+    struct level_entry
+    {
+        uint64_t offset = 0;
+        uint64_t length = 0;
+    };
+
+    std::vector<level_entry> levels;
+    levels.reserve(level_count);
+    for(uint32_t i = 0; i < level_count; ++i)
+    {
+        const size_t table_offset = 80ull + uint64_t(i) * 24ull;
+        const uint64_t offset = read_u64_le(data, table_offset);
+        const uint64_t length = read_u64_le(data, table_offset + 8);
+        const uint32_t mip_width = std::max<uint32_t>(1, width >> i);
+        const uint32_t mip_height = std::max<uint32_t>(1, height >> i);
+        const uint64_t expected_length = get_bc_mip_size(mip_width, mip_height, format->block_bytes);
+
+        if(length != expected_length || offset > data.size() || length > data.size() - offset)
+        {
+            return false;
+        }
+        levels.push_back({offset, length});
+    }
+
+    std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
+    if(!output)
+    {
+        return false;
+    }
+
+    constexpr uint32_t dds_magic = 0x20534444;              // "DDS "
+    constexpr uint32_t dds_header_size = 124;
+    constexpr uint32_t ddsd_caps = 0x00000001;
+    constexpr uint32_t ddsd_height = 0x00000002;
+    constexpr uint32_t ddsd_width = 0x00000004;
+    constexpr uint32_t ddsd_pixelformat = 0x00001000;
+    constexpr uint32_t ddsd_mipmapcount = 0x00020000;
+    constexpr uint32_t ddsd_linearsize = 0x00080000;
+    constexpr uint32_t ddpf_fourcc = 0x00000004;
+    constexpr uint32_t dds_dx10 = 0x30315844;               // "DX10"
+    constexpr uint32_t ddscaps_complex = 0x00000008;
+    constexpr uint32_t ddscaps_texture = 0x00001000;
+    constexpr uint32_t ddscaps_mipmap = 0x00400000;
+    constexpr uint32_t dds_dimension_texture2d = 3;
+    constexpr uint32_t array_size = 1;
+
+    write_u32_le(output, dds_magic);
+    write_u32_le(output, dds_header_size);
+    write_u32_le(output,
+                 ddsd_caps | ddsd_height | ddsd_width | ddsd_pixelformat | ddsd_linearsize |
+                     (level_count > 1 ? ddsd_mipmapcount : 0u));
+    write_u32_le(output, height);
+    write_u32_le(output, width);
+    write_u32_le(output, static_cast<uint32_t>(levels.front().length));
+    write_u32_le(output, 1); // depth
+    write_u32_le(output, level_count);
+    for(uint32_t i = 0; i < 11; ++i)
+    {
+        write_u32_le(output, 0);
+    }
+
+    write_u32_le(output, 32); // DDS_PIXELFORMAT size
+    write_u32_le(output, ddpf_fourcc);
+    write_u32_le(output, dds_dx10);
+    write_u32_le(output, 0); // RGBBitCount
+    write_u32_le(output, 0); // RBitMask
+    write_u32_le(output, 0); // GBitMask
+    write_u32_le(output, 0); // BBitMask
+    write_u32_le(output, 0); // ABitMask
+
+    write_u32_le(output, ddscaps_texture | (level_count > 1 ? (ddscaps_complex | ddscaps_mipmap) : 0u));
+    write_u32_le(output, 0); // caps2
+    write_u32_le(output, 0); // caps3
+    write_u32_le(output, 0); // caps4
+    write_u32_le(output, 0); // reserved2
+
+    write_u32_le(output, format->dxgi_format);
+    write_u32_le(output, dds_dimension_texture2d);
+    write_u32_le(output, 0); // miscFlag
+    write_u32_le(output, array_size);
+    write_u32_le(output, 0); // miscFlags2
+
+    for(const auto& level : levels)
+    {
+        output.write(reinterpret_cast<const char*>(data.data() + level.offset), static_cast<std::streamsize>(level.length));
+    }
+
+    if(!output)
+    {
+        fs::error_code err;
+        fs::remove(output_path, err);
+        return false;
+    }
+
+    APPLOG_INFO("Wrapped KTX2 BC texture as DDS: {0} -> {1}",
+                input_path.filename().string(),
+                output_path.filename().string());
+    return true;
 }
 
 auto get_input_texture_format(const fs::path& input_path) -> gfx::texture_format
@@ -361,6 +582,23 @@ auto compile_texture_to_file(const fs::path& input_path,
     std::string str_output = output_path.string();
     
     bool try_compress = protocol == "app";
+
+    if(!using_temp_input && is_passthrough_texture_container(compile_input))
+    {
+        return copy_compiled_file(compile_input, output_path);
+    }
+
+    const bool is_ktx2_input = compile_input.extension().generic_string() == ".ktx2";
+    if(is_ktx2_input && wrap_ktx2_bc_as_dds(compile_input, output_path))
+    {
+        if(using_temp_input)
+        {
+            fs::error_code remove_err;
+            fs::remove(temp_baked_path, remove_err);
+        }
+
+        return true;
+    }
     
     auto quality = importer.quality;
     if(quality.compression == texture_importer_meta::compression_quality::project_default)
@@ -398,7 +636,7 @@ auto compile_texture_to_file(const fs::path& input_path,
     const auto input_format = get_input_texture_format(compile_input);
     auto format = select_compressed_format(input_format, compile_input.extension(), quality.compression);
     
-    if(input_format != format)
+    if(input_format != format || is_ktx2_input)
     {
         std::vector<std::string> args_array = {
             "-f",
@@ -533,14 +771,22 @@ auto compile_texture_to_file(const fs::path& input_path,
         bool compiled = run_process(texturec.string(), args_array, false, error);
         if(!compiled)
         {
-            APPLOG_ERROR("Failed compilation of {0} with error: {1}", str_input, error);
             fs::remove(str_output);
+            if(is_ktx2_input && wrap_ktx2_bc_as_dds(compile_input, output_path))
+            {
+                return true;
+            }
+
+            APPLOG_ERROR("Failed compilation of {0} with error: {1}", str_input, error);
             return false;
         }
     }
     else
     {
-        copy_compiled_file(compile_input, output_path);
+        if(!copy_compiled_file(compile_input, output_path))
+        {
+            return false;
+        }
     }
 
     if(using_temp_input)
@@ -854,21 +1100,28 @@ auto compile<gfx::texture>(asset_manager& am, const fs::path& key, const fs::pat
     std::string str_input = absolute_path.string();
 
     fs::error_code err;
+    bool compiled = false;
     
     asset_writer::atomic_write_file(output, [&](const fs::path& temp_output) -> void
     {
-        compile_texture_to_file(
+        compiled = compile_texture_to_file(
             absolute_path, 
             temp_output, 
             *importer, 
             protocol
         );
+
+        if(!compiled)
+        {
+            fs::error_code remove_err;
+            fs::remove(temp_output, remove_err);
+        }
     }, err);
     
-    if(err)
+    if(err || !compiled)
     {
         APPLOG_ERROR("Failed compilation of {0} -> {1} with error: {2}", 
-            str_input, output.filename().string(), err.message());
+            str_input, output.filename().string(), err ? err.message() : "texture compiler returned false");
         return false;
     }
 
@@ -1634,4 +1887,3 @@ auto compile<script>(asset_manager& am, const fs::path& key, const fs::path& out
 }
 
 } // namespace unravel::asset_compiler
-

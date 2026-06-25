@@ -35,6 +35,7 @@
 #include <logging/logging.h>
 
 #include <algorithm>
+#include <condition_variable>
 #include <set>
 
 namespace unravel
@@ -60,6 +61,94 @@ template<typename T>
 auto checking_for_recompilation_job_name() -> std::string
 {
     return fmt::format("Checking for recompilation of {}", ex::get_type<T>());
+}
+
+class asset_compile_gate
+{
+public:
+    class permit
+    {
+    public:
+        explicit permit(asset_compile_gate& gate)
+            : gate_(&gate)
+        {
+            gate_->acquire();
+        }
+
+        ~permit()
+        {
+            if(gate_ != nullptr)
+            {
+                gate_->release();
+            }
+        }
+
+        permit(const permit&) = delete;
+        auto operator=(const permit&) -> permit& = delete;
+
+        permit(permit&& other) noexcept
+            : gate_(other.gate_)
+        {
+            other.gate_ = nullptr;
+        }
+
+        auto operator=(permit&& other) noexcept -> permit&
+        {
+            if(this != &other)
+            {
+                if(gate_ != nullptr)
+                {
+                    gate_->release();
+                }
+                gate_ = other.gate_;
+                other.gate_ = nullptr;
+            }
+
+            return *this;
+        }
+
+    private:
+        asset_compile_gate* gate_{};
+    };
+
+    static auto instance() -> asset_compile_gate&
+    {
+        static asset_compile_gate gate;
+        return gate;
+    }
+
+    auto acquire_permit() -> permit
+    {
+        return permit(*this);
+    }
+
+private:
+    void acquire()
+    {
+        std::unique_lock lock(mutex_);
+        cv_.wait(lock, [this]() { return active_jobs_ < max_active_jobs; });
+        ++active_jobs_;
+    }
+
+    void release()
+    {
+        {
+            std::lock_guard lock(mutex_);
+            --active_jobs_;
+        }
+        cv_.notify_one();
+    }
+
+    static constexpr std::size_t max_active_jobs = 1;
+
+    std::mutex mutex_{};
+    std::condition_variable cv_{};
+    std::size_t active_jobs_{};
+};
+
+auto acquire_asset_compile_permit() -> asset_compile_gate::permit
+{
+    return asset_compile_gate::instance().acquire_permit();
 }
 
 
@@ -408,6 +497,7 @@ static void add_to_syncer(rtti::context& ctx,
                 auto task = ts.pool->schedule(job_name,
                                               [&am, ref_path, output, job_name]()
                                               {
+                                                  auto compile_permit = acquire_asset_compile_permit();
                                                   APPLOG_TRACE_PERF_NAMED_ALLOC(std::chrono::milliseconds, fmt::format("{} - {}", job_name, output.string()));
                                                   asset_compiler::compile<T>(am, ref_path, output);
                                               });
@@ -482,6 +572,7 @@ void add_to_syncer<gfx::shader>(rtti::context& ctx,
                                               priority,
                                               [&am, ref_path, output, job_name]()
                                               {
+                                                  auto compile_permit = acquire_asset_compile_permit();
                                                 //   APPLOG_TRACE_PERF_NAMED_ALLOC(std::chrono::milliseconds, fmt::format("{} - {}", job_name, output.string()));
                                                   asset_compiler::compile<gfx::shader>(am, ref_path, output);
                                               });
