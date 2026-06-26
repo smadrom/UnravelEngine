@@ -61,6 +61,16 @@ public:
      */
     void set_cull_type(cull_type val);
 
+    auto get_alpha_blend() const -> bool
+    {
+        return alpha_blend_;
+    }
+
+    void set_alpha_blend(bool val)
+    {
+        alpha_blend_ = val;
+    }
+
     /**
      * @brief Gets the render states for the material.
      * @param apply_cull Whether to apply culling.
@@ -92,6 +102,7 @@ public:
 protected:
     ///< The culling type for this material.
     cull_type cull_type_ = cull_type::counter_clockwise;
+    bool alpha_blend_ = false;
 };
 
 /**

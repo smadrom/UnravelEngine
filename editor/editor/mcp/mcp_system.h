@@ -28,8 +28,16 @@ public:
         uint32_t total = 0;
         uint32_t created = 0;
         uint32_t skipped = 0;
+        uint32_t foliage_done = 0;
+        uint32_t foliage_total = 0;
+        uint32_t foliage_created = 0;
+        uint32_t foliage_skipped = 0;
+        uint32_t water_total = 0;
+        uint32_t water_created = 0;
+        uint32_t water_skipped = 0;
         uint32_t current_index = 0;
         uint32_t current_attempts = 0;
+        std::string current_kind;
         std::string current_name;
         std::string current_model;
         std::string current_texture;
@@ -58,8 +66,12 @@ public:
         std::string name;
         std::string model;
         std::string texture;
+        std::vector<std::string> textures;
         math::vec3 position{};
         math::vec3 forward{0.0f, 0.0f, 1.0f};
+        math::vec3 up{0.0f, 1.0f, 0.0f};
+        bool alpha_blend = false;
+        bool alpha_test = false;
         float source_position_y = 0.0f;
         float terrain_surface_y = 0.0f;
         float local_min_y = 0.0f;
@@ -68,6 +80,33 @@ public:
         bool texture_request_logged = false;
         bool texture_ready_logged = false;
         bool placement_logged = false;
+    };
+
+    struct login_foliage
+    {
+        std::string name;
+        std::string model;
+        std::string texture;
+        std::vector<std::string> textures;
+        math::vec3 position{};
+        bool alpha_blend = false;
+        bool alpha_test = true;
+        float source_position_y = 0.0f;
+        float terrain_surface_y = 0.0f;
+        float local_min_y = 0.0f;
+        int tree_type = -1;
+        bool terrain_sample_valid = false;
+        uint32_t attempts = 0;
+        bool texture_request_logged = false;
+        bool texture_ready_logged = false;
+        bool placement_logged = false;
+    };
+
+    struct login_water
+    {
+        std::string name;
+        std::string payload;
+        uint32_t visible_cells = 0;
     };
 
     auto init(rtti::context& ctx) -> bool;
@@ -119,14 +158,22 @@ private:
         std::string status = "idle";
         std::string error;
         std::vector<login_building> buildings;
+        std::vector<login_foliage> foliage;
+        std::vector<login_water> water;
         terrain_heightfield terrain;
         uint32_t buildings_per_frame = 3;
         uint32_t cursor = 0;
         uint32_t created = 0;
         uint32_t skipped = 0;
+        uint32_t foliage_cursor = 0;
+        uint32_t foliage_created = 0;
+        uint32_t foliage_skipped = 0;
+        uint32_t water_created = 0;
+        uint32_t water_skipped = 0;
         bool active = false;
         bool completed = false;
         bool terrain_created = false;
+        bool water_created_flag = false;
         bool environment_created = false;
     };
 

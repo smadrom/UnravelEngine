@@ -229,6 +229,7 @@ auto material_to_json(const material::sptr& material_instance, uint32_t index) -
 
     result["type"] = "material";
     result["cull_type"] = cull_type_to_string(material_instance->get_cull_type());
+    result["alpha_blend"] = material_instance->get_alpha_blend();
 
     auto pbr = std::dynamic_pointer_cast<pbr_material>(material_instance);
     if(pbr)
@@ -237,6 +238,7 @@ auto material_to_json(const material::sptr& material_instance, uint32_t index) -
         result["base_color"] = color_to_json(pbr->get_base_color());
         result["roughness"] = pbr->get_roughness();
         result["metalness"] = pbr->get_metalness();
+        result["alpha_test_value"] = pbr->get_alpha_test_value();
         result["textures"] = {
             {"color", asset_handle_to_json(pbr->get_color_map())},
             {"normal", asset_handle_to_json(pbr->get_normal_map())},
@@ -637,12 +639,20 @@ auto make_login_status_result(const mcp_system::login_load_status& status) -> js
     result["total"] = status.total;
     result["created"] = status.created;
     result["skipped"] = status.skipped;
+    result["foliage_done"] = status.foliage_done;
+    result["foliage_total"] = status.foliage_total;
+    result["foliage_created"] = status.foliage_created;
+    result["foliage_skipped"] = status.foliage_skipped;
+    result["water_total"] = status.water_total;
+    result["water_created"] = status.water_created;
+    result["water_skipped"] = status.water_skipped;
     result["terrain"] = status.terrain;
     result["current_index"] = status.current_index;
     if(status.has_current)
     {
         result["current"] = {
             {"index", status.current_index},
+            {"kind", status.current_kind},
             {"attempts", status.current_attempts},
             {"name", status.current_name},
             {"model", status.current_model},

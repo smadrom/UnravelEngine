@@ -67,6 +67,12 @@ auto material::get_render_states(bool apply_cull, bool depth_write, bool depth_t
         }
     }
 
+    if(alpha_blend_)
+    {
+        states &= ~BGFX_STATE_WRITE_Z;
+        states |= BGFX_STATE_BLEND_ALPHA;
+    }
+
     return states;
 }
 

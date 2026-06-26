@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 #include <filesystem/filesystem.h>
 #include <functional>
 #include <optional>
@@ -970,6 +971,49 @@ auto normalize_assimp_path(const char* path) -> fs::path
         return {};
     }
     return normalize_assimp_path(std::string(path));
+}
+
+auto is_login_gltf_mesh_path(const fs::path& path) -> bool
+{
+    const auto normalized_path = normalize_assimp_path(path);
+    const auto normalized = string_utils::to_lower(normalized_path.generic_string());
+    if(normalized.find("/data/login/") == std::string::npos)
+    {
+        return false;
+    }
+
+    const auto extension = string_utils::to_lower(normalized_path.extension().string());
+    if(extension == ".glb" || extension == ".gltf")
+    {
+        return true;
+    }
+
+    if(normalized.find("/objects/") == std::string::npos)
+    {
+        return false;
+    }
+
+    std::ifstream file(normalized_path, std::ios::binary);
+    if(!file)
+    {
+        return false;
+    }
+
+    std::array<char, 512> header{};
+    file.read(header.data(), static_cast<std::streamsize>(header.size()));
+    const auto read_count = file.gcount();
+    if(read_count >= 4 && header[0] == 'g' && header[1] == 'l' && header[2] == 'T' && header[3] == 'F')
+    {
+        return true;
+    }
+
+    if(read_count <= 0)
+    {
+        return false;
+    }
+
+    const std::string_view text(header.data(), static_cast<size_t>(read_count));
+    return text.find("\"asset\"") != std::string_view::npos && text.find("\"meshes\"") != std::string_view::npos;
 }
 
 /**
@@ -4757,7 +4801,8 @@ void process_imported_scene(asset_manager& am,
                             mesh::load_data& load_data,
                             std::vector<animation_clip>& animations,
                             std::vector<imported_material>& materials,
-                            std::vector<imported_texture>& textures)
+                            std::vector<imported_texture>& textures,
+                            bool apply_import_facing_correction)
 {
     int meshes_with_bones = 0;
     int meshes_without_bones = 0;
@@ -4803,7 +4848,14 @@ void process_imported_scene(asset_manager& am,
         accumulate_bounds_from_armature(load_data, load_data.bbox);
     }
 
-    apply_import_facing_correction_to_load_data(load_data);
+    if(apply_import_facing_correction)
+    {
+        apply_import_facing_correction_to_load_data(load_data);
+    }
+    else
+    {
+        APPLOG_TRACE("Mesh Importer: Keeping source glTF coordinate frame for {}", filename.generic_string());
+    }
 
     APPLOG_TRACE("Mesh Importer: bbox min {}, max {}", load_data.bbox.min, load_data.bbox.max);
 }
@@ -4982,8 +5034,9 @@ auto load_mesh_data_from_file(asset_manager& am,
 
     // clang-format off
 
-    uint32_t flags = aiProcess_ConvertToLeftHanded                      |
-                     aiProcess_RemoveComponent              |
+    const bool login_open_format_gltf = is_login_gltf_mesh_path(path);
+
+    uint32_t flags = aiProcess_RemoveComponent              |
                      aiProcess_Triangulate                  |
                      aiProcess_CalcTangentSpace             |
                      aiProcess_GenUVCoords                  |
@@ -4996,6 +5049,15 @@ auto load_mesh_data_from_file(asset_manager& am,
                      aiProcess_GlobalScale;
 
     // clang-format on
+
+    if(!login_open_format_gltf)
+    {
+        flags |= aiProcess_ConvertToLeftHanded;
+    }
+    else
+    {
+        APPLOG_TRACE("Mesh Importer: Preserving Login glTF handedness for {}", path.generic_string());
+    }
 
     if(import_meta.model.weld_vertices)
     {
@@ -5017,9 +5079,14 @@ auto load_mesh_data_from_file(asset_manager& am,
     {
         flags |= aiProcess_FindInvalidData;
     }
-    if(import_meta.materials.remove_redundant_materials)
+    const bool preserve_login_material_slots = login_open_format_gltf;
+    if(import_meta.materials.remove_redundant_materials && !preserve_login_material_slots)
     {
         flags |= aiProcess_RemoveRedundantMaterials;
+    }
+    else if(import_meta.materials.remove_redundant_materials && preserve_login_material_slots)
+    {
+        APPLOG_TRACE("Mesh Importer: Preserving Login glTF material slots for {}", path.generic_string());
     }
 
     APPLOG_TRACE("Mesh Importer: Loading {}", path.generic_string());
@@ -5036,7 +5103,15 @@ auto load_mesh_data_from_file(asset_manager& am,
     aiScene* modScene = const_cast<aiScene*>(scene);
 
     //CollapseAssimpFBXPivotsAndAnimations(modScene);
-    process_imported_scene(am, file, output_dir, modScene, load_data, animations, materials, textures);
+    process_imported_scene(am,
+                           file,
+                           output_dir,
+                           modScene,
+                           load_data,
+                           animations,
+                           materials,
+                           textures,
+                           !login_open_format_gltf);
 
     APPLOG_TRACE("Mesh Importer: Done with {}", path.generic_string());
 

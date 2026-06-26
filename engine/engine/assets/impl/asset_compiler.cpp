@@ -225,7 +225,8 @@ void write_u32_le(std::ostream& output, uint32_t value)
 struct ktx2_dds_format
 {
     uint32_t dxgi_format = 0;
-    uint32_t block_bytes = 0;
+    uint32_t unit_bytes = 0;
+    bool block_compressed = true;
 };
 
 auto get_ktx2_bc_dds_format(uint32_t vk_format) -> std::optional<ktx2_dds_format>
@@ -233,29 +234,38 @@ auto get_ktx2_bc_dds_format(uint32_t vk_format) -> std::optional<ktx2_dds_format
     // Vulkan KTX2 format ids mapped to DDS DX10 ids accepted by bimg.
     switch(vk_format)
     {
-        case 131: return ktx2_dds_format{71, 8};  // VK_FORMAT_BC1_RGB_UNORM_BLOCK
-        case 132: return ktx2_dds_format{72, 8};  // VK_FORMAT_BC1_RGB_SRGB_BLOCK
-        case 133: return ktx2_dds_format{71, 8};  // VK_FORMAT_BC1_RGBA_UNORM_BLOCK
-        case 134: return ktx2_dds_format{72, 8};  // VK_FORMAT_BC1_RGBA_SRGB_BLOCK
-        case 135: return ktx2_dds_format{74, 16}; // VK_FORMAT_BC2_UNORM_BLOCK
-        case 136: return ktx2_dds_format{75, 16}; // VK_FORMAT_BC2_SRGB_BLOCK
-        case 137: return ktx2_dds_format{77, 16}; // VK_FORMAT_BC3_UNORM_BLOCK
-        case 138: return ktx2_dds_format{78, 16}; // VK_FORMAT_BC3_SRGB_BLOCK
-        case 139: return ktx2_dds_format{80, 8};  // VK_FORMAT_BC4_UNORM_BLOCK
-        case 141: return ktx2_dds_format{83, 16}; // VK_FORMAT_BC5_UNORM_BLOCK
-        case 143: return ktx2_dds_format{95, 16}; // VK_FORMAT_BC6H_UFLOAT_BLOCK
-        case 144: return ktx2_dds_format{96, 16}; // VK_FORMAT_BC6H_SFLOAT_BLOCK
-        case 145: return ktx2_dds_format{98, 16}; // VK_FORMAT_BC7_UNORM_BLOCK
-        case 146: return ktx2_dds_format{99, 16}; // VK_FORMAT_BC7_SRGB_BLOCK
+        case 37: return ktx2_dds_format{28, 4, false}; // VK_FORMAT_R8G8B8A8_UNORM
+        case 43: return ktx2_dds_format{29, 4, false}; // VK_FORMAT_R8G8B8A8_SRGB
+        case 44: return ktx2_dds_format{87, 4, false}; // VK_FORMAT_B8G8R8A8_UNORM
+        case 50: return ktx2_dds_format{91, 4, false}; // VK_FORMAT_B8G8R8A8_SRGB
+        case 131: return ktx2_dds_format{71, 8, true};  // VK_FORMAT_BC1_RGB_UNORM_BLOCK
+        case 132: return ktx2_dds_format{72, 8, true};  // VK_FORMAT_BC1_RGB_SRGB_BLOCK
+        case 133: return ktx2_dds_format{71, 8, true};  // VK_FORMAT_BC1_RGBA_UNORM_BLOCK
+        case 134: return ktx2_dds_format{72, 8, true};  // VK_FORMAT_BC1_RGBA_SRGB_BLOCK
+        case 135: return ktx2_dds_format{74, 16, true}; // VK_FORMAT_BC2_UNORM_BLOCK
+        case 136: return ktx2_dds_format{75, 16, true}; // VK_FORMAT_BC2_SRGB_BLOCK
+        case 137: return ktx2_dds_format{77, 16, true}; // VK_FORMAT_BC3_UNORM_BLOCK
+        case 138: return ktx2_dds_format{78, 16, true}; // VK_FORMAT_BC3_SRGB_BLOCK
+        case 139: return ktx2_dds_format{80, 8, true};  // VK_FORMAT_BC4_UNORM_BLOCK
+        case 141: return ktx2_dds_format{83, 16, true}; // VK_FORMAT_BC5_UNORM_BLOCK
+        case 143: return ktx2_dds_format{95, 16, true}; // VK_FORMAT_BC6H_UFLOAT_BLOCK
+        case 144: return ktx2_dds_format{96, 16, true}; // VK_FORMAT_BC6H_SFLOAT_BLOCK
+        case 145: return ktx2_dds_format{98, 16, true}; // VK_FORMAT_BC7_UNORM_BLOCK
+        case 146: return ktx2_dds_format{99, 16, true}; // VK_FORMAT_BC7_SRGB_BLOCK
         default: return std::nullopt;
     }
 }
 
-auto get_bc_mip_size(uint32_t width, uint32_t height, uint32_t block_bytes) -> uint64_t
+auto get_ktx2_mip_size(uint32_t width, uint32_t height, const ktx2_dds_format& format) -> uint64_t
 {
-    const uint64_t blocks_w = std::max<uint32_t>(1, (width + 3) / 4);
-    const uint64_t blocks_h = std::max<uint32_t>(1, (height + 3) / 4);
-    return blocks_w * blocks_h * block_bytes;
+    if(format.block_compressed)
+    {
+        const uint64_t blocks_w = std::max<uint32_t>(1, (width + 3) / 4);
+        const uint64_t blocks_h = std::max<uint32_t>(1, (height + 3) / 4);
+        return blocks_w * blocks_h * format.unit_bytes;
+    }
+
+    return uint64_t(width) * uint64_t(height) * uint64_t(format.unit_bytes);
 }
 
 auto wrap_ktx2_bc_as_dds(const fs::path& input_path, const fs::path& output_path) -> bool
@@ -310,13 +320,13 @@ auto wrap_ktx2_bc_as_dds(const fs::path& input_path, const fs::path& output_path
         const uint64_t length = read_u64_le(data, table_offset + 8);
         const uint32_t mip_width = std::max<uint32_t>(1, width >> i);
         const uint32_t mip_height = std::max<uint32_t>(1, height >> i);
-        const uint64_t expected_length = get_bc_mip_size(mip_width, mip_height, format->block_bytes);
+        const uint64_t expected_length = get_ktx2_mip_size(mip_width, mip_height, *format);
 
-        if(length != expected_length || offset > data.size() || length > data.size() - offset)
+        if(length < expected_length || offset > data.size() || length > data.size() - offset)
         {
             return false;
         }
-        levels.push_back({offset, length});
+        levels.push_back({offset, expected_length});
     }
 
     std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
@@ -332,6 +342,7 @@ auto wrap_ktx2_bc_as_dds(const fs::path& input_path, const fs::path& output_path
     constexpr uint32_t ddsd_width = 0x00000004;
     constexpr uint32_t ddsd_pixelformat = 0x00001000;
     constexpr uint32_t ddsd_mipmapcount = 0x00020000;
+    constexpr uint32_t ddsd_pitch = 0x00000008;
     constexpr uint32_t ddsd_linearsize = 0x00080000;
     constexpr uint32_t ddpf_fourcc = 0x00000004;
     constexpr uint32_t dds_dx10 = 0x30315844;               // "DX10"
@@ -344,11 +355,14 @@ auto wrap_ktx2_bc_as_dds(const fs::path& input_path, const fs::path& output_path
     write_u32_le(output, dds_magic);
     write_u32_le(output, dds_header_size);
     write_u32_le(output,
-                 ddsd_caps | ddsd_height | ddsd_width | ddsd_pixelformat | ddsd_linearsize |
-                     (level_count > 1 ? ddsd_mipmapcount : 0u));
+                 ddsd_caps | ddsd_height | ddsd_width | ddsd_pixelformat |
+                     (format->block_compressed ? ddsd_linearsize : ddsd_pitch) |
+                      (level_count > 1 ? ddsd_mipmapcount : 0u));
     write_u32_le(output, height);
     write_u32_le(output, width);
-    write_u32_le(output, static_cast<uint32_t>(levels.front().length));
+    write_u32_le(output,
+                 format->block_compressed ? static_cast<uint32_t>(levels.front().length)
+                                          : width * format->unit_bytes);
     write_u32_le(output, 1); // depth
     write_u32_le(output, level_count);
     for(uint32_t i = 0; i < 11; ++i)
@@ -389,7 +403,7 @@ auto wrap_ktx2_bc_as_dds(const fs::path& input_path, const fs::path& output_path
         return false;
     }
 
-    APPLOG_INFO("Wrapped KTX2 BC texture as DDS: {0} -> {1}",
+    APPLOG_INFO("Wrapped KTX2 texture as DDS: {0} -> {1}",
                 input_path.filename().string(),
                 output_path.filename().string());
     return true;
