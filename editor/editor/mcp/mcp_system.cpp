@@ -355,6 +355,32 @@ auto read_vec3_array(const json& item, const char* label) -> math::vec3
     return {item[0].get<float>(), item[1].get<float>(), item[2].get<float>()};
 }
 
+auto read_login_light_vec3_member(const json& item, const char* key) -> math::vec3
+{
+    if(!item.contains(key) || !item[key].is_array() || item[key].size() < 3)
+    {
+        throw std::runtime_error(std::string("load_login: light has no valid '") + key + "'");
+    }
+
+    return {item[key][0].get<float>(), item[key][1].get<float>(), item[key][2].get<float>()};
+}
+
+auto read_login_light_color(const json& item) -> math::color
+{
+    const auto color = read_login_light_vec3_member(item, "colorRGB");
+    return {color.x, color.y, color.z, 1.0f};
+}
+
+auto normalize_login_light_direction(const math::vec3& direction) -> math::vec3
+{
+    if(math::dot(direction, direction) <= 0.000001f)
+    {
+        throw std::runtime_error("load_login: directional light has zero direction");
+    }
+
+    return math::normalize(direction);
+}
+
 auto map_source_position_to_unravel(const math::vec3& source_pos) -> math::vec3
 {
     return source_pos;
@@ -1178,6 +1204,75 @@ auto find_scene_entity_named(scene& scn, const std::string& name) -> entt::handl
     return {};
 }
 
+void create_login_lights(rtti::context& ctx, const std::string& content_root)
+{
+    const auto lights_doc = read_json_asset(make_asset_key(content_root, "lights/login.eds.lights.json"));
+    if(!lights_doc.contains("lights") || !lights_doc["lights"].is_array())
+    {
+        throw std::runtime_error("load_login: login.eds.lights.json has no lights[]");
+    }
+
+    auto& scn = ctx.get_cached<ecs>().get_scene();
+    size_t directional_count = 0;
+    size_t point_count = 0;
+
+    const auto& lights = lights_doc["lights"];
+    for(size_t i = 0; i < lights.size(); ++i)
+    {
+        const auto& light_item = lights[i];
+        if(!light_item.is_object())
+        {
+            continue;
+        }
+
+        const auto type = light_item.value("type", std::string{});
+        if(type == "directional")
+        {
+            auto sun = find_scene_entity_named(scn, "Sun Light");
+            if(!sun)
+            {
+                sun = defaults::create_light_entity(ctx, scn, light_type::directional, "Sun");
+            }
+
+            const auto direction =
+                normalize_login_light_direction(read_login_light_vec3_member(light_item, "direction"));
+            auto& transform = sun.get_or_emplace<transform_component>();
+            transform.set_rotation_global(math::from_to_rotation(math::vec3{0.0f, 0.0f, 1.0f}, direction));
+
+            auto& light_comp = sun.get_or_emplace<light_component>();
+            auto light_data = light_comp.get_light();
+            light_data.type = light_type::directional;
+            light_data.color = read_login_light_color(light_item);
+            // PW authored sun intensity (~1.0) is far below this engine's photometric scale (engine default ~5.0).
+            light_data.intensity = light_item.value("intensity", light_data.intensity) * 4.5f;
+            light_comp.set_light(light_data);
+
+            ++directional_count;
+            continue;
+        }
+
+        if(type == "point")
+        {
+            auto point_entity = scene::create_entity(*scn.registry, "Login Light " + std::to_string(i));
+            auto& transform = point_entity.get<transform_component>();
+            transform.set_position_local(read_login_light_vec3_member(light_item, "position"));
+
+            light light_data;
+            light_data.type = light_type::point;
+            light_data.color = read_login_light_color(light_item);
+            light_data.intensity = light_item.value("intensity", light_data.intensity);
+            light_data.point_data.range = light_item.value("range", light_data.point_data.range);
+            light_data.casts_shadows = false;
+
+            point_entity.emplace<light_component>().set_light(light_data);
+
+            ++point_count;
+        }
+    }
+
+    APPLOG_INFO("load_login lights created: directional={} points={}", directional_count, point_count);
+}
+
 void create_login_environment(rtti::context& ctx)
 {
     auto& scn = ctx.get_cached<ecs>().get_scene();
@@ -1204,23 +1299,13 @@ void create_login_environment(rtti::context& ctx)
     if(!sun)
     {
         sun = defaults::create_light_entity(ctx, scn, light_type::directional, "Sun");
-
-        auto& transform = sun.get<transform_component>();
-        transform.set_rotation_euler_local({50.0f, -30.0f, 0.0f});
     }
 
     if(sun)
     {
-        if(auto* light_comp = sun.try_get<light_component>())
-        {
-            auto light = light_comp->get_light();
-            light.intensity = 2.0f;
-            light_comp->set_light(light);
-        }
-
         auto& skylight = sun.get_or_emplace<skylight_component>();
         skylight.set_cloud_mode(skylight_component::cloud_mode::none);
-        skylight.set_irradiance_intensity(0.08f);
+        skylight.set_irradiance_intensity(0.35f);
     }
 
     if(!find_scene_entity_named(scn, "Reflection Probe Global"))
@@ -1781,6 +1866,7 @@ void mcp_system::service_login_loader(rtti::context& ctx)
         if(!login_.environment_created)
         {
             create_login_environment(ctx);
+            create_login_lights(ctx, login_.content_root);
             login_.environment_created = true;
         }
 
