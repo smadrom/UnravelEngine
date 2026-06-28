@@ -1166,9 +1166,18 @@ auto create_login_water_surface(rtti::context& ctx,
     }
 
     auto material_instance = std::make_shared<pbr_material>();
-    material_instance->set_base_color(login_water_color_from_argb(source_argb));
-    material_instance->set_metalness(0.0f);
-    material_instance->set_roughness(0.06f);
+    const auto source_color = login_water_color_from_argb(source_argb);
+    const float source_luminance = source_color.value.r * 0.2126f +
+                                   source_color.value.g * 0.7152f +
+                                   source_color.value.b * 0.0722f;
+    const math::color water_base_color{
+        std::clamp(source_luminance * 0.08f + source_color.value.r * 0.10f + 0.015f, 0.0f, 0.07f),
+        std::clamp(source_luminance * 0.10f + source_color.value.g * 0.16f + 0.055f, 0.0f, 0.16f),
+        std::clamp(source_luminance * 0.10f + source_color.value.b * 0.15f + 0.070f, 0.0f, 0.18f),
+        1.0f};
+    material_instance->set_base_color(water_base_color);
+    material_instance->set_metalness(0.04f);
+    material_instance->set_roughness(0.08f);
     material_instance->set_cull_type(cull_type::none);
 
     model water_model;
