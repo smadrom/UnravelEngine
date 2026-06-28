@@ -974,6 +974,153 @@ auto make_login_foliage(const std::string& content_root, const terrain_heightfie
     return result;
 }
 
+auto build_login_terrain_skirt_mesh_data(const terrain_heightfield& terrain, mesh::load_data& data) -> bool
+{
+    if(!terrain.is_valid())
+    {
+        return false;
+    }
+
+    const uint32_t segments_x = terrain.width - 1u;
+    const uint32_t segments_z = terrain.height - 1u;
+    const uint32_t edge_segments = (segments_x + segments_z) * 2u;
+    if(edge_segments == 0u)
+    {
+        return false;
+    }
+
+    data = mesh::load_data{};
+    data.vertex_format = gfx::mesh_vertex::get_layout();
+    data.vertex_count = edge_segments * 4u;
+    data.triangle_count = edge_segments * 2u;
+    data.vertex_data.resize(static_cast<size_t>(data.vertex_count) * data.vertex_format.getStride());
+    data.triangle_data.resize(data.triangle_count);
+    data.material_count = 1;
+
+    const float height_range = terrain.height_range();
+    const float base_y = 0.0f;
+
+    auto sample_height = [&terrain, height_range](uint32_t x, uint32_t z) -> float
+    {
+        x = std::min(x, terrain.width - 1u);
+        z = std::min(z, terrain.height - 1u);
+        return terrain.heights[static_cast<size_t>(z) * static_cast<size_t>(terrain.width) + static_cast<size_t>(x)] *
+               height_range;
+    };
+
+    auto local_position = [&terrain, segments_x, segments_z, sample_height](uint32_t x, uint32_t z) -> math::vec3
+    {
+        const float u = static_cast<float>(x) / static_cast<float>(segments_x);
+        const float v = static_cast<float>(z) / static_cast<float>(segments_z);
+        return {
+            (u - 0.5f) * terrain.world_width,
+            sample_height(x, z),
+            (0.5f - v) * terrain.world_depth};
+    };
+
+    auto pack_vertex = [&data](uint32_t index,
+                               const math::vec3& position,
+                               const math::vec3& normal,
+                               const math::vec3& tangent,
+                               const math::vec3& bitangent,
+                               float u,
+                               float v)
+    {
+        const float packed_position[4] = {position.x, position.y, position.z, 0.0f};
+        const float packed_normal[4] = {normal.x, normal.y, normal.z, 0.0f};
+        const float packed_tangent[4] = {tangent.x, tangent.y, tangent.z, 0.0f};
+        const float packed_bitangent[4] = {bitangent.x, bitangent.y, bitangent.z, 0.0f};
+        const float packed_texcoord[4] = {u, v, 0.0f, 0.0f};
+
+        gfx::vertex_pack(packed_position, false, gfx::attribute::Position, data.vertex_format, data.vertex_data.data(), index);
+        gfx::vertex_pack(packed_normal, true, gfx::attribute::Normal, data.vertex_format, data.vertex_data.data(), index);
+        gfx::vertex_pack(packed_tangent, true, gfx::attribute::Tangent, data.vertex_format, data.vertex_data.data(), index);
+        gfx::vertex_pack(packed_bitangent, true, gfx::attribute::Bitangent, data.vertex_format, data.vertex_data.data(), index);
+        gfx::vertex_pack(packed_texcoord, true, gfx::attribute::TexCoord0, data.vertex_format, data.vertex_data.data(), index);
+    };
+
+    math::bbox bounds;
+    uint32_t vertex_index = 0;
+    uint32_t triangle_index = 0;
+    const math::vec3 bitangent{0.0f, 1.0f, 0.0f};
+
+    auto append_segment = [&](uint32_t x0,
+                              uint32_t z0,
+                              uint32_t x1,
+                              uint32_t z1,
+                              const math::vec3& normal,
+                              const math::vec3& tangent)
+    {
+        auto top0 = local_position(x0, z0);
+        auto top1 = local_position(x1, z1);
+        auto bottom1 = top1;
+        auto bottom0 = top0;
+        bottom1.y = base_y;
+        bottom0.y = base_y;
+
+        const float u0 = static_cast<float>(x0) / static_cast<float>(segments_x);
+        const float v0 = static_cast<float>(z0) / static_cast<float>(segments_z);
+        const float u1 = static_cast<float>(x1) / static_cast<float>(segments_x);
+        const float v1 = static_cast<float>(z1) / static_cast<float>(segments_z);
+
+        const uint32_t i0 = vertex_index++;
+        const uint32_t i1 = vertex_index++;
+        const uint32_t i2 = vertex_index++;
+        const uint32_t i3 = vertex_index++;
+
+        pack_vertex(i0, top0, normal, tangent, bitangent, u0, v0);
+        pack_vertex(i1, top1, normal, tangent, bitangent, u1, v1);
+        pack_vertex(i2, bottom1, normal, tangent, bitangent, u1, v1);
+        pack_vertex(i3, bottom0, normal, tangent, bitangent, u0, v0);
+
+        bounds.add_point(top0);
+        bounds.add_point(top1);
+        bounds.add_point(bottom1);
+        bounds.add_point(bottom0);
+
+        auto& tri0 = data.triangle_data[triangle_index++];
+        tri0.data_group_id = 0;
+        tri0.indices = {i0, i1, i2};
+
+        auto& tri1 = data.triangle_data[triangle_index++];
+        tri1.data_group_id = 0;
+        tri1.indices = {i0, i2, i3};
+    };
+
+    for(uint32_t x = 0; x < segments_x; ++x)
+    {
+        append_segment(x, 0u, x + 1u, 0u, {0.0f, 0.0f, 1.0f}, {1.0f, 0.0f, 0.0f});
+    }
+    for(uint32_t z = 0; z < segments_z; ++z)
+    {
+        append_segment(segments_x, z, segments_x, z + 1u, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f});
+    }
+    for(uint32_t x = 0; x < segments_x; ++x)
+    {
+        append_segment(x, segments_z, x + 1u, segments_z, {0.0f, 0.0f, -1.0f}, {1.0f, 0.0f, 0.0f});
+    }
+    for(uint32_t z = 0; z < segments_z; ++z)
+    {
+        append_segment(0u, z, 0u, z + 1u, {-1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f});
+    }
+
+    if(vertex_index != data.vertex_count || triangle_index != data.triangle_count)
+    {
+        return false;
+    }
+
+    mesh::submesh skirt_submesh;
+    skirt_submesh.data_group_id = 0;
+    skirt_submesh.vertex_start = 0;
+    skirt_submesh.vertex_count = data.vertex_count;
+    skirt_submesh.face_start = 0;
+    skirt_submesh.face_count = data.triangle_count;
+    skirt_submesh.bbox = bounds;
+    data.submeshes.emplace_back(skirt_submesh);
+    data.bbox = bounds;
+    return true;
+}
+
 void create_login_terrain(rtti::context& ctx, const std::string& content_root, const terrain_heightfield& terrain)
 {
     auto terrain_mesh = std::make_shared<mesh>();
@@ -993,6 +1140,19 @@ void create_login_terrain(rtti::context& ctx, const std::string& content_root, c
 
     auto& am = ctx.get_cached<asset_manager>();
     auto terrain_handle = am.get_asset_from_instance<mesh>("app:/generated/login_terrain", terrain_mesh);
+
+    mesh::load_data terrain_skirt_data;
+    if(!build_login_terrain_skirt_mesh_data(terrain, terrain_skirt_data))
+    {
+        throw std::runtime_error("load_login: failed to create terrain skirt data");
+    }
+
+    auto terrain_skirt_mesh = std::make_shared<mesh>();
+    if(!terrain_skirt_mesh->load_mesh(std::move(terrain_skirt_data)))
+    {
+        throw std::runtime_error("load_login: failed to create terrain skirt mesh");
+    }
+    auto terrain_skirt_handle = am.get_asset_from_instance<mesh>("app:/generated/login_terrain_skirt", terrain_skirt_mesh);
 
     auto material_instance = std::make_shared<pbr_material>();
     material_instance->set_base_color({1.0f, 1.0f, 1.0f, 1.0f});
@@ -1031,6 +1191,21 @@ void create_login_terrain(rtti::context& ctx, const std::string& content_root, c
     auto entity = scene::create_entity(*scn.registry, "Login Terrain");
     entity.get<transform_component>().set_position_local({0.0f, terrain.heightfield_entity_y(), 0.0f});
     entity.emplace<model_component>().set_model(terrain_model);
+
+    model terrain_skirt_model;
+    terrain_skirt_model.set_lod(terrain_skirt_handle, 0);
+    if(auto terrain_skirt = terrain_skirt_handle.get())
+    {
+        const auto submeshes = terrain_skirt->get_submeshes_count(0);
+        for(uint32_t i = 0; i < submeshes; ++i)
+        {
+            terrain_skirt_model.set_material_instance(material_instance, i);
+        }
+    }
+
+    auto skirt_entity = scene::create_entity(*scn.registry, "Login Terrain Skirt");
+    skirt_entity.get<transform_component>().set_position_local({0.0f, terrain.heightfield_entity_y(), 0.0f});
+    skirt_entity.emplace<model_component>().set_model(terrain_skirt_model);
 }
 
 auto color_from_argb(uint32_t argb) -> math::color
