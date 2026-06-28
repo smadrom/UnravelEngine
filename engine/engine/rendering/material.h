@@ -274,8 +274,19 @@ public:
         const auto normal_texture = normal_map.get();
         surface_data2[1] =
             normal_texture && gfx::normal_map_needs_z_reconstruction(normal_texture->info.format) ? 1.0f : 0.0f;
+        surface_data2[2] = double_sided_normal_flip_ ? 1.0f : 0.0f;
 
         return surface_data2;
+    }
+
+    auto get_double_sided_normal_flip() const -> bool
+    {
+        return double_sided_normal_flip_;
+    }
+
+    void set_double_sided_normal_flip(bool val)
+    {
+        double_sided_normal_flip_ = val;
     }
 
     auto metalness_roughness_combined() const -> bool
@@ -451,6 +462,7 @@ private:
     };
     /// Emissive intensity multiplier (premultiplied into color before G-buffer write)
     float emissive_intensity_{1.0f};
+    bool double_sided_normal_flip_{false};
     /// Surface data
     math::vec4 surface_data_{
         0.3f, /// Roughness

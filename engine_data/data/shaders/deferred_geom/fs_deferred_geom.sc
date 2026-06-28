@@ -30,6 +30,7 @@ uniform vec4 u_dither_threshold; //.x = alpha threshold .y = distance threshold
 #define u_surface_alpha_test_value u_surface_data.w
 #define u_surface_metalness_roughness_combined u_surface_data2.x
 #define u_surface_normal_reconstruct_z u_surface_data2.y
+#define u_surface_double_sided_normal_flip u_surface_data2.z
 
 #define u_camear_near u_camera_clip_planes.x
 #define u_camear_far u_camera_clip_planes.y
@@ -72,6 +73,10 @@ void main()
 	mat3 tangent_to_world_space = constructTangentToWorldSpaceMatrix(normalize(v_wtangent), normalize(v_wbitangent), normalize(v_wnormal));
 
 	vec3 wnormal = normalize( mul( tangent_to_world_space, tangent_space_normal ).xyz );
+	if(u_surface_double_sided_normal_flip > 0.5f)
+	{
+		wnormal *= mix(-1.0f, 1.0f, step(0.0f, dot(wnormal, view_direction)));
+	}
 	vec4 albedo_color = texture2D(s_tex_color, texcoords) * u_base_color;
 
 	float distance = length(view_direction) - u_camear_near * 2.0f;

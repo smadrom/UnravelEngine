@@ -1591,6 +1591,7 @@ auto create_login_foliage(rtti::context& ctx,
         material_instance->set_metalness(0.0f);
         material_instance->set_roughness(1.0f);
         material_instance->set_cull_type(cull_type::none);
+        material_instance->set_double_sided_normal_flip(true);
         material_instance->set_alpha_blend(foliage.alpha_blend);
         if(foliage.alpha_test)
         {
