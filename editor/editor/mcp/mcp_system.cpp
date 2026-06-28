@@ -11,10 +11,12 @@
 #include <engine/ecs/ecs.h>
 #include <engine/ecs/scene.h>
 #include <engine/events.h>
+#include <engine/rendering/ecs/components/auto_exposure_component.h>
 #include <engine/rendering/ecs/components/camera_component.h>
 #include <engine/rendering/ecs/components/light_component.h>
 #include <engine/rendering/ecs/components/model_component.h>
 #include <engine/rendering/ecs/components/reflection_probe_component.h>
+#include <engine/rendering/ecs/components/tonemapping_component.h>
 #include <engine/rendering/ecs/systems/rendering_system.h>
 #include <engine/rendering/material.h>
 #include <engine/rendering/mesh.h>
@@ -1162,42 +1164,66 @@ auto create_login_water_surface(rtti::context& ctx,
     return true;
 }
 
-auto scene_has_entity_named(scene& scn, const std::string& name) -> bool
+auto find_scene_entity_named(scene& scn, const std::string& name) -> entt::handle
 {
     auto view = scn.registry->view<tag_component>();
     for(auto e : view)
     {
         if(view.get<tag_component>(e).name == name)
         {
-            return true;
+            return scn.create_handle(e);
         }
     }
 
-    return false;
+    return {};
 }
 
 void create_login_environment(rtti::context& ctx)
 {
     auto& scn = ctx.get_cached<ecs>().get_scene();
 
-    if(!scene_has_entity_named(scn, "Volume"))
+    auto volume = find_scene_entity_named(scn, "Volume");
+    if(!volume)
     {
-        defaults::create_volume_entity(ctx, scn, "Volume", volume_mode::global);
+        volume = defaults::create_volume_entity(ctx, scn, "Volume", volume_mode::global);
     }
 
-    if(!scene_has_entity_named(scn, "Sun Light"))
+    if(auto* tonemapping = volume.try_get<tonemapping_component>())
     {
-        auto sun = defaults::create_light_entity(ctx, scn, light_type::directional, "Sun");
+        tonemapping->enabled = true;
+        tonemapping->settings.method = tonemapping_method::aces;
+        tonemapping->settings.exposure = 0.85f;
+    }
+
+    if(auto* auto_exposure = volume.try_get<auto_exposure_component>())
+    {
+        auto_exposure->enabled = false;
+    }
+
+    auto sun = find_scene_entity_named(scn, "Sun Light");
+    if(!sun)
+    {
+        sun = defaults::create_light_entity(ctx, scn, light_type::directional, "Sun");
 
         auto& transform = sun.get<transform_component>();
         transform.set_rotation_euler_local({50.0f, -30.0f, 0.0f});
+    }
+
+    if(sun)
+    {
+        if(auto* light_comp = sun.try_get<light_component>())
+        {
+            auto light = light_comp->get_light();
+            light.intensity = 2.0f;
+            light_comp->set_light(light);
+        }
 
         auto& skylight = sun.get_or_emplace<skylight_component>();
         skylight.set_cloud_mode(skylight_component::cloud_mode::none);
-        skylight.set_irradiance_intensity(0.20f);
+        skylight.set_irradiance_intensity(0.08f);
     }
 
-    if(!scene_has_entity_named(scn, "Reflection Probe Global"))
+    if(!find_scene_entity_named(scn, "Reflection Probe Global"))
     {
         auto probe_entity = defaults::create_reflection_probe_entity(ctx, scn, probe_type::sphere, " Global");
         auto& reflection_comp = probe_entity.get_or_emplace<reflection_probe_component>();
