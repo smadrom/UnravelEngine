@@ -59,12 +59,12 @@ constexpr const char* kLoginCharacterEntityName = "Login Character";
 constexpr const char* kLoginCharacterMeshRef = "characters/player/model_d2dc62c0.gltf";
 constexpr const char* kLoginCharacterIdleClipRef = "characters/player/model_d2dc62c0_anim_f682cdc5.anim";
 // Character stand + char-select camera derived from the client config configs/scenectrl.ini
-// (read via AngelicaIDE PCK reader). The converted login scene has Z negated relative to the
-// original client coordinate space, so every scenectrl.ini position/direction Z is flipped here.
+// (read via AngelicaIDE PCK reader). The converter now emits LEFT-handed open format (kEmitLeftHanded),
+// matching this LH runtime, so scenectrl.ini coordinates are used directly (no Z flip).
 // Stand = [NewChar] Pos0 (profession 0 = Blademaster), camera = [Camera] idx 14 (LOGIN_SCENE_CREATE
 // for profession 0) + s_camPosDelta[0][0]=(0,0.2,0); FOV = DEFCAMERA_FOV (56 deg).
 constexpr float kLoginCharacterX = 191.983002f;
-constexpr float kLoginCharacterZ = -286.619995f;
+constexpr float kLoginCharacterZ = 286.619995f;
 constexpr float kLoginCharacterFallbackY = 228.391006f;
 constexpr float kLoginCharacterGroundOffset = 0.03f;
 constexpr float kLoginCharacterCameraFov = 56.0f;
@@ -269,7 +269,7 @@ void parse_login_scene_camera_value(std::array<partial_login_scene_camera, kLogi
     }
     if(parse_login_scene_key_index(key, "PosZ", kLoginSceneCameraCount, index))
     {
-        cameras[static_cast<size_t>(index)].camera.pos.z = -value;
+        cameras[static_cast<size_t>(index)].camera.pos.z = value;
         cameras[static_cast<size_t>(index)].pos_z = true;
         return;
     }
@@ -285,7 +285,7 @@ void parse_login_scene_camera_value(std::array<partial_login_scene_camera, kLogi
     }
     if(parse_login_scene_key_index(key, "DirZ", kLoginSceneCameraCount, index))
     {
-        cameras[static_cast<size_t>(index)].camera.dir.z = -value;
+        cameras[static_cast<size_t>(index)].camera.dir.z = value;
         return;
     }
     if(parse_login_scene_key_index(key, "UpX", kLoginSceneCameraCount, index))
@@ -300,7 +300,7 @@ void parse_login_scene_camera_value(std::array<partial_login_scene_camera, kLogi
     }
     if(parse_login_scene_key_index(key, "UpZ", kLoginSceneCameraCount, index))
     {
-        cameras[static_cast<size_t>(index)].camera.up.z = -value;
+        cameras[static_cast<size_t>(index)].camera.up.z = value;
         return;
     }
 }
@@ -335,7 +335,7 @@ void parse_login_scene_new_char_value(std::vector<partial_login_scene_vec3>& pos
         auto* slot = get_login_scene_vec3_slot(positions, index);
         if(slot)
         {
-            slot->value.z = -value;
+            slot->value.z = value;
             slot->z = true;
         }
         return;
@@ -358,7 +358,7 @@ void parse_login_scene_center_value(partial_login_scene_vec3& center, const std:
     }
     if(key == "PosZ0")
     {
-        center.value.z = -value;
+        center.value.z = value;
         center.z = true;
         return;
     }
@@ -2180,14 +2180,14 @@ auto login_character_position() -> math::vec3
 
 auto login_character_camera_position() -> math::vec3
 {
-    // scenectrl.ini [Camera] idx14 Pos (CREATE prof0), Z-flipped, + s_camPosDelta[0][0]=(0,0.2,0).
-    return {190.303848f, 229.390994f, -284.287781f};
+    // scenectrl.ini [Camera] idx14 Pos (CREATE prof0), LH (no flip), + s_camPosDelta[0][0]=(0,0.2,0).
+    return {190.303848f, 229.390994f, 284.287781f};
 }
 
 auto login_character_camera_target() -> math::vec3
 {
-    // camera pos + dir(0.610395,0.130526,-0.781269)*10 (dir Z component flipped from scenectrl.ini).
-    return {196.407806f, 230.696259f, -292.100464f};
+    // camera pos + dir(0.610395,0.130526,0.781269)*10 (LH, directly from scenectrl.ini).
+    return {196.407806f, 230.696259f, 292.100464f};
 }
 
 auto login_character_camera_position(const login_scene_config& config) -> math::vec3
