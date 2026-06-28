@@ -56,8 +56,8 @@ constexpr auto kMcpFrameDt = delta_t(0.016667f);
 constexpr uint32_t kLoginMaxAssetWaitFrames = 900;
 constexpr float kDuplicatePositionEpsilon = 0.01f;
 constexpr const char* kLoginCharacterEntityName = "Login Character";
-constexpr const char* kLoginCharacterMeshRef = "characters/player/model_d2dc62c0.gltf";
-constexpr const char* kLoginCharacterIdleClipRef = "characters/player/model_d2dc62c0_anim_f682cdc5.anim";
+constexpr const char* kLoginCharacterMeshRef = "characters/player/model_57f7b4eb.gltf";
+constexpr const char* kLoginCharacterIdleClipRef = "characters/player/model_57f7b4eb_anim_74691562.anim";
 // Character stand + char-select camera derived from the client config configs/scenectrl.ini
 // (read via AngelicaIDE PCK reader). The converter now emits LEFT-handed open format (kEmitLeftHanded),
 // matching this LH runtime, so scenectrl.ini coordinates are used directly (no Z flip).
