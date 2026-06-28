@@ -1643,20 +1643,22 @@ auto login_effect_direction_for_type(const std::string& type_name) -> EmitterDir
 
 auto login_effect_sprite_scale_for_type(const std::string& type_name) -> float
 {
+    // Tuned down toward the D9 reference: the prior multipliers (2.0-4.0) produced oversized
+    // billboards that, with additive blending, washed out the scene (the SELCHAR view especially).
     if(type_name == "decal3d" || type_name == "decalBillboard")
-    {
-        return 4.0f;
-    }
-    if(type_name == "particleBox")
     {
         return 2.0f;
     }
+    if(type_name == "particleBox")
+    {
+        return 1.1f;
+    }
     if(type_name == "particlePoint")
     {
-        return 2.5f;
+        return 1.3f;
     }
 
-    return 2.5f;
+    return 1.3f;
 }
 
 auto login_effect_extent_scale_for_type(const std::string& type_name) -> float
@@ -1689,14 +1691,14 @@ void configure_login_effect_emitter(particle_emitter_component& emitter,
     const float safe_scale = std::max(scale, 0.05f);
     const float safe_speed = std::max(play_speed, 0.05f);
     const float sprite_size =
-        std::clamp(safe_scale * login_effect_sprite_scale_for_type(element.type_name), 0.25f, 32.0f);
+        std::clamp(safe_scale * login_effect_sprite_scale_for_type(element.type_name), 0.2f, 10.0f);
     const float emitter_extent =
         std::clamp(safe_scale * login_effect_extent_scale_for_type(element.type_name), 0.1f, 24.0f);
 
     const float lifetime = std::clamp(1.4f / safe_speed, 0.25f, 6.0f);
-    const float emission_rate = std::clamp(36.0f * safe_speed, 6.0f, 120.0f);
+    const float emission_rate = std::clamp(18.0f * safe_speed, 4.0f, 60.0f);
     const auto max_particles = static_cast<uint32_t>(
-        std::clamp(static_cast<float>(std::ceil(emission_rate * lifetime * 2.0f)), 32.0f, 256.0f));
+        std::clamp(static_cast<float>(std::ceil(emission_rate * lifetime * 2.0f)), 16.0f, 110.0f));
 
     emitter.set_max_particles(max_particles);
     emitter.set_shape(login_effect_shape_for_type(element.type_name));
@@ -1711,8 +1713,8 @@ void configure_login_effect_emitter(particle_emitter_component& emitter,
     emitter.set_lifetime(std::chrono::duration<float>(lifetime));
     emitter.set_emission_lifetime(std::chrono::duration<float>(std::clamp(2.0f / safe_speed, 0.3f, 8.0f)));
     emitter.set_emission_rate(emission_rate);
-    emitter.set_opacity(std::clamp(alpha, 0.0f, 1.0f));
-    emitter.set_color_intensity(1.6f);
+    emitter.set_opacity(std::clamp(alpha, 0.0f, 0.7f));
+    emitter.set_color_intensity(0.85f);
     emitter.set_gravity_scale(0.0f);
     emitter.set_velocity_damping(0.25f);
     emitter.set_temporal_motion(1.0f);
