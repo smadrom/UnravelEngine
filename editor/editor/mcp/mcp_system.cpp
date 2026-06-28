@@ -54,14 +54,14 @@ namespace
 constexpr auto kMcpFrameDt = delta_t(0.016667f);
 constexpr uint32_t kLoginMaxAssetWaitFrames = 900;
 constexpr float kDuplicatePositionEpsilon = 0.01f;
-constexpr const char* kLoginCharacterEntityName = "Login Character 2012";
-constexpr const char* kLoginCharacterMeshRef = "characters/2012/2012.gltf";
-constexpr const char* kLoginCharacterIdleClipRef = "characters/2012/2012_anim_d18853ad.anim";
+constexpr const char* kLoginCharacterEntityName = "Login Character";
+constexpr const char* kLoginCharacterMeshRef = "characters/player/model_d2dc62c0.gltf";
+constexpr const char* kLoginCharacterIdleClipRef = "characters/player/model_d2dc62c0_anim_f682cdc5.anim";
 constexpr float kLoginCharacterX = -109.0f;
 constexpr float kLoginCharacterZ = 38.0f;
 constexpr float kLoginCharacterFallbackY = 228.9f;
 constexpr float kLoginCharacterGroundOffset = 0.03f;
-constexpr float kLoginCharacterCameraFov = 30.0f;
+constexpr float kLoginCharacterCameraFov = 28.0f;
 constexpr float kLoginCharacterCameraNear = 0.05f;
 constexpr float kLoginCharacterCameraFar = 1600.0f;
 
@@ -1872,12 +1872,12 @@ auto login_character_position() -> math::vec3
 
 auto login_character_camera_position() -> math::vec3
 {
-    return {kLoginCharacterX, kLoginCharacterFallbackY + 2.0f, kLoginCharacterZ + 7.0f};
+    return {kLoginCharacterX, kLoginCharacterFallbackY + 3.0f, kLoginCharacterZ + 8.5f};
 }
 
 auto login_character_camera_target() -> math::vec3
 {
-    return {kLoginCharacterX, kLoginCharacterFallbackY + 1.35f, kLoginCharacterZ + 0.15f};
+    return {kLoginCharacterX, kLoginCharacterFallbackY + 2.1f, kLoginCharacterZ + 0.7f};
 }
 
 void apply_login_character_camera_pose(entt::handle camera)
