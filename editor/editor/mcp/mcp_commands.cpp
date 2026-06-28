@@ -551,6 +551,100 @@ auto make_camera_set_result(rtti::context& ctx, mcp_system& sys, const json& par
     return make_camera_result(camera);
 }
 
+auto camera_preset_name(int index) -> std::string
+{
+    if(index == kLoginSceneLoginIndex)
+    {
+        return "login";
+    }
+    if(index == kLoginSceneSelcharIndex)
+    {
+        return "selchar";
+    }
+    if(index == kLoginSceneCreateIndex)
+    {
+        return "create";
+    }
+    if(index == kLoginSceneChooseIndex)
+    {
+        return "choose";
+    }
+    return {};
+}
+
+auto camera_preset_index(const std::string& preset, int& out_index) -> bool
+{
+    if(preset == "login")
+    {
+        out_index = kLoginSceneLoginIndex;
+        return true;
+    }
+    if(preset == "selchar")
+    {
+        out_index = kLoginSceneSelcharIndex;
+        return true;
+    }
+    if(preset == "create")
+    {
+        out_index = kLoginSceneCreateIndex;
+        return true;
+    }
+    if(preset == "choose")
+    {
+        out_index = kLoginSceneChooseIndex;
+        return true;
+    }
+    return false;
+}
+
+auto make_camera_preset_result(rtti::context& ctx, mcp_system& sys, const json& params) -> json
+{
+    const auto config = sys.get_login_scene_config();
+    int index = -1;
+    std::string preset;
+    if(params.contains("index"))
+    {
+        if(!params["index"].is_number_integer())
+        {
+            throw std::runtime_error("camera_preset: 'index' must be an integer");
+        }
+        index = params["index"].get<int>();
+        preset = camera_preset_name(index);
+    }
+    else if(params.contains("preset") && params["preset"].is_string())
+    {
+        preset = params["preset"].get<std::string>();
+        if(!camera_preset_index(preset, index))
+        {
+            throw std::runtime_error("camera_preset: unknown preset '" + preset + "'");
+        }
+    }
+    else
+    {
+        throw std::runtime_error("camera_preset: 'preset' or 'index' required");
+    }
+    if(index < 0 || index >= kLoginSceneCameraCount || !config.cameras[static_cast<size_t>(index)].valid)
+    {
+        throw std::runtime_error("camera_preset: scene camera " + std::to_string(index) + " unavailable");
+    }
+    const auto& scene_camera = config.cameras[static_cast<size_t>(index)];
+    auto camera = sys.ensure_camera(ctx);
+    auto& transform_comp = camera.get<transform_component>();
+    auto& camera_comp = camera.get<camera_component>();
+    const math::vec3 target{
+        scene_camera.pos.x + scene_camera.dir.x,
+        scene_camera.pos.y + scene_camera.dir.y,
+        scene_camera.pos.z + scene_camera.dir.z,
+    };
+    transform_comp.set_position_local(scene_camera.pos);
+    transform_comp.look_at(target, {0.0f, 1.0f, 0.0f});
+    camera_comp.set_fov(56.0f);
+    auto result = make_camera_result(camera);
+    result["preset"] = preset;
+    result["index"] = index;
+    return result;
+}
+
 auto make_screenshot_status_result(const mcp_system::screenshot_status& status) -> json
 {
     json result;
@@ -918,6 +1012,10 @@ auto dispatch(rtti::context& ctx, const std::string& req_json, mcp_system& sys) 
         else if(method == "camera_set")
         {
             result = make_camera_set_result(ctx, sys, params);
+        }
+        else if(method == "camera_preset")
+        {
+            result = make_camera_preset_result(ctx, sys, params);
         }
         else if(method == "screenshot")
         {

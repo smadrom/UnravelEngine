@@ -9,6 +9,7 @@
 #include <entt/entt.hpp>
 #include <math/math.h>
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -16,6 +17,28 @@
 
 namespace unravel
 {
+constexpr int kLoginSceneCameraCount = 39;
+constexpr int kLoginSceneLoginIndex = 0;
+constexpr int kLoginSceneSelcharIndex = 1;
+constexpr int kLoginSceneCreateIndex = 14;
+constexpr int kLoginSceneChooseIndex = 38;
+
+struct login_scene_camera
+{
+    math::vec3 pos{};
+    math::vec3 dir{0.0f, 0.0f, 1.0f};
+    math::vec3 up{0.0f, 1.0f, 0.0f};
+    bool valid = false;
+};
+
+struct login_scene_config
+{
+    std::array<login_scene_camera, kLoginSceneCameraCount> cameras{};
+    std::vector<math::vec3> new_char_positions;
+    math::vec3 new_char_center{};
+    bool loaded = false;
+};
+
 class mcp_system
 {
 public:
@@ -121,6 +144,8 @@ public:
     auto has_login_terrain() const -> bool;
     auto sample_login_terrain(float world_x, float world_z, float& out_height) const -> bool;
     auto get_login_terrain() const -> const terrain_heightfield&;
+    auto get_login_scene_config() const -> login_scene_config;
+    auto get_login_content_root() const -> const std::string&;
 
 private:
     void service_pending_screenshot(rtti::context& ctx);

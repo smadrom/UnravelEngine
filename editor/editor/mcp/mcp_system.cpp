@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstddef>
 #include <cstdlib>
 #include <fstream>
@@ -71,6 +72,23 @@ constexpr float kLoginCharacterCameraNear = 0.05f;
 constexpr float kLoginCharacterCameraFar = 1600.0f;
 
 using json = nlohmann::json;
+constexpr int kLoginSceneNewCharMax = 64;
+
+struct partial_login_scene_camera
+{
+    login_scene_camera camera;
+    bool pos_x = false;
+    bool pos_y = false;
+    bool pos_z = false;
+};
+
+struct partial_login_scene_vec3
+{
+    math::vec3 value{};
+    bool x = false;
+    bool y = false;
+    bool z = false;
+};
 
 auto normalize_content_root(std::string root) -> std::string
 {
@@ -160,6 +178,289 @@ auto read_json_asset(const std::string& asset_key) -> json
         throw std::runtime_error("load_login: failed to parse '" + asset_key + "'");
     }
     return doc;
+}
+
+auto trim_login_scene_text(std::string text) -> std::string
+{
+    auto begin = size_t{0};
+    while(begin < text.size() && std::isspace(static_cast<unsigned char>(text[begin])))
+    {
+        ++begin;
+    }
+    auto end = text.size();
+    while(end > begin && std::isspace(static_cast<unsigned char>(text[end - 1u])))
+    {
+        --end;
+    }
+    return text.substr(begin, end - begin);
+}
+
+auto parse_login_scene_float(const std::string& text, float& out_value) -> bool
+{
+    char* end = nullptr;
+    const char* begin = text.c_str();
+    out_value = std::strtof(begin, &end);
+    if(end == begin)
+    {
+        return false;
+    }
+    while(*end != '\0' && std::isspace(static_cast<unsigned char>(*end)))
+    {
+        ++end;
+    }
+    return *end == '\0';
+}
+
+auto parse_login_scene_key_index(const std::string& key, const char* prefix, int max_count, int& out_index) -> bool
+{
+    const auto prefix_text = std::string(prefix);
+    if(key.size() <= prefix_text.size() || key.compare(0u, prefix_text.size(), prefix_text) != 0)
+    {
+        return false;
+    }
+    size_t index = 0;
+    for(size_t i = prefix_text.size(); i < key.size(); ++i)
+    {
+        const auto ch = static_cast<unsigned char>(key[i]);
+        if(!std::isdigit(ch))
+        {
+            return false;
+        }
+        index = index * 10u + static_cast<size_t>(key[i] - '0');
+        if(index >= static_cast<size_t>(max_count))
+        {
+            return false;
+        }
+    }
+    out_index = static_cast<int>(index);
+    return true;
+}
+
+auto get_login_scene_vec3_slot(std::vector<partial_login_scene_vec3>& values, int index) -> partial_login_scene_vec3*
+{
+    if(index < 0 || index >= kLoginSceneNewCharMax)
+    {
+        return nullptr;
+    }
+    const auto slot = static_cast<size_t>(index);
+    if(slot >= values.size())
+    {
+        values.resize(slot + 1u);
+    }
+    return &values[slot];
+}
+
+void parse_login_scene_camera_value(std::array<partial_login_scene_camera, kLoginSceneCameraCount>& cameras,
+                                    const std::string& key,
+                                    float value)
+{
+    int index = 0;
+    if(parse_login_scene_key_index(key, "PosX", kLoginSceneCameraCount, index))
+    {
+        cameras[static_cast<size_t>(index)].camera.pos.x = value;
+        cameras[static_cast<size_t>(index)].pos_x = true;
+        return;
+    }
+    if(parse_login_scene_key_index(key, "PosY", kLoginSceneCameraCount, index))
+    {
+        cameras[static_cast<size_t>(index)].camera.pos.y = value;
+        cameras[static_cast<size_t>(index)].pos_y = true;
+        return;
+    }
+    if(parse_login_scene_key_index(key, "PosZ", kLoginSceneCameraCount, index))
+    {
+        cameras[static_cast<size_t>(index)].camera.pos.z = -value;
+        cameras[static_cast<size_t>(index)].pos_z = true;
+        return;
+    }
+    if(parse_login_scene_key_index(key, "DirX", kLoginSceneCameraCount, index))
+    {
+        cameras[static_cast<size_t>(index)].camera.dir.x = value;
+        return;
+    }
+    if(parse_login_scene_key_index(key, "DirY", kLoginSceneCameraCount, index))
+    {
+        cameras[static_cast<size_t>(index)].camera.dir.y = value;
+        return;
+    }
+    if(parse_login_scene_key_index(key, "DirZ", kLoginSceneCameraCount, index))
+    {
+        cameras[static_cast<size_t>(index)].camera.dir.z = -value;
+        return;
+    }
+    if(parse_login_scene_key_index(key, "UpX", kLoginSceneCameraCount, index))
+    {
+        cameras[static_cast<size_t>(index)].camera.up.x = value;
+        return;
+    }
+    if(parse_login_scene_key_index(key, "UpY", kLoginSceneCameraCount, index))
+    {
+        cameras[static_cast<size_t>(index)].camera.up.y = value;
+        return;
+    }
+    if(parse_login_scene_key_index(key, "UpZ", kLoginSceneCameraCount, index))
+    {
+        cameras[static_cast<size_t>(index)].camera.up.z = -value;
+        return;
+    }
+}
+
+void parse_login_scene_new_char_value(std::vector<partial_login_scene_vec3>& positions,
+                                      const std::string& key,
+                                      float value)
+{
+    int index = 0;
+    if(parse_login_scene_key_index(key, "PosX", kLoginSceneNewCharMax, index))
+    {
+        auto* slot = get_login_scene_vec3_slot(positions, index);
+        if(slot)
+        {
+            slot->value.x = value;
+            slot->x = true;
+        }
+        return;
+    }
+    if(parse_login_scene_key_index(key, "PosY", kLoginSceneNewCharMax, index))
+    {
+        auto* slot = get_login_scene_vec3_slot(positions, index);
+        if(slot)
+        {
+            slot->value.y = value;
+            slot->y = true;
+        }
+        return;
+    }
+    if(parse_login_scene_key_index(key, "PosZ", kLoginSceneNewCharMax, index))
+    {
+        auto* slot = get_login_scene_vec3_slot(positions, index);
+        if(slot)
+        {
+            slot->value.z = -value;
+            slot->z = true;
+        }
+        return;
+    }
+}
+
+void parse_login_scene_center_value(partial_login_scene_vec3& center, const std::string& key, float value)
+{
+    if(key == "PosX0")
+    {
+        center.value.x = value;
+        center.x = true;
+        return;
+    }
+    if(key == "PosY0")
+    {
+        center.value.y = value;
+        center.y = true;
+        return;
+    }
+    if(key == "PosZ0")
+    {
+        center.value.z = -value;
+        center.z = true;
+        return;
+    }
+}
+
+void finalize_login_scene_cameras(login_scene_config& config,
+                                  const std::array<partial_login_scene_camera, kLoginSceneCameraCount>& cameras)
+{
+    for(size_t i = 0; i < cameras.size(); ++i)
+    {
+        config.cameras[i] = cameras[i].camera;
+        config.cameras[i].valid = cameras[i].pos_x && cameras[i].pos_y && cameras[i].pos_z;
+    }
+}
+
+void finalize_login_scene_positions(login_scene_config& config, const std::vector<partial_login_scene_vec3>& positions)
+{
+    for(const auto& position : positions)
+    {
+        if(!position.x || !position.y || !position.z)
+        {
+            return;
+        }
+        config.new_char_positions.push_back(position.value);
+    }
+}
+
+auto parse_login_scene_config(const std::string& content_root) -> login_scene_config
+{
+    login_scene_config config;
+    std::ifstream file;
+    try
+    {
+        const auto path = fs::resolve_protocol(make_asset_key(content_root, "scenectrl.ini"));
+        file.open(path);
+    }
+    catch(const std::exception&)
+    {
+        return config;
+    }
+    if(!file)
+    {
+        return config;
+    }
+    config.loaded = true;
+    std::array<partial_login_scene_camera, kLoginSceneCameraCount> cameras{};
+    std::vector<partial_login_scene_vec3> new_char_positions;
+    partial_login_scene_vec3 new_char_center;
+    std::string section;
+    std::string line;
+    while(std::getline(file, line))
+    {
+        const auto comment = line.find_first_of(";#");
+        if(comment != std::string::npos)
+        {
+            line.erase(comment);
+        }
+        line = trim_login_scene_text(line);
+        if(line.empty())
+        {
+            continue;
+        }
+        if(line.front() == '[' && line.back() == ']')
+        {
+            section = trim_login_scene_text(line.substr(1u, line.size() - 2u));
+            continue;
+        }
+        const auto equals = line.find('=');
+        if(equals == std::string::npos)
+        {
+            continue;
+        }
+        const auto key = trim_login_scene_text(line.substr(0u, equals));
+        const auto value_text = trim_login_scene_text(line.substr(equals + 1u));
+        float value = 0.0f;
+        if(!parse_login_scene_float(value_text, value))
+        {
+            continue;
+        }
+        if(section == "Camera")
+        {
+            parse_login_scene_camera_value(cameras, key, value);
+            continue;
+        }
+        if(section == "NewChar")
+        {
+            parse_login_scene_new_char_value(new_char_positions, key, value);
+            continue;
+        }
+        if(section == "NewCharCenter")
+        {
+            parse_login_scene_center_value(new_char_center, key, value);
+            continue;
+        }
+    }
+    finalize_login_scene_cameras(config, cameras);
+    finalize_login_scene_positions(config, new_char_positions);
+    if(new_char_center.x && new_char_center.y && new_char_center.z)
+    {
+        config.new_char_center = new_char_center.value;
+    }
+    return config;
 }
 
 auto read_material_texture_ref(const std::string& content_root, const std::string& material_ref) -> std::string
@@ -1889,19 +2190,39 @@ auto login_character_camera_target() -> math::vec3
     return {196.407806f, 230.696259f, -292.100464f};
 }
 
-void apply_login_character_camera_pose(entt::handle camera)
+auto login_character_camera_position(const login_scene_config& config) -> math::vec3
+{
+    if(config.loaded && config.cameras[kLoginSceneCreateIndex].valid)
+    {
+        auto position = config.cameras[kLoginSceneCreateIndex].pos;
+        position.y += 0.2f;
+        return position;
+    }
+    return login_character_camera_position();
+}
+
+auto login_character_camera_target(const login_scene_config& config) -> math::vec3
+{
+    if(config.loaded && config.cameras[kLoginSceneCreateIndex].valid)
+    {
+        const auto position = login_character_camera_position(config);
+        const auto direction = config.cameras[kLoginSceneCreateIndex].dir;
+        return {position.x + direction.x, position.y + direction.y, position.z + direction.z};
+    }
+    return login_character_camera_target();
+}
+
+void apply_login_character_camera_pose(entt::handle camera, const login_scene_config& config)
 {
     if(!camera)
     {
         return;
     }
-
     auto& transform = camera.get<transform_component>();
-    const auto position = login_character_camera_position();
-    const auto target = login_character_camera_target();
+    const auto position = login_character_camera_position(config);
+    const auto target = login_character_camera_target(config);
     transform.set_position_global(position);
     transform.look_at(target, {0.0f, 1.0f, 0.0f});
-
     auto& camera_comp = camera.get<camera_component>();
     camera_comp.set_fov(kLoginCharacterCameraFov);
     camera_comp.set_near_clip(kLoginCharacterCameraNear);
@@ -1915,29 +2236,24 @@ auto create_login_character(rtti::context& ctx, const std::string& content_root)
     {
         return true;
     }
-
     auto& am = ctx.get_cached<asset_manager>();
     const auto flags = load_flags::standard;
     auto mesh_handle = am.get_asset<mesh>(make_asset_key(content_root, kLoginCharacterMeshRef), flags);
     auto idle_clip_handle = am.get_asset<animation_clip>(make_asset_key(content_root, kLoginCharacterIdleClipRef), flags);
     mesh_handle.submit();
     idle_clip_handle.submit();
-
     if(!mesh_handle.is_ready() || !idle_clip_handle.is_ready())
     {
         return false;
     }
-
     auto mesh_instance = mesh_handle.get(false);
     auto idle_clip = idle_clip_handle.get(false);
     if(!mesh_instance || mesh_instance->get_submeshes_count(0) == 0 || !idle_clip)
     {
         return false;
     }
-
     model character_model;
     character_model.set_lod(mesh_handle, 0);
-
     const auto& material_uids = mesh_instance->get_default_material_uids();
     for(size_t i = 0; i < material_uids.size(); ++i)
     {
@@ -1947,8 +2263,13 @@ auto create_login_character(rtti::context& ctx, const std::string& content_root)
             character_model.set_material(material_handle, static_cast<uint32_t>(i));
         }
     }
-
+    const auto scene_config = parse_login_scene_config(content_root);
     auto position = login_character_position();
+    if(scene_config.loaded && !scene_config.new_char_positions.empty())
+    {
+        position.x = scene_config.new_char_positions[0].x;
+        position.z = scene_config.new_char_positions[0].z;
+    }
     terrain_heightfield terrain;
     try
     {
@@ -1958,7 +2279,6 @@ auto create_login_character(rtti::context& ctx, const std::string& content_root)
     {
         APPLOG_WARNING("load_login character terrain sample fallback: reason='{}'", e.what());
     }
-
     float terrain_surface_y = kLoginCharacterFallbackY;
     const bool terrain_sample_valid =
         terrain.is_valid() && terrain.sample_terrain_height(position.x, position.z, terrain_surface_y);
@@ -1966,18 +2286,15 @@ auto create_login_character(rtti::context& ctx, const std::string& content_root)
     const float local_min_y =
         local_bounds.is_populated() && std::isfinite(local_bounds.min.y) ? local_bounds.min.y : 0.0f;
     position.y = terrain_surface_y - local_min_y + kLoginCharacterGroundOffset;
-
     auto entity = scene::create_entity(*scn.registry, kLoginCharacterEntityName);
     auto& transform = entity.get<transform_component>();
     transform.set_position_local(position);
     // Face the char-select camera (horizontal), matching the client create/select pose.
-    const auto camera_pos = login_character_camera_position();
+    const auto camera_pos = login_character_camera_position(scene_config);
     transform.look_at(math::vec3{camera_pos.x, position.y, camera_pos.z}, {0.0f, 1.0f, 0.0f});
-
     auto& model_comp = entity.emplace<model_component>();
     model_comp.set_model(character_model);
     model_comp.init_armature(false);
-
     auto& animation_comp = entity.emplace<animation_component>();
     animation_comp.set_animation(idle_clip_handle);
     animation_comp.set_autoplay(true);
@@ -1985,7 +2302,6 @@ auto create_login_character(rtti::context& ctx, const std::string& content_root)
     auto& player = animation_comp.get_player();
     player.blend_to(0, idle_clip_handle, animation_player::seconds_t(0.0f), true);
     player.play();
-
     APPLOG_INFO("load_login character created: entity='{}' mesh='{}' idle='{}' x={} y={} z={} terrain_surface_y={} "
                 "sample_valid={} local_min_y={}",
                 kLoginCharacterEntityName,
@@ -2484,9 +2800,8 @@ auto mcp_system::ensure_camera(rtti::context& ctx) -> entt::handle
     if(!camera_valid)
     {
         mcp_cam_ = defaults::create_camera_entity(ctx, scn, "MCP Camera");
-        apply_login_character_camera_pose(mcp_cam_);
+        apply_login_character_camera_pose(mcp_cam_, parse_login_scene_config(login_.content_root));
     }
-
     return mcp_cam_;
 }
 
@@ -2647,6 +2962,16 @@ auto mcp_system::sample_login_terrain(float world_x, float world_z, float& out_h
 auto mcp_system::get_login_terrain() const -> const terrain_heightfield&
 {
     return login_.terrain;
+}
+
+auto mcp_system::get_login_scene_config() const -> login_scene_config
+{
+    return parse_login_scene_config(login_.content_root);
+}
+
+auto mcp_system::get_login_content_root() const -> const std::string&
+{
+    return login_.content_root;
 }
 
 void mcp_system::service_login_loader(rtti::context& ctx)
