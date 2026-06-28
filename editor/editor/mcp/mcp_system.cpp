@@ -716,6 +716,15 @@ auto make_login_buildings(const std::string& content_root, const terrain_heightf
 
         const auto source_position = read_vec3_member(item, "pos");
         const auto mapped_position = map_source_position_to_unravel(source_position);
+        if(std::any_of(result.buildings.begin(),
+                       result.buildings.end(),
+                       [&mapped_position](const mcp_system::login_building& accepted) {
+                           return positions_match(accepted.position, mapped_position);
+                       }))
+        {
+            ++result.duplicate_skipped;
+            continue;
+        }
 
         mcp_system::login_building building;
         building.name = item.value("name", std::string("Login Building ") + std::to_string(result.buildings.size()));
