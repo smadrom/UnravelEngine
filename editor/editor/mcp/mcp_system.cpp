@@ -57,11 +57,16 @@ constexpr float kDuplicatePositionEpsilon = 0.01f;
 constexpr const char* kLoginCharacterEntityName = "Login Character";
 constexpr const char* kLoginCharacterMeshRef = "characters/player/model_d2dc62c0.gltf";
 constexpr const char* kLoginCharacterIdleClipRef = "characters/player/model_d2dc62c0_anim_f682cdc5.anim";
-constexpr float kLoginCharacterX = -109.0f;
-constexpr float kLoginCharacterZ = 38.0f;
-constexpr float kLoginCharacterFallbackY = 228.9f;
+// Character stand + char-select camera derived from the client config configs/scenectrl.ini
+// (read via AngelicaIDE PCK reader). The converted login scene has Z negated relative to the
+// original client coordinate space, so every scenectrl.ini position/direction Z is flipped here.
+// Stand = [NewChar] Pos0 (profession 0 = Blademaster), camera = [Camera] idx 14 (LOGIN_SCENE_CREATE
+// for profession 0) + s_camPosDelta[0][0]=(0,0.2,0); FOV = DEFCAMERA_FOV (56 deg).
+constexpr float kLoginCharacterX = 191.983002f;
+constexpr float kLoginCharacterZ = -286.619995f;
+constexpr float kLoginCharacterFallbackY = 228.391006f;
 constexpr float kLoginCharacterGroundOffset = 0.03f;
-constexpr float kLoginCharacterCameraFov = 28.0f;
+constexpr float kLoginCharacterCameraFov = 56.0f;
 constexpr float kLoginCharacterCameraNear = 0.05f;
 constexpr float kLoginCharacterCameraFar = 1600.0f;
 
@@ -1872,12 +1877,14 @@ auto login_character_position() -> math::vec3
 
 auto login_character_camera_position() -> math::vec3
 {
-    return {kLoginCharacterX, kLoginCharacterFallbackY + 3.0f, kLoginCharacterZ + 8.5f};
+    // scenectrl.ini [Camera] idx14 Pos (CREATE prof0), Z-flipped, + s_camPosDelta[0][0]=(0,0.2,0).
+    return {190.303848f, 229.390994f, -284.287781f};
 }
 
 auto login_character_camera_target() -> math::vec3
 {
-    return {kLoginCharacterX, kLoginCharacterFallbackY + 2.1f, kLoginCharacterZ + 0.7f};
+    // camera pos + dir(0.610395,0.130526,-0.781269)*10 (dir Z component flipped from scenectrl.ini).
+    return {196.407806f, 230.696259f, -292.100464f};
 }
 
 void apply_login_character_camera_pose(entt::handle camera)
@@ -1961,7 +1968,9 @@ auto create_login_character(rtti::context& ctx, const std::string& content_root)
     auto entity = scene::create_entity(*scn.registry, kLoginCharacterEntityName);
     auto& transform = entity.get<transform_component>();
     transform.set_position_local(position);
-    transform.look_at(position + math::vec3{0.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f});
+    // Face the char-select camera (horizontal), matching the client create/select pose.
+    const auto camera_pos = login_character_camera_position();
+    transform.look_at(math::vec3{camera_pos.x, position.y, camera_pos.z}, {0.0f, 1.0f, 0.0f});
 
     auto& model_comp = entity.emplace<model_component>();
     model_comp.set_model(character_model);
