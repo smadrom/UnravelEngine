@@ -4,6 +4,8 @@
 
 #include "json.hpp"
 
+#include <engine/animation/animation.h>
+#include <engine/animation/ecs/components/animation_component.h>
 #include <engine/assets/asset_manager.h>
 #include <engine/defaults/defaults.h>
 #include <engine/ecs/components/tag_component.h>
@@ -52,6 +54,16 @@ namespace
 constexpr auto kMcpFrameDt = delta_t(0.016667f);
 constexpr uint32_t kLoginMaxAssetWaitFrames = 900;
 constexpr float kDuplicatePositionEpsilon = 0.01f;
+constexpr const char* kLoginCharacterEntityName = "Login Character 2012";
+constexpr const char* kLoginCharacterMeshRef = "characters/2012/2012.gltf";
+constexpr const char* kLoginCharacterIdleClipRef = "characters/2012/2012_anim_d18853ad.anim";
+constexpr float kLoginCharacterX = -109.0f;
+constexpr float kLoginCharacterZ = 38.0f;
+constexpr float kLoginCharacterFallbackY = 228.9f;
+constexpr float kLoginCharacterGroundOffset = 0.03f;
+constexpr float kLoginCharacterCameraFov = 30.0f;
+constexpr float kLoginCharacterCameraNear = 0.05f;
+constexpr float kLoginCharacterCameraFar = 1600.0f;
 
 using json = nlohmann::json;
 
@@ -1853,6 +1865,130 @@ void create_login_effects(rtti::context& ctx, const std::string& content_root)
                 unmapped);
 }
 
+auto login_character_position() -> math::vec3
+{
+    return {kLoginCharacterX, kLoginCharacterFallbackY, kLoginCharacterZ};
+}
+
+auto login_character_camera_position() -> math::vec3
+{
+    return {kLoginCharacterX, kLoginCharacterFallbackY + 2.0f, kLoginCharacterZ + 7.0f};
+}
+
+auto login_character_camera_target() -> math::vec3
+{
+    return {kLoginCharacterX, kLoginCharacterFallbackY + 1.35f, kLoginCharacterZ + 0.15f};
+}
+
+void apply_login_character_camera_pose(entt::handle camera)
+{
+    if(!camera)
+    {
+        return;
+    }
+
+    auto& transform = camera.get<transform_component>();
+    const auto position = login_character_camera_position();
+    const auto target = login_character_camera_target();
+    transform.set_position_global(position);
+    transform.look_at(target, {0.0f, 1.0f, 0.0f});
+
+    auto& camera_comp = camera.get<camera_component>();
+    camera_comp.set_fov(kLoginCharacterCameraFov);
+    camera_comp.set_near_clip(kLoginCharacterCameraNear);
+    camera_comp.set_far_clip(kLoginCharacterCameraFar);
+}
+
+auto create_login_character(rtti::context& ctx, const std::string& content_root) -> bool
+{
+    auto& scn = ctx.get_cached<ecs>().get_scene();
+    if(find_scene_entity_named(scn, kLoginCharacterEntityName))
+    {
+        return true;
+    }
+
+    auto& am = ctx.get_cached<asset_manager>();
+    const auto flags = load_flags::standard;
+    auto mesh_handle = am.get_asset<mesh>(make_asset_key(content_root, kLoginCharacterMeshRef), flags);
+    auto idle_clip_handle = am.get_asset<animation_clip>(make_asset_key(content_root, kLoginCharacterIdleClipRef), flags);
+    mesh_handle.submit();
+    idle_clip_handle.submit();
+
+    if(!mesh_handle.is_ready() || !idle_clip_handle.is_ready())
+    {
+        return false;
+    }
+
+    auto mesh_instance = mesh_handle.get(false);
+    auto idle_clip = idle_clip_handle.get(false);
+    if(!mesh_instance || mesh_instance->get_submeshes_count(0) == 0 || !idle_clip)
+    {
+        return false;
+    }
+
+    model character_model;
+    character_model.set_lod(mesh_handle, 0);
+
+    const auto& material_uids = mesh_instance->get_default_material_uids();
+    for(size_t i = 0; i < material_uids.size(); ++i)
+    {
+        auto material_handle = am.get_asset<material>(material_uids[i], flags);
+        if(material_handle)
+        {
+            character_model.set_material(material_handle, static_cast<uint32_t>(i));
+        }
+    }
+
+    auto position = login_character_position();
+    terrain_heightfield terrain;
+    try
+    {
+        terrain = load_login_terrain_heightfield(content_root);
+    }
+    catch(const std::exception& e)
+    {
+        APPLOG_WARNING("load_login character terrain sample fallback: reason='{}'", e.what());
+    }
+
+    float terrain_surface_y = kLoginCharacterFallbackY;
+    const bool terrain_sample_valid =
+        terrain.is_valid() && terrain.sample_terrain_height(position.x, position.z, terrain_surface_y);
+    const auto& local_bounds = mesh_instance->get_bounds();
+    const float local_min_y =
+        local_bounds.is_populated() && std::isfinite(local_bounds.min.y) ? local_bounds.min.y : 0.0f;
+    position.y = terrain_surface_y - local_min_y + kLoginCharacterGroundOffset;
+
+    auto entity = scene::create_entity(*scn.registry, kLoginCharacterEntityName);
+    auto& transform = entity.get<transform_component>();
+    transform.set_position_local(position);
+    transform.look_at(position + math::vec3{0.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f});
+
+    auto& model_comp = entity.emplace<model_component>();
+    model_comp.set_model(character_model);
+    model_comp.init_armature(false);
+
+    auto& animation_comp = entity.emplace<animation_component>();
+    animation_comp.set_animation(idle_clip_handle);
+    animation_comp.set_autoplay(true);
+    animation_comp.set_apply_root_motion(false);
+    auto& player = animation_comp.get_player();
+    player.blend_to(0, idle_clip_handle, animation_player::seconds_t(0.0f), true);
+    player.play();
+
+    APPLOG_INFO("load_login character created: entity='{}' mesh='{}' idle='{}' x={} y={} z={} terrain_surface_y={} "
+                "sample_valid={} local_min_y={}",
+                kLoginCharacterEntityName,
+                kLoginCharacterMeshRef,
+                kLoginCharacterIdleClipRef,
+                position.x,
+                position.y,
+                position.z,
+                terrain_surface_y,
+                terrain_sample_valid,
+                local_min_y);
+    return true;
+}
+
 void create_login_lights(rtti::context& ctx, const std::string& content_root)
 {
     const auto lights_doc = read_json_asset(make_asset_key(content_root, "lights/login.eds.lights.json"));
@@ -2337,6 +2473,7 @@ auto mcp_system::ensure_camera(rtti::context& ctx) -> entt::handle
     if(!camera_valid)
     {
         mcp_cam_ = defaults::create_camera_entity(ctx, scn, "MCP Camera");
+        apply_login_character_camera_pose(mcp_cam_);
     }
 
     return mcp_cam_;
@@ -2541,6 +2678,15 @@ void mcp_system::service_login_loader(rtti::context& ctx)
             ++login_.created;
             ++login_.cursor;
             ++processed_this_frame;
+        }
+
+        if(login_.cursor >= login_.buildings.size())
+        {
+            if(!create_login_character(ctx, login_.content_root))
+            {
+                login_.status = "waiting_assets";
+                return;
+            }
         }
 
         while(login_.cursor >= login_.buildings.size() && login_.foliage_cursor < login_.foliage.size() &&
