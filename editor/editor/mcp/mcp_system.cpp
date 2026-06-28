@@ -1571,12 +1571,12 @@ auto create_login_foliage(rtti::context& ctx,
         auto material_instance = std::make_shared<pbr_material>();
         material_instance->set_base_color({1.0f, 1.0f, 1.0f, 1.0f});
         material_instance->set_metalness(0.0f);
-        material_instance->set_roughness(0.85f);
+        material_instance->set_roughness(1.0f);
         material_instance->set_cull_type(cull_type::none);
         material_instance->set_alpha_blend(foliage.alpha_blend);
         if(foliage.alpha_test)
         {
-            material_instance->set_alpha_test_value(0.5f);
+            material_instance->set_alpha_test_value(0.35f);
         }
         if(slot_index < texture_handles.size() && texture_usable[slot_index])
         {
