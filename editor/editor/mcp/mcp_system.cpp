@@ -15,6 +15,7 @@
 #include <engine/rendering/ecs/components/camera_component.h>
 #include <engine/rendering/ecs/components/light_component.h>
 #include <engine/rendering/ecs/components/model_component.h>
+#include <engine/rendering/ecs/components/particle_emitter_component.h>
 #include <engine/rendering/ecs/components/reflection_probe_component.h>
 #include <engine/rendering/ecs/components/tonemapping_component.h>
 #include <engine/rendering/ecs/systems/rendering_system.h>
@@ -33,6 +34,7 @@
 #include <bx/file.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -1222,6 +1224,460 @@ auto find_scene_entity_named(scene& scn, const std::string& name) -> entt::handl
     return {};
 }
 
+struct login_effect_note_params
+{
+    float scale = 1.0f;
+    float play_speed = 1.0f;
+    float alpha = 1.0f;
+};
+
+struct login_effect_element
+{
+    std::string name;
+    std::string type_name;
+    std::string texture_ref;
+};
+
+auto read_login_effect_note_float(const std::string& note, const char* key, float fallback) -> float
+{
+    const std::string marker = std::string(key) + "=";
+    const auto marker_pos = note.find(marker);
+    if(marker_pos == std::string::npos)
+    {
+        return fallback;
+    }
+
+    const char* begin = note.c_str() + marker_pos + marker.size();
+    char* end = nullptr;
+    const float value = std::strtof(begin, &end);
+    if(end == begin || !std::isfinite(value))
+    {
+        return fallback;
+    }
+
+    return value;
+}
+
+auto read_login_effect_note_params(const json& item) -> login_effect_note_params
+{
+    login_effect_note_params params;
+    const auto note = item.value("note", std::string{});
+    params.scale = read_login_effect_note_float(note, "scale", params.scale);
+    params.play_speed = read_login_effect_note_float(note, "speed", params.play_speed);
+    params.alpha = read_login_effect_note_float(note, "alpha", params.alpha);
+    return params;
+}
+
+void add_login_effect_ref_candidate(std::vector<std::string>& candidates, std::string ref)
+{
+    std::replace(ref.begin(), ref.end(), '\\', '/');
+    while(!ref.empty() && ref.front() == '/')
+    {
+        ref.erase(ref.begin());
+    }
+    if(ref.empty() || std::find(candidates.begin(), candidates.end(), ref) != candidates.end())
+    {
+        return;
+    }
+
+    candidates.emplace_back(std::move(ref));
+}
+
+auto login_effect_ref_candidates(const json& item) -> std::vector<std::string>
+{
+    std::vector<std::string> candidates;
+
+    if(item.contains("openFormat") && item["openFormat"].is_object())
+    {
+        const auto& open_format = item["openFormat"];
+        if(open_format.contains("effectRef") && open_format["effectRef"].is_object())
+        {
+            add_login_effect_ref_candidate(candidates, open_format["effectRef"].value("effect", std::string{}));
+        }
+    }
+
+    const auto payload_ref = item.value("payload", std::string{});
+    add_login_effect_ref_candidate(candidates, payload_ref);
+
+    std::string normalized_payload = payload_ref;
+    std::replace(normalized_payload.begin(), normalized_payload.end(), '\\', '/');
+    if(normalized_payload.rfind("effects/", 0) == 0)
+    {
+        add_login_effect_ref_candidate(candidates, "fx/" + normalized_payload.substr(std::string("effects/").size()));
+    }
+
+    return candidates;
+}
+
+auto make_login_relative_asset_key(const std::string& content_root, const std::string& ref) -> std::string
+{
+    if(fs::has_known_protocol(ref))
+    {
+        return ref;
+    }
+
+    return make_asset_key(content_root, ref);
+}
+
+auto read_login_effect_doc(const std::string& content_root, const json& item, std::string& selected_ref) -> json
+{
+    const auto candidates = login_effect_ref_candidates(item);
+    std::string last_error;
+
+    for(const auto& candidate : candidates)
+    {
+        try
+        {
+            const auto asset_key = make_login_relative_asset_key(content_root, candidate);
+            auto doc = read_json_asset(asset_key);
+            selected_ref = candidate;
+            return doc;
+        }
+        catch(const std::exception& e)
+        {
+            last_error = e.what();
+        }
+    }
+
+    throw std::runtime_error("load_login: no readable effect payload for '" +
+                             item.value("name", std::string("<unnamed>")) + "'; last_error='" + last_error + "'");
+}
+
+auto find_login_effect_texture_ref(const json& effect_doc, const std::string& element_name) -> std::string
+{
+    std::string first_texture_ref;
+    if(!effect_doc.contains("dependencies") || !effect_doc["dependencies"].is_array())
+    {
+        return {};
+    }
+
+    for(const auto& dependency : effect_doc["dependencies"])
+    {
+        if(!dependency.is_object() || dependency.value("kind", std::string{}) != "texture")
+        {
+            continue;
+        }
+
+        const auto texture_ref = dependency.value("textureRef", std::string{});
+        if(texture_ref.empty())
+        {
+            continue;
+        }
+
+        if(first_texture_ref.empty())
+        {
+            first_texture_ref = texture_ref;
+        }
+
+        if(!element_name.empty() && dependency.value("elementName", std::string{}) == element_name)
+        {
+            return texture_ref;
+        }
+    }
+
+    return first_texture_ref;
+}
+
+auto read_login_effect_elements(const json& effect_doc) -> std::vector<login_effect_element>
+{
+    std::vector<login_effect_element> elements;
+
+    if(effect_doc.contains("elements") && effect_doc["elements"].is_array())
+    {
+        for(const auto& element_doc : effect_doc["elements"])
+        {
+            if(!element_doc.is_object())
+            {
+                continue;
+            }
+
+            login_effect_element element;
+            element.name = element_doc.value("name", std::string{});
+            element.type_name = element_doc.value("typeName", std::string{});
+            element.texture_ref = find_login_effect_texture_ref(effect_doc, element.name);
+            if(!element.texture_ref.empty())
+            {
+                elements.emplace_back(std::move(element));
+            }
+        }
+    }
+
+    if(elements.empty() && effect_doc.contains("dependencies") && effect_doc["dependencies"].is_array())
+    {
+        for(const auto& dependency : effect_doc["dependencies"])
+        {
+            if(!dependency.is_object() || dependency.value("kind", std::string{}) != "texture")
+            {
+                continue;
+            }
+
+            login_effect_element element;
+            element.name = dependency.value("elementName", std::string{});
+            element.type_name = "texture";
+            element.texture_ref = dependency.value("textureRef", std::string{});
+            if(!element.texture_ref.empty())
+            {
+                elements.emplace_back(std::move(element));
+            }
+        }
+    }
+
+    return elements;
+}
+
+auto login_effect_shape_for_type(const std::string& type_name) -> EmitterShape::Enum
+{
+    if(type_name == "particleBox")
+    {
+        return EmitterShape::Box;
+    }
+    if(type_name == "decal3d" || type_name == "decalBillboard")
+    {
+        return EmitterShape::Rect;
+    }
+
+    return EmitterShape::Sphere;
+}
+
+auto login_effect_direction_for_type(const std::string& type_name) -> EmitterDirection::Enum
+{
+    if(type_name == "particlePoint" || type_name == "particleBox" || type_name == "particleEllipsoid")
+    {
+        return EmitterDirection::Outward;
+    }
+
+    return EmitterDirection::Up;
+}
+
+auto login_effect_sprite_scale_for_type(const std::string& type_name) -> float
+{
+    if(type_name == "decal3d" || type_name == "decalBillboard")
+    {
+        return 4.0f;
+    }
+    if(type_name == "particleBox")
+    {
+        return 2.0f;
+    }
+    if(type_name == "particlePoint")
+    {
+        return 2.5f;
+    }
+
+    return 2.5f;
+}
+
+auto login_effect_extent_scale_for_type(const std::string& type_name) -> float
+{
+    if(type_name == "decal3d" || type_name == "decalBillboard")
+    {
+        return 0.35f;
+    }
+    if(type_name == "particleBox")
+    {
+        return 1.75f;
+    }
+
+    return 1.0f;
+}
+
+auto is_login_effect_type_mapped(const std::string& type_name) -> bool
+{
+    return type_name == "particleBox" || type_name == "particleEllipsoid" || type_name == "particlePoint" ||
+           type_name == "decal3d" || type_name == "decalBillboard" || type_name == "texture";
+}
+
+void configure_login_effect_emitter(particle_emitter_component& emitter,
+                                    const login_effect_element& element,
+                                    const asset_handle<gfx::texture>& texture_handle,
+                                    float scale,
+                                    float alpha,
+                                    float play_speed)
+{
+    const float safe_scale = std::max(scale, 0.05f);
+    const float safe_speed = std::max(play_speed, 0.05f);
+    const float sprite_size =
+        std::clamp(safe_scale * login_effect_sprite_scale_for_type(element.type_name), 0.25f, 32.0f);
+    const float emitter_extent =
+        std::clamp(safe_scale * login_effect_extent_scale_for_type(element.type_name), 0.1f, 24.0f);
+
+    const float lifetime = std::clamp(1.4f / safe_speed, 0.25f, 6.0f);
+    const float emission_rate = std::clamp(36.0f * safe_speed, 6.0f, 120.0f);
+    const auto max_particles = static_cast<uint32_t>(
+        std::clamp(static_cast<float>(std::ceil(emission_rate * lifetime * 2.0f)), 32.0f, 256.0f));
+
+    emitter.set_max_particles(max_particles);
+    emitter.set_shape(login_effect_shape_for_type(element.type_name));
+    emitter.set_direction(login_effect_direction_for_type(element.type_name));
+    emitter.set_spawn_location(EmitterSpawnLocation::Inside);
+    emitter.set_simulation_space(SimulationSpace::World);
+    emitter.set_texture(texture_handle);
+    emitter.set_texture_mode(TextureMode::MultiChannel);
+    emitter.set_render_mode(RenderMode::Billboard);
+    emitter.set_blend_mode(BlendMode::Additive);
+    emitter.set_loop(true);
+    emitter.set_lifetime(std::chrono::duration<float>(lifetime));
+    emitter.set_emission_lifetime(std::chrono::duration<float>(std::clamp(2.0f / safe_speed, 0.3f, 8.0f)));
+    emitter.set_emission_rate(emission_rate);
+    emitter.set_opacity(std::clamp(alpha, 0.0f, 1.0f));
+    emitter.set_color_intensity(1.6f);
+    emitter.set_gravity_scale(0.0f);
+    emitter.set_velocity_damping(0.25f);
+    emitter.set_temporal_motion(1.0f);
+    emitter.set_emission_shape_scale(math::vec3(emitter_extent));
+    emitter.set_initial_scale_3d(math::vec3(1.0f));
+
+    math::gradient<frange_t> scale_gradient;
+    scale_gradient.add_point(frange_t(sprite_size * 0.35f, sprite_size * 0.75f), 0.0f);
+    scale_gradient.add_point(frange_t(sprite_size * 0.85f, sprite_size * 1.35f), 1.0f);
+    emitter.set_scale_gradient(scale_gradient);
+
+    math::gradient<math::color> color_gradient;
+    color_gradient.add_point(math::color(1.0f, 1.0f, 1.0f, 0.0f), 0.0f);
+    color_gradient.add_point(math::color(1.0f, 1.0f, 1.0f, 1.0f), 0.15f);
+    color_gradient.add_point(math::color(1.0f, 1.0f, 1.0f, 0.85f), 0.72f);
+    color_gradient.add_point(math::color(1.0f, 1.0f, 1.0f, 0.0f), 1.0f);
+    emitter.set_color_gradient(color_gradient);
+
+    math::gradient<frange_t> velocity_gradient;
+    velocity_gradient.add_point(frange_t(0.15f * safe_scale, 0.7f * safe_scale), 0.0f);
+    velocity_gradient.add_point(frange_t(0.35f * safe_scale, 1.8f * safe_scale), 1.0f);
+    emitter.set_velocity_gradient(velocity_gradient);
+    emitter.play();
+}
+
+void create_login_effects(rtti::context& ctx, const std::string& content_root)
+{
+    const auto scene_doc = read_json_asset(make_asset_key(content_root, "maps/login/scene.eds.json"));
+    if(!scene_doc.contains("nodes") || !scene_doc["nodes"].is_array())
+    {
+        APPLOG_WARNING("load_login: scene.eds.json has no nodes[]; effects skipped");
+        return;
+    }
+
+    auto& am = ctx.get_cached<asset_manager>();
+    auto& scn = ctx.get_cached<ecs>().get_scene();
+
+    size_t effect_index = 0;
+    size_t created = 0;
+    size_t skipped = 0;
+    size_t unmapped = 0;
+
+    for(const auto& item : scene_doc["nodes"])
+    {
+        if(!item.is_object() || item.value("kind", std::string{}) != "Effect")
+        {
+            continue;
+        }
+
+        const size_t authored_effect_index = effect_index++;
+
+        try
+        {
+            if(item.contains("openFormat") && item["openFormat"].is_object() &&
+               !item["openFormat"].value("convertedToOpenFormat", false))
+            {
+                ++skipped;
+                APPLOG_WARNING("load_login effect skipped: name='{}' reason='not converted to open format'",
+                               item.value("name", std::string("<unnamed>")));
+                continue;
+            }
+
+            std::string effect_ref;
+            const auto effect_doc = read_login_effect_doc(content_root, item, effect_ref);
+            auto elements = read_login_effect_elements(effect_doc);
+            if(elements.empty())
+            {
+                ++skipped;
+                APPLOG_WARNING("load_login effect skipped: name='{}' ref='{}' reason='no texture dependencies'",
+                               item.value("name", std::string("<unnamed>")),
+                               effect_ref);
+                continue;
+            }
+
+            const auto note_params = read_login_effect_note_params(item);
+            const float scale = effect_doc.value("defaultScale", 1.0f) * note_params.scale;
+            const float alpha = effect_doc.value("defaultAlpha", 1.0f) * note_params.alpha;
+            const float play_speed = effect_doc.value("defaultPlaySpeed", 1.0f) * note_params.play_speed;
+            const auto position = map_source_position_to_unravel(read_vec3_member(item, "pos"));
+
+            size_t element_index = 0;
+            size_t created_for_effect = 0;
+            for(const auto& element : elements)
+            {
+                if(!is_login_effect_type_mapped(element.type_name))
+                {
+                    ++unmapped;
+                    APPLOG_WARNING("load_login effect element mapped as generic billboard: effect='{}' element='{}' "
+                                   "type='{}'",
+                                   effect_ref,
+                                   element.name,
+                                   element.type_name);
+                }
+
+                const auto texture_key = make_login_relative_asset_key(content_root, element.texture_ref);
+                auto texture_handle = am.get_asset<gfx::texture>(texture_key, load_flags::standard);
+                texture_handle.submit();
+                if(!texture_handle.is_valid())
+                {
+                    ++unmapped;
+                    APPLOG_WARNING("load_login effect element skipped: effect='{}' element='{}' texture='{}' "
+                                   "reason='texture asset handle invalid'",
+                                   effect_ref,
+                                   element.name,
+                                   texture_key);
+                    ++element_index;
+                    continue;
+                }
+
+                std::string entity_name = "Login Effect " + std::to_string(authored_effect_index);
+                if(created_for_effect > 0)
+                {
+                    entity_name += " Element " + std::to_string(element_index);
+                }
+
+                auto entity = scene::create_entity(*scn.registry, entity_name);
+                auto& transform = entity.get<transform_component>();
+                transform.set_position_local(position);
+                if(item.contains("dir") && item.contains("up"))
+                {
+                    const auto forward = map_source_forward_to_unravel(read_vec3_member(item, "dir"));
+                    const auto up = map_source_up_to_unravel(read_vec3_member(item, "up"));
+                    transform.look_at(position + forward, up);
+                }
+
+                auto& emitter = entity.emplace<particle_emitter_component>();
+                configure_login_effect_emitter(emitter, element, texture_handle, scale, alpha, play_speed);
+
+                ++created;
+                ++created_for_effect;
+                ++element_index;
+            }
+
+            if(created_for_effect == 0)
+            {
+                ++skipped;
+                APPLOG_WARNING("load_login effect skipped: name='{}' ref='{}' reason='no mappable texture elements'",
+                               item.value("name", std::string("<unnamed>")),
+                               effect_ref);
+            }
+        }
+        catch(const std::exception& e)
+        {
+            ++skipped;
+            APPLOG_WARNING("load_login effect skipped: name='{}' reason='{}'",
+                           item.value("name", std::string("<unnamed>")),
+                           e.what());
+        }
+    }
+
+    APPLOG_INFO("load_login effects created: nodes={} emitters={} skipped={} generic_mapped={}",
+                effect_index,
+                created,
+                skipped,
+                unmapped);
+}
+
 void create_login_lights(rtti::context& ctx, const std::string& content_root)
 {
     const auto lights_doc = read_json_asset(make_asset_key(content_root, "lights/login.eds.lights.json"));
@@ -1886,6 +2342,7 @@ void mcp_system::service_login_loader(rtti::context& ctx)
         {
             create_login_environment(ctx);
             create_login_lights(ctx, login_.content_root);
+            create_login_effects(ctx, login_.content_root);
             login_.environment_created = true;
         }
 
