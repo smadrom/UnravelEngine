@@ -56,7 +56,10 @@ constexpr auto kMcpFrameDt = delta_t(0.016667f);
 constexpr uint32_t kLoginMaxAssetWaitFrames = 900;
 constexpr float kDuplicatePositionEpsilon = 0.01f;
 constexpr const char* kLoginCharacterEntityName = "Login Character";
-constexpr const char* kLoginCharacterMeshRef = "characters/player/model_57f7b4eb.gltf";
+// Dressed char-select Blademaster: body + Guardian armor (AddSkinFile) + sword (AddChildModel),
+// baked into model_1c939f0c.gltf by ECModelViewer. Same 武侠男 skeleton as the bare body, so the
+// existing idle clip (model_57f7b4eb_anim_74691562) is reused unchanged.
+constexpr const char* kLoginCharacterMeshRef = "characters/player/model_1c939f0c.gltf";
 constexpr const char* kLoginCharacterIdleClipRef = "characters/player/model_57f7b4eb_anim_74691562.anim";
 // Character stand + char-select camera derived from the client config configs/scenectrl.ini
 // (read via AngelicaIDE PCK reader). The converter now emits LEFT-handed open format (kEmitLeftHanded),
@@ -2258,10 +2261,40 @@ auto create_login_character(rtti::context& ctx, const std::string& content_root)
     for(size_t i = 0; i < material_uids.size(); ++i)
     {
         auto material_handle = am.get_asset<material>(material_uids[i], flags);
+        material_handle.submit();
+        // Force-load the material asset and promote it to a concrete instance. The deferred
+        // renderer SKIPS any data-group whose get_material_instance() returns null (model.cpp
+        // get_material_instance -> if asset handle not resolved -> nullptr -> submesh skipped),
+        // which left the freshly-imported armor sub-skins invisible. Buildings/foliage already
+        // use this set_material_instance path; do the same for the dressed character.
+        auto material_instance = material_handle.get(true);
         if(material_handle)
         {
             character_model.set_material(material_handle, static_cast<uint32_t>(i));
         }
+        if(material_instance)
+        {
+            // Armor sub-skins (added via AddSkin in the exporter) can carry opposite winding and
+            // an alpha channel that is a spec mask (not transparency). Force opaque + two-sided so
+            // the deferred pass neither back-face-culls nor alpha-discards them. Buildings already
+            // render with cull_type::none; do the same here.
+            if(auto pbr = std::dynamic_pointer_cast<pbr_material>(material_instance))
+            {
+                pbr->set_cull_type(cull_type::none);
+                pbr->set_alpha_blend(false);
+                pbr->set_alpha_test_value(0.0f);
+                // Force-load the color map so the (freshly imported) armor texture is resident at render
+                // instead of sampling a white default. Buildings/foliage submit their textures the same way.
+                auto color_map = pbr->get_color_map();
+                color_map.submit();
+            }
+            character_model.set_material_instance(material_instance, static_cast<uint32_t>(i));
+        }
+        APPLOG_INFO("load_login character material[{}]: valid={} ready={} instance={}",
+                    i,
+                    material_handle.is_valid(),
+                    material_handle.is_ready(),
+                    static_cast<bool>(material_instance));
     }
     const auto scene_config = parse_login_scene_config(content_root);
     auto position = login_character_position();
