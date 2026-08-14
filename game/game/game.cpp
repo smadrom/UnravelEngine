@@ -1,12 +1,13 @@
 #include "game.h"
 
 #include <engine/engine.h>
-#include <engine/events.h>
+#include <engine/play_mode.h>
 #include <engine/rendering/renderer.h>
 #include <engine/meta/settings/settings.hpp>
 #include <engine/assets/asset_manager.h>
 #include <engine/meta/assets/asset_database.hpp>
 #include <engine/scripting/ecs/systems/script_system.h>
+#include <engine/settings/boot_config.h>
 #include "runner/runner.h"
 
 #include <filesystem/filesystem.h>
@@ -15,7 +16,7 @@
 
 namespace unravel
 {
- 
+
 REFLECTION_REGISTRATION
 {
     entt::meta_factory<game>{}
@@ -47,24 +48,37 @@ auto game::create(rtti::context& ctx, cmd_line::parser& parser) -> bool
 
 auto game::init(const cmd_line::parser& parser) -> bool
 {
-    if(!engine::init_core(parser))
+    if(!init_protocols(parser))
     {
         return false;
     }
 
     auto& ctx = engine::context();
 
-    if(!init_assets(ctx, parser))
+    // Peek settings for cold boot fields only. Asset handles inside settings.cfg
+    // cannot resolve yet (databases not loaded); that is expected here.
+    if(!prepare_boot_config(ctx, parser))
     {
         return false;
     }
 
+    if(!engine::init_core(parser))
+    {
+        return false;
+    }
+
+    if(!init_assets(ctx))
+    {
+        return false;
+    }
+
+    // Full settings load now that asset databases can resolve handles.
     if(!init_settings(ctx))
     {
         return false;
     }
 
-    if(!init_window(ctx))
+    if(!init_window(ctx, parser))
     {
         return false;
     }
@@ -90,30 +104,16 @@ auto game::init(const cmd_line::parser& parser) -> bool
         return false;
     }
 
-    auto& ev = ctx.get_cached<events>();
-    ev.set_play_mode(ctx, true);
+    auto& play = ctx.get_cached<play_mode>();
+    play.set_active(ctx, true);
 
     return true;
 }
 
-auto game::init_settings(rtti::context& ctx) -> bool
-{
-    auto& s = ctx.add<settings>();
-    auto settings_path = fs::resolve_protocol("app:/settings/settings.cfg");
-    if(!load_from_file(settings_path.string(), s))
-    {
-        APPLOG_CRITICAL("Failed to load project settings {}", settings_path.string());
-        return false;
-    }
-
-    return true;
-}
-
-auto game::init_assets(rtti::context& ctx, const cmd_line::parser& parser) -> bool
+auto game::init_protocols(const cmd_line::parser& parser) -> bool
 {
     std::string appdata;
     parser.try_get("appdata", appdata);
-
     if(!appdata.empty())
     {
         fs::path app_data = appdata;
@@ -126,29 +126,63 @@ auto game::init_assets(rtti::context& ctx, const cmd_line::parser& parser) -> bo
         fs::path app_data = binary_path / "data" / "app";
         fs::add_path_protocol("app", app_data);
     }
+    return true;
+}
 
+auto game::prepare_boot_config(rtti::context& ctx, const cmd_line::parser& parser) -> bool
+{
+    const fs::path app_root = fs::resolve_protocol("app:/");
+    const boot_config project_hint = peek_project_boot_config(app_root);
+    const boot_config resolved = resolve_boot_config(parser, project_hint);
+    if(ctx.has<boot_config>())
+    {
+        ctx.get<boot_config>() = resolved;
+    }
+    else
+    {
+        ctx.add<boot_config>(resolved);
+    }
+    APPLOG_INFO("Resolved boot config: renderer={} (cli={}) physics={} (cli={})",
+                preferred_renderer_to_string(resolved.renderer),
+                resolved.cli.renderer,
+                physics_backend_to_string(resolved.physics),
+                resolved.cli.physics);
+    return true;
+}
+
+auto game::init_settings(rtti::context& ctx) -> bool
+{
+    auto& s = ctx.add<settings>();
+    const auto settings_path = fs::resolve_protocol("app:/settings/settings.cfg");
+    if(!load_from_file(settings_path.string(), s))
+    {
+        APPLOG_CRITICAL("Failed to load project settings {}", settings_path.string());
+        return false;
+    }
+    return true;
+}
+
+auto game::init_assets(rtti::context& ctx) -> bool
+{
     auto& am = ctx.get_cached<asset_manager>();
-
     if(!am.load_database("engine:/"))
     {
         APPLOG_CRITICAL("Failed to load engine asset pack.");
         return false;
     }
-
     if(!am.load_database("app:/"))
     {
         APPLOG_CRITICAL("Failed to load app asset pack.");
         return false;
     }
-
     return true;
 }
 
-auto game::init_window(rtti::context& ctx) -> bool
+auto game::init_window(rtti::context& ctx, const cmd_line::parser& parser) -> bool
 {
     auto& s = ctx.get<settings>();
 
-    auto title = fmt::format("Ace Game <{}>", gfx::get_renderer_name(gfx::get_renderer_type()));
+    auto title = fmt::format("Unravel Game <{}>", gfx::get_renderer_name(gfx::get_renderer_type()));
 
     if(!s.app.product.empty())
     {
@@ -159,10 +193,26 @@ auto game::init_window(rtti::context& ctx) -> bool
     {
         title += fmt::format("v{}", s.app.version);
     }
-    uint32_t flags = os::window::resizable | os::window::maximized;
-    auto primary_display = os::display::get_primary_display_index();
-
     auto& rend = ctx.get_cached<renderer>();
+    std::string window_geometry;
+    int32_t x = 0;
+    int32_t y = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool maximized = false;
+    if(parser.try_get("window", window_geometry) &&
+       renderer::parse_window_geometry(window_geometry, x, y, width, height, maximized))
+    {
+        uint32_t flags = os::window::resizable;
+        if(maximized)
+        {
+            flags |= os::window::maximized;
+        }
+        rend.create_window(title, x, y, width, height, flags);
+        return true;
+    }
+    const uint32_t flags = os::window::resizable | os::window::maximized;
+    const auto primary_display = os::display::get_primary_display_index();
     rend.create_window_for_display(primary_display, title, flags);
     return true;
 }

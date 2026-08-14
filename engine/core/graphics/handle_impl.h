@@ -57,6 +57,11 @@ public:
             eviction::restore_resource(const_cast<handle_impl*>(this));
         }
         touch();
+
+        if(!is_valid())
+        {
+            return get_fallback_handle();
+        }
         return handle_;
     }
 
@@ -104,6 +109,15 @@ public:
     }
 
 protected:
+    auto fallback_handle() const -> T
+    {
+        return handle_;
+    }
+
+    auto get_fallback_handle() const -> T
+    {
+        return static_cast<const Base&>(*this).fallback_handle();
+    }
     /// Opt the resource into the eviction system. Call once, after the GPU handle is created and a
     /// CPU-side backing exists. @p restore_fn recreates the handle from that backing and returns
     /// true on success. Resources that never call this stay @ref evict_class::non_evictable and
@@ -120,6 +134,24 @@ protected:
         restore_fn_ = std::move(restore_fn);
         evict_class_ = cls;
         eviction::register_resource(this);
+        touch();
+    }
+
+    /// Opt in with CPU backing but no GPU handle yet (create skipped or deferred). Restored on the
+    /// next @ref native_handle access via the same path as post-eviction restore.
+    void make_evictable_deferred(std::uint64_t gpu_bytes,
+                                 std::function<bool(Base&)> restore_fn,
+                                 evict_class cls = evict_class::evictable)
+    {
+        if(!eviction::is_supported())
+        {
+            return;
+        }
+        gpu_size_ = gpu_bytes;
+        restore_fn_ = std::move(restore_fn);
+        evict_class_ = cls;
+        evict_state_ = evict_state::evicted;
+        eviction::register_evicted_resource(this);
     }
 
     T handle_ = invalid_handle();

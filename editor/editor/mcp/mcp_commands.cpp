@@ -187,6 +187,20 @@ auto cull_type_to_string(cull_type type) -> std::string
     }
 }
 
+auto alpha_mode_to_string(alpha_mode mode) -> std::string
+{
+    switch(mode)
+    {
+        case alpha_mode::mask:
+            return "mask";
+        case alpha_mode::blend:
+            return "blend";
+        case alpha_mode::opaque:
+        default:
+            return "opaque";
+    }
+}
+
 auto mesh_status_to_string(mesh_status status) -> std::string
 {
     switch(status)
@@ -238,7 +252,10 @@ auto material_to_json(const material::sptr& material_instance, uint32_t index) -
         result["base_color"] = color_to_json(pbr->get_base_color());
         result["roughness"] = pbr->get_roughness();
         result["metalness"] = pbr->get_metalness();
-        result["alpha_test_value"] = pbr->get_alpha_test_value();
+        result["alpha_mode"] = alpha_mode_to_string(pbr->get_alpha_mode());
+        result["alpha_cutoff"] = pbr->get_alpha_cutoff();
+        // Preserve the legacy response field for existing PW automation clients.
+        result["alpha_test_value"] = pbr->get_alpha_cutoff();
         result["textures"] = {
             {"color", asset_handle_to_json(pbr->get_color_map())},
             {"normal", asset_handle_to_json(pbr->get_normal_map())},

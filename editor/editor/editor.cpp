@@ -7,6 +7,9 @@
 #include <simulation/simulation.h>
 #include <version/version.h>
 
+#include <cstdint>
+#include <string>
+
 #include "assets/asset_watcher.h"
 #include "editing/editing_manager.h"
 #include "editing/picking_manager.h"
@@ -15,6 +18,7 @@
 #include "hub/hub.h"
 #include "imgui/imgui_interface.h"
 #include "mcp/mcp_system.h"
+#include "system/mcp_manager.h"
 #include "system/project_manager.h"
 #include "system/version_manager.h"
 #include <filedialog/filedialog.h>
@@ -32,7 +36,8 @@ REFLECTION_REGISTRATION
         .func<&editor::deinit>("deinit"_hs)
         .func<&editor::destroy>("destroy"_hs)
         .func<&editor::process>("process"_hs)
-        .func<&editor::interrupt>("interrupt"_hs);
+        .func<&editor::interrupt>("interrupt"_hs)
+        .func<&editor::prepare_restart>("prepare_restart"_hs);
 
 
 }
@@ -58,6 +63,7 @@ auto editor::create(rtti::context& ctx, cmd_line::parser& parser) -> bool
     ctx.add<thumbnail_manager>();
     ctx.add<asset_watcher>();
     ctx.add<version_manager>();
+    ctx.add<mcp_manager>();
 
     return true;
 }
@@ -71,6 +77,10 @@ auto editor::init(const cmd_line::parser& parser) -> bool
     {
         native::message_box(message, native::dialog_type::ok, native::icon_type::error, module);
     });
+
+    // Peek project boot settings (if -p/--project) before cold system init.
+    ctx.get_cached<project_manager>().prepare_boot_config(ctx, parser);
+
     // --- Phase 1: core systems (no ImGui yet, console-only progress) ---
 
     if(!engine::init_core(parser))
@@ -79,7 +89,7 @@ auto editor::init(const cmd_line::parser& parser) -> bool
     }
 
     ls.begin_module("Window");
-    if(!ls.check(init_window(ctx)))
+    if(!ls.check(init_window(ctx, parser)))
     {
         return false;
     }
@@ -170,7 +180,7 @@ auto editor::init(const cmd_line::parser& parser) -> bool
         return false;
     }
 
-    ls.begin_module("MCP");
+    ls.begin_module("PW Content");
     if(!ls.check(ctx.get_cached<mcp_system>().init(ctx)))
     {
         return false;
@@ -194,16 +204,38 @@ auto editor::init(const cmd_line::parser& parser) -> bool
         return false;
     }
 
+    ls.begin_module("MCP Server");
+    if(!ls.check(ctx.get_cached<mcp_manager>().init(ctx)))
+    {
+        return false;
+    }
+
     return true;
 }
 
-auto editor::init_window(rtti::context& ctx) -> bool
+auto editor::init_window(rtti::context& ctx, const cmd_line::parser& parser) -> bool
 {
     auto title = fmt::format("Unravel Editor <{}> {}", gfx::get_renderer_name(gfx::get_renderer_type()), version::get_full());
-    uint32_t flags = os::window::resizable | os::window::maximized;
-    auto primary_display = os::display::get_primary_display_index();
-
     auto& rend = ctx.get_cached<renderer>();
+    std::string window_geometry;
+    int32_t x = 0;
+    int32_t y = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool maximized = false;
+    if(parser.try_get("window", window_geometry) &&
+       renderer::parse_window_geometry(window_geometry, x, y, width, height, maximized))
+    {
+        uint32_t flags = os::window::resizable;
+        if(maximized)
+        {
+            flags |= os::window::maximized;
+        }
+        rend.create_window(title, x, y, width, height, flags);
+        return true;
+    }
+    const uint32_t flags = os::window::resizable | os::window::maximized;
+    const auto primary_display = os::display::get_primary_display_index();
     rend.create_window_for_display(primary_display, title, flags);
     return true;
 }
@@ -211,6 +243,11 @@ auto editor::init_window(rtti::context& ctx) -> bool
 auto editor::deinit() -> bool
 {
     auto& ctx = engine::context();
+
+    if(!ctx.get_cached<mcp_manager>().deinit(ctx))
+    {
+        return false;
+    }
 
     if(!ctx.get_cached<mcp_system>().deinit(ctx))
     {
@@ -274,6 +311,7 @@ auto editor::destroy() -> bool
     ctx.remove<asset_watcher>();
     ctx.remove<thumbnail_manager>();
     ctx.remove<picking_manager>();
+    ctx.remove<mcp_manager>();
     ctx.remove<mcp_system>();
     ctx.remove<editing_manager>();
 
@@ -282,7 +320,6 @@ auto editor::destroy() -> bool
 
     ctx.remove<project_manager>();
     ctx.remove<version_manager>();
-
     ctx.remove<ui_events>();
 
     return engine::destroy();
@@ -295,6 +332,15 @@ auto editor::process() -> int
 auto editor::interrupt() -> bool
 {
     return engine::interrupt();
+}
+
+void editor::prepare_restart(std::vector<std::string>& arguments)
+{
+    auto& ctx = engine::context();
+    auto& pm = ctx.get_cached<project_manager>();
+    pm.prepare_restart(arguments);
+    auto& rend = ctx.get_cached<renderer>();
+    rend.prepare_restart(arguments);
 }
 
 } // namespace unravel

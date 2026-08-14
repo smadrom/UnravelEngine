@@ -65,6 +65,21 @@ bool init(init_type init_data);
 /**/
 void shutdown();
 
+/// Policy when @ref eviction::reclaim_for reports insufficient headroom before a GPU texture
+/// allocation (render targets / compute-write surfaces).
+enum class allocation_failure_policy : std::uint8_t
+{
+    warn_and_try,      ///< Log a warning and attempt the allocation anyway (default).
+    skip_with_fallback ///< Skip the allocation; @ref texture::native_handle binds the fallback texture.
+};
+
+void set_allocation_failure_policy(allocation_failure_policy policy);
+auto get_allocation_failure_policy() -> allocation_failure_policy;
+
+/// Valid magenta 4x4 RGBA8 texture created during @ref init and destroyed in @ref shutdown. Returned
+/// from @ref texture::native_handle when the resource has no live GPU handle.
+auto fallback_texture() -> texture_handle;
+
 /**/
 void reset(uint32_t _width, uint32_t _height, uint32_t _flags = BGFX_RESET_NONE);
 
@@ -125,7 +140,7 @@ encoder* begin();
 void end(encoder* _encoder);
 
 /**/
-uint32_t frame(bool _capture = true);
+uint32_t frame(uint8_t _flags = BGFX_FRAME_NONE);
 
 /**/
 renderer_type get_renderer_type();
@@ -531,6 +546,9 @@ void set_vertex_buffer(uint8_t _stream,
                        uint32_t _numVertices);
 
 /**/
+void set_vertex_count(uint32_t _numVertices);
+
+/**/
 void set_instance_data_buffer(const instance_data_buffer* _idb, uint32_t _start, uint32_t _num);
 
 /**/
@@ -636,6 +654,15 @@ void set_warning_logger(const std::function<void(const std::string&, const char*
 void set_error_logger(const std::function<void(const std::string&, const char* _filePath, uint16_t _line)>& logger);
 void set_debug_logger(const std::function<void(const std::string&, const char* _filePath, uint16_t _line)>& logger);
 
+/// Emit a message through the logger callback registered for @p category ("trace", "debug",
+/// "info", "warning", "error"). No-op when the host has not installed a callback for that
+/// category. Used by the graphics layer (e.g. the eviction system) to surface messages through
+/// the same channel bgfx uses, so the user only has to wire one logger up to the engine.
+void log(const std::string& category,
+         const std::string& log_msg,
+         const char* _filePath = nullptr,
+         uint16_t _line = 0);
+
 /// Hooks for bgfx::CallbackI::profilerBegin / profilerBeginLiteral / profilerEnd. The graphics layer
 /// only forwards events; pair nested begin/end and any token stack in the code that installs hooks.
 using gfx_profiler_begin_hook =
@@ -648,7 +675,7 @@ void set_profiler_hooks(gfx_profiler_begin_hook on_begin,
                         gfx_profiler_end_hook on_end);
 void clear_profiler_hooks();
 
-void flush();
+void frames(int _count, int32_t _flags = BGFX_FRAME_NONE);
 
 bool is_origin_bottom_left();
 bool is_homogeneous_depth();
@@ -696,10 +723,11 @@ uint32_t get_render_frame();
 
 void set_world_transform(const void* _mtx, uint16_t _num = 1);
 
-/// Conservative estimate of the GPU memory a texture occupies, derived from its computed
-/// @ref texture_info plus creation @p _flags (accounts for MSAA sample count and allocation
-/// alignment, which @ref texture_info::storageSize does not). Use for eviction accounting; true
-/// device occupancy still comes from the backend via @ref get_stats (gpuMemoryUsed/gpuMemoryMax).
+/// Estimate of GPU memory a texture occupies for eviction accounting. Matches bgfx's internal
+/// @c textureMemoryUsed baseline (@ref texture_info::storageSize), with row-pitch uplift for
+/// uncompressed formats (256-byte alignment) and a 4 KiB minimum for committed image allocations.
+/// MSAA sample count from @p _flags is applied for render targets. True device occupancy comes from
+/// @ref get_stats (gpuMemoryUsed / gpuMemoryMax); the eviction budget also carries a safety margin.
 uint64_t estimate_texture_gpu_size(const texture_info& _info, uint64_t _flags);
 
 

@@ -1,9 +1,10 @@
 #include "particle_system.h"
 #include "threadpp/thread.h"
-#include <engine/rendering/ecs/components/particle_emitter_component.h>
 #include <engine/ecs/components/transform_component.h>
-#include <engine/rendering/particles/ps/particle_system.h>
 #include <engine/profiler/profiler.h>
+#include <engine/rendering/ecs/components/particle_emitter_component.h>
+#include <engine/rendering/particles/ps/particle_system_soa.h>
+#include <graphics/graphics.h>
 #include <logging/logging.h>
 
 
@@ -18,12 +19,13 @@ auto particle_system::init(rtti::context& ctx) -> bool
 {
     APPLOG_TRACE("{}::{}", hpp::type_name_str(*this), __func__);
 
-    // Initialize the particle system with default parameters
-    // 64 max emitters, using default allocator
-    psInit(4096 * 4, nullptr);
+    // Initialize the soa particle system (large emitter pool for editor/scenes).
+    ps_soa::init(4096 * 4);
+    ps_soa::init_gpu(ctx);
     
+
     initialized_ = true;
-    
+
     return true;
 }
 
@@ -33,8 +35,7 @@ auto particle_system::deinit(rtti::context& ctx) -> bool
 
     if(initialized_)
     {
-        // Shutdown the particle system
-        psShutdown();
+        ps_soa::shutdown();
         initialized_ = false;
     }
     
@@ -67,12 +68,17 @@ void particle_system::on_frame_before_render(scene& scn, delta_t dt)
         APP_SCOPE_PERF_THREAD("Particle/Update Emitter","Pool Thread");
         auto& transform_comp = view.get<transform_component>(entity);
         auto& emitter_comp = view.get<particle_emitter_component>(entity);
-        
-        // Get the world transform and pass it to the emitter
+        // Same grace as model_system: leave newly created as "used" for one frame.
+        if(emitter_comp.is_newly_created())
+        {
+            emitter_comp.set_last_render_frame(uint64_t(gfx::get_render_frame()));
+        }
         const auto& world_transform = transform_comp.get_transform_global();
         emitter_comp.update_emitter(world_transform, dt);
     });
-    
+
+    // Awake GPU emitters only — renderer-based freeze clears pending_pack.
+    ps_soa::sync_gpu_simulation();
 }
 
 } // namespace unravel

@@ -1,9 +1,13 @@
 #include "editor_actions.h"
+#include "entity_inspect.h"
 #include "engine/scripting/script.h"
 #include "engine/ui/ui_tree.h"
+#include "threadpp/thread.h"
 
 #include <editor/editing/create_scene_modal.h>
 #include <editor/editing/editing_manager.h>
+#include <editor/hub/hub.h>
+#include <editor/hub/panels/console_log_panel/console_log_panel.h>
 #include <editor/imgui/integration/imgui_messagebox.h>
 #include <editor/imgui/integration/imgui_notify.h>
 #include <editor/system/project_manager.h>
@@ -15,11 +19,13 @@
 #include <engine/ecs/ecs.h>
 #include <engine/engine.h>
 #include <engine/events.h>
+#include <engine/play_mode.h>
 #include <engine/meta/assets/asset_database.hpp>
 #include <engine/meta/ecs/entity.hpp>
 #include <engine/scripting/ecs/systems/script_system.h>
 #include <engine/rendering/ecs/systems/reflection_probe_system.h>
 #include <engine/rendering/ecs/components/reflection_probe_component.h>
+#include <engine/rendering/renderer.h>
 #include <engine/ecs/scene.h>
 #include <filedialog/filedialog.h>
 #include <filesystem/filesystem.h>
@@ -322,7 +328,9 @@ void generate_workspace_file(const std::string& file_path,
     json_stream << ",\n";
     json_stream << "    \"extensions\": {\n";
     json_stream << "        \"recommendations\": [\n";
+#if DOTNETPP_BACKEND_MONO
     json_stream << "             \"ms-vscode.mono-debug\",\n";
+#endif
     json_stream << "             \"ms-dotnettools.csharp\"\n";
     json_stream << "        ]\n";
     json_stream << "    }\n";
@@ -332,6 +340,7 @@ void generate_workspace_file(const std::string& file_path,
     json_stream << "    \"launch\": {\n";
     json_stream << "        \"version\": \"0.2.0\",\n";
     json_stream << "        \"configurations\": [\n";
+#if DOTNETPP_BACKEND_MONO
     json_stream << "            {\n";
     json_stream << "                \"name\": \"Attach to Mono\",\n";
     json_stream << "                \"request\": \"attach\",\n";
@@ -339,6 +348,20 @@ void generate_workspace_file(const std::string& file_path,
     json_stream << "                \"address\": \"" << settings.debugger.ip << "\",\n";
     json_stream << "                \"port\": " << settings.debugger.port << "\n";
     json_stream << "            }\n";
+#else
+    (void)settings;
+    json_stream << "            {\n";
+    json_stream << "                \"name\": \"Attach to " << EDITOR_NAME << "\",\n";
+    json_stream << "                \"type\": \"coreclr\",\n";
+    json_stream << "                \"request\": \"attach\"\n";
+    json_stream << "                \"processName\": \"" << EDITOR_NAME << "\"\n";
+    json_stream << "            },\n";
+    json_stream << "            {\n";
+    json_stream << "                \"name\": \".NET Core Attach\",\n";
+    json_stream << "                \"type\": \"coreclr\",\n";
+    json_stream << "                \"request\": \"attach\"\n";
+    json_stream << "            }\n";
+#endif
     json_stream << "        ]\n";
     json_stream << "    }\n";
 
@@ -355,103 +378,193 @@ void generate_workspace_file(const std::string& file_path,
     APPLOG_TRACE("Workspace {}", file_path);
 }
 
+namespace
+{
+
+auto collect_csharp_sources(const fs::path& source_directory, std::vector<fs::path>& out_sources) -> bool
+{
+    fs::error_code ec;
+    const fs::recursive_directory_iterator end;
+    fs::recursive_directory_iterator it(source_directory, ec);
+    if(ec)
+    {
+        APPLOG_ERROR("Failed to iterate source directory {}: {}", source_directory.string(), ec.message());
+        return false;
+    }
+    while(it != end)
+    {
+        const fs::path current_path = it->path();
+        const bool is_regular = it->is_regular_file(ec);
+        if(ec)
+        {
+            APPLOG_ERROR("Failed to query {}: {}", current_path.string(), ec.message());
+            return false;
+        }
+        if(is_regular && current_path.extension() == ".cs")
+        {
+            out_sources.push_back(current_path);
+        }
+        it.increment(ec);
+        if(ec)
+        {
+            APPLOG_ERROR("Failed while iterating {}: {}", source_directory.string(), ec.message());
+            return false;
+        }
+    }
+    return true;
+}
+
+auto validate_csproj_inputs(const fs::path& source_directory,
+                            const std::vector<fs::path>& external_dll_paths,
+                            const fs::path& output_directory) -> bool
+{
+    fs::error_code ec;
+    fs::create_directories(output_directory, ec);
+    if(ec)
+    {
+        APPLOG_ERROR("Failed to create output directory {}: {}", output_directory.string(), ec.message());
+        return false;
+    }
+    if(!fs::exists(source_directory, ec) || !fs::is_directory(source_directory, ec))
+    {
+        APPLOG_ERROR("Source directory does not exist or is not a directory: {}", source_directory.string());
+        return false;
+    }
+    for(const auto& dll_path : external_dll_paths)
+    {
+        if(!fs::exists(dll_path, ec) || !fs::is_regular_file(dll_path, ec))
+        {
+            APPLOG_ERROR("External DLL does not exist or is not a file: {}", dll_path.string());
+            return false;
+        }
+    }
+    return true;
+}
+
+auto write_csproj_file(const fs::path& csproj_path, const std::string& csproj_content) -> bool
+{
+    std::ofstream csproj_file(csproj_path);
+    if(!csproj_file.is_open())
+    {
+        APPLOG_ERROR("Failed to create .csproj file at {}", csproj_path.string());
+        return false;
+    }
+    csproj_file << csproj_content;
+    if(!csproj_file)
+    {
+        APPLOG_ERROR("Failed to write .csproj file at {}", csproj_path.string());
+        return false;
+    }
+    APPLOG_TRACE("Generated {}", csproj_path.string());
+    return true;
+}
+
+auto build_external_dll_references(const std::vector<fs::path>& external_dll_paths) -> std::string
+{
+    std::string external_dll_references;
+    fs::error_code ec;
+    for(const auto& dll_path : external_dll_paths)
+    {
+        const std::string dll_name = dll_path.filename().string();
+        const fs::path dll_absolute_path = fs::absolute(dll_path, ec);
+        if(ec)
+        {
+            APPLOG_ERROR("Failed to resolve absolute path for {}: {}", dll_path.string(), ec.message());
+            return {};
+        }
+        external_dll_references += "    <Reference Include=\"" + dll_name + "\">\n";
+        external_dll_references += "      <HintPath>" + dll_absolute_path.generic_string() + "</HintPath>\n";
+        external_dll_references += "      <Private>False</Private>\n";
+        external_dll_references += "    </Reference>\n";
+    }
+    return external_dll_references;
+}
+
+} // namespace
+
 /**
  * @brief Generates a .csproj file based on the provided parameters.
  *
- * @param source_directory Directory containing C# source files.
- * @param external_dll_path Path to the external DLL to reference.
- * @param output_directory Directory where the .csproj file will be generated.
- * @param project_name Name of the project and the .csproj file (default: "MyLibrary").
- * @param dotnet_sdk_version Target .NET SDK version (default: "7.0").
- *
- * @throws std::runtime_error if the .csproj file cannot be created.
+ * @return true on success; false on failure (errors are logged, never thrown).
  */
-void generate_csproj(const fs::path& source_directory,
+#if !DOTNETPP_BACKEND_MONO
+auto generate_csproj(const fs::path& source_directory,
                      const std::vector<fs::path>& external_dll_paths,
                      const fs::path& output_directory,
                      const std::string& project_name = "MyLibrary",
-                     const std::string& dotnet_sdk_version = "7.0")
+                     std::string dotnet_sdk_version = {}) -> bool
 {
-    // Ensure the output directory exists
-    try
+    if(dotnet_sdk_version.empty())
     {
-        fs::create_directories(output_directory);
+        dotnet_sdk_version = dotnet::get_dotnet_version();
     }
-    catch(const fs::filesystem_error& e)
+    if(!validate_csproj_inputs(source_directory, external_dll_paths, output_directory))
     {
-        throw std::runtime_error("Failed to create output directory: " + std::string(e.what()));
+        return false;
     }
-
-    // Verify that the source directory exists
-    if(!fs::exists(source_directory) || !fs::is_directory(source_directory))
-    {
-        throw std::runtime_error("Source directory does not exist or is not a directory: " + source_directory.string());
-    }
-
-    // Verify that all external DLLs exist and are files
-    for(const auto& dll_path : external_dll_paths)
-    {
-        if(!fs::exists(dll_path) || !fs::is_regular_file(dll_path))
-        {
-            throw std::runtime_error("External DLL does not exist or is not a file: " + dll_path.string());
-        }
-    }
-
-    // Collect all C# source files from the specified source directory
     std::vector<fs::path> csharp_sources;
-    try
+    if(!collect_csharp_sources(source_directory, csharp_sources))
     {
-        for(const auto& entry : fs::recursive_directory_iterator(source_directory))
-        {
-            if(entry.is_regular_file() && entry.path().extension() == ".cs")
-            {
-                // Compute the relative path from the source directory
-                fs::path relative_path = fs::relative(entry.path(), source_directory);
-                csharp_sources.push_back(relative_path);
-            }
-        }
+        return false;
     }
-    catch(const fs::filesystem_error& e)
+    fs::error_code ec;
+    const fs::path csproj_directory = fs::absolute(output_directory, ec);
+    if(ec)
     {
-        throw std::runtime_error("Error while iterating source directory: " + std::string(e.what()));
+        APPLOG_ERROR("Failed to resolve output directory {}: {}", output_directory.string(), ec.message());
+        return false;
     }
-
-    // Generate the list of source files for the .csproj file with <Link> elements (for virtual folders)
+    const fs::path source_root = fs::absolute(source_directory, ec);
+    if(ec)
+    {
+        APPLOG_ERROR("Failed to resolve source directory {}: {}", source_directory.string(), ec.message());
+        return false;
+    }
     std::string csharp_source_items;
     for(const auto& source_file : csharp_sources)
     {
-        // Convert path to generic format (forward slashes)
-        std::string source_file_str = source_file.string();
-        fs::path full_physical_path = fs::absolute(source_directory / source_file);
-        std::string full_physical_path_str = full_physical_path.string();
-
-        // Construct the <Compile Include> with <Link>
-        csharp_source_items += "    <Compile Include=\"" + full_physical_path_str + "\">\n";
-        csharp_source_items += "      <Link>" + source_file_str + "</Link>\n";
+        const fs::path absolute_source = fs::absolute(source_file, ec);
+        if(ec)
+        {
+            APPLOG_ERROR("Failed to resolve source {}: {}", source_file.string(), ec.message());
+            return false;
+        }
+        const fs::path include_path = fs::relative(absolute_source, csproj_directory, ec);
+        if(ec)
+        {
+            APPLOG_ERROR("Failed to make relative include for {}: {}", absolute_source.string(), ec.message());
+            return false;
+        }
+        const fs::path link_path = fs::relative(absolute_source, source_root, ec);
+        if(ec)
+        {
+            APPLOG_ERROR("Failed to make relative link for {}: {}", absolute_source.string(), ec.message());
+            return false;
+        }
+        csharp_source_items += "    <Compile Include=\"" + include_path.generic_string() + "\">\n";
+        csharp_source_items += "      <Link>" + link_path.generic_string() + "</Link>\n";
         csharp_source_items += "    </Compile>\n";
     }
-
-    // Generate external DLL references
-    std::string external_dll_references;
-    for(const auto& dll_path : external_dll_paths)
+    const std::string external_dll_references = build_external_dll_references(external_dll_paths);
+    if(external_dll_references.empty() && !external_dll_paths.empty())
     {
-        std::string dll_name = dll_path.filename().string();
-        fs::path dll_absolute_path = fs::absolute(dll_path);
-        std::string dll_absolute_path_str = dll_absolute_path.string(); // Forward slashes
-
-        external_dll_references += "    <Reference Include=\"" + dll_name + "\">\n";
-        external_dll_references += "      <HintPath>" + dll_absolute_path_str + "</HintPath>\n";
-        external_dll_references += "    </Reference>\n";
+        return false;
     }
-
-    // Build the .csproj content
+    // IDE tooling project; engine compiles scripts with csc. Keep outputs under temp/.
     std::string csproj_content;
     csproj_content += "<Project Sdk=\"Microsoft.NET.Sdk\">\n";
     csproj_content += "  <PropertyGroup>\n";
     csproj_content += "    <TargetFramework>net" + dotnet_sdk_version + "</TargetFramework>\n";
     csproj_content += "    <OutputType>Library</OutputType>\n";
-    csproj_content +=
-        "    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>\n"; // Disable default .cs file inclusion
+    csproj_content += "    <AssemblyName>" + project_name + "</AssemblyName>\n";
+    csproj_content += "    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>\n";
+    csproj_content += "    <ImplicitUsings>disable</ImplicitUsings>\n";
+    csproj_content += "    <Nullable>disable</Nullable>\n";
+    csproj_content += "    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>\n";
+    csproj_content += "    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>\n";
+    csproj_content += "    <BaseOutputPath>temp/bin</BaseOutputPath>\n";
+    csproj_content += "    <BaseIntermediateOutputPath>temp/obj</BaseIntermediateOutputPath>\n";
+    csproj_content += "    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>\n";
     csproj_content += "  </PropertyGroup>\n";
     csproj_content += "  <ItemGroup>\n";
     csproj_content += csharp_source_items;
@@ -460,101 +573,57 @@ void generate_csproj(const fs::path& source_directory,
     csproj_content += external_dll_references;
     csproj_content += "  </ItemGroup>\n";
     csproj_content += "</Project>\n";
-
-    // Define the path to the .csproj file
-    fs::path csproj_path = output_directory / (project_name + ".csproj");
-
-    // Write the .csproj file
-    std::ofstream csproj_file(csproj_path);
-    if(!csproj_file.is_open())
-    {
-        APPLOG_ERROR("Failed to create .csproj file at {}", csproj_path.string());
-        return;
-    }
-
-    csproj_file << csproj_content;
-
-    APPLOG_TRACE("Generated {}", csproj_path.string());
+    const fs::path csproj_path = output_directory / (project_name + ".csproj");
+    return write_csproj_file(csproj_path, csproj_content);
 }
-
-void generate_csproj_legacy(const fs::path& source_directory,
+#else
+auto generate_csproj_legacy(const fs::path& source_directory,
                             const std::vector<fs::path>& external_dll_paths,
                             const fs::path& output_directory,
                             const std::string& project_name = "MyLibrary",
-                            const std::string& dotnet_framework_version = "v4.7.1")
+                            const std::string& dotnet_framework_version = "v4.7.1") -> bool
 {
-    auto uid = generate_uuid(project_name);
-    fs::path output_path = fs::path("temp") / "bin" / "Debug";
-    fs::path intermediate_output_path = fs::path("temp") / "obj" / "Debug";
-
-    // Ensure the output directory exists
-    try
+    const auto uid = generate_uuid(project_name);
+    const fs::path output_path = fs::path("temp") / "bin" / "Debug";
+    const fs::path intermediate_output_path = fs::path("temp") / "obj" / "Debug";
+    if(!validate_csproj_inputs(source_directory, external_dll_paths, output_directory))
     {
-        fs::create_directories(output_directory);
+        return false;
     }
-    catch(const fs::filesystem_error& e)
-    {
-        throw std::runtime_error("Failed to create output directory: " + std::string(e.what()));
-    }
-
-    // Verify that the source directory exists
-    if(!fs::exists(source_directory) || !fs::is_directory(source_directory))
-    {
-        throw std::runtime_error("Source directory does not exist or is not a directory: " + source_directory.string());
-    }
-
-    // Verify that all external DLLs exist and are files
-    for(const auto& dll_path : external_dll_paths)
-    {
-        if(!fs::exists(dll_path) || !fs::is_regular_file(dll_path))
-        {
-            throw std::runtime_error("External DLL does not exist or is not a file: " + dll_path.string());
-        }
-    }
-
-    // Collect all C# source files from the specified source directory
     std::vector<fs::path> csharp_sources;
-    try
+    if(!collect_csharp_sources(source_directory, csharp_sources))
     {
-        for(const auto& entry : fs::recursive_directory_iterator(source_directory))
-        {
-            if(entry.is_regular_file() && entry.path().extension() == ".cs")
-            {
-                // Compute the relative path from the output directory
-                fs::path relative_path = fs::relative(entry.path(), output_directory);
-                csharp_sources.push_back(relative_path);
-            }
-        }
+        return false;
     }
-    catch(const fs::filesystem_error& e)
+    fs::error_code ec;
+    const fs::path csproj_directory = fs::absolute(output_directory, ec);
+    if(ec)
     {
-        throw std::runtime_error("Error while iterating source directory: " + std::string(e.what()));
+        APPLOG_ERROR("Failed to resolve output directory {}: {}", output_directory.string(), ec.message());
+        return false;
     }
-
-    // Generate the list of source files for the .csproj file
     std::string csharp_source_items;
     for(const auto& source_file : csharp_sources)
     {
-        // Convert path to generic format (forward slashes)
-        std::string source_file_str = source_file.string();
-        csharp_source_items += "    <Compile Include=\"" + source_file_str + "\" />\n";
+        const fs::path absolute_source = fs::absolute(source_file, ec);
+        if(ec)
+        {
+            APPLOG_ERROR("Failed to resolve source {}: {}", source_file.string(), ec.message());
+            return false;
+        }
+        const fs::path include_path = fs::relative(absolute_source, csproj_directory, ec);
+        if(ec)
+        {
+            APPLOG_ERROR("Failed to make relative include for {}: {}", absolute_source.string(), ec.message());
+            return false;
+        }
+        csharp_source_items += "    <Compile Include=\"" + include_path.generic_string() + "\" />\n";
     }
-
-    // Generate external DLL references
-    std::string external_dll_references;
-    for(const auto& dll_path : external_dll_paths)
+    const std::string external_dll_references = build_external_dll_references(external_dll_paths);
+    if(external_dll_references.empty() && !external_dll_paths.empty())
     {
-        std::string dll_name = dll_path.filename().string();
-        fs::path dll_absolute_path = fs::absolute(dll_path);
-        std::string dll_absolute_path_str = dll_absolute_path.string(); // Forward slashes
-
-        external_dll_references += "    <Reference Include=\"" + dll_name + "\">\n";
-        external_dll_references += "      <HintPath>" + dll_absolute_path_str + "</HintPath>\n";
-        external_dll_references += "      <Private>False</Private>\n"; // Mimic Unity's references
-        external_dll_references += "    </Reference>\n";
+        return false;
     }
-
-    // Build the .csproj content
     std::string csproj_content;
     csproj_content += "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n";
     csproj_content += "<Project ToolsVersion=\"4.0\" DefaultTargets=\"Build\" "
@@ -575,61 +644,23 @@ void generate_csproj_legacy(const fs::path& source_directory,
     csproj_content += "    <TargetFrameworkVersion>" + dotnet_framework_version + "</TargetFrameworkVersion>\n";
     csproj_content += "    <FileAlignment>512</FileAlignment>\n";
     csproj_content += "    <BaseDirectory>.</BaseDirectory>\n";
-    csproj_content += "    <OutputPath>" + output_path.string() + "</OutputPath>\n";
+    csproj_content += "    <OutputPath>" + output_path.generic_string() + "</OutputPath>\n";
     csproj_content +=
-        "    <IntermediateOutputPath>" + intermediate_output_path.string() + "</IntermediateOutputPath>\n";
-
+        "    <IntermediateOutputPath>" + intermediate_output_path.generic_string() + "</IntermediateOutputPath>\n";
     csproj_content += "  </PropertyGroup>\n";
-
-    // Add other necessary PropertyGroups as needed (similar to the Unity example)
-    // ...
-
-    // ItemGroup for Compile (C# files)
     csproj_content += "  <ItemGroup>\n";
     csproj_content += csharp_source_items;
     csproj_content += "  </ItemGroup>\n";
-
-    // ItemGroup for References
     csproj_content += "  <ItemGroup>\n";
     csproj_content += external_dll_references;
     csproj_content += "  </ItemGroup>\n";
-
-    // Add other ItemGroups as needed (e.g., Analyzers, etc.)
-    // ...
-
-    // Import the C# targets
     csproj_content += "  <Import Project=\"$(MSBuildToolsPath)\\Microsoft.CSharp.targets\" />\n";
-
-    // Optionally add custom Targets
     csproj_content += "  <Target Name=\"GenerateTargetFrameworkMonikerAttribute\" />\n";
-
-    // Optionally add BeforeBuild and AfterBuild targets
-    csproj_content +=
-        "  <!-- To modify your build process, add your task inside one of the targets below and uncomment it.\n";
-    csproj_content += "       Other similar extension points exist, see Microsoft.Common.targets.\n";
-    csproj_content += "  <Target Name=\"BeforeBuild\">\n";
-    csproj_content += "  </Target>\n";
-    csproj_content += "  <Target Name=\"AfterBuild\">\n";
-    csproj_content += "  </Target>\n";
-    csproj_content += "  -->\n";
-
     csproj_content += "</Project>\n";
-
-    // Define the path to the .csproj file
-    fs::path csproj_path = output_directory / (project_name + ".csproj");
-
-    // Write the .csproj file
-    std::ofstream csproj_file(csproj_path);
-    if(!csproj_file.is_open())
-    {
-        APPLOG_ERROR("Failed to create .csproj file at {}", csproj_path.string());
-        return;
-    }
-
-    csproj_file << csproj_content;
-
-    APPLOG_TRACE("Generated {}", csproj_path.string());
+    const fs::path csproj_path = output_directory / (project_name + ".csproj");
+    return write_csproj_file(csproj_path, csproj_content);
 }
+#endif
 
 auto trim_line = [](std::string& line)
 {
@@ -756,24 +787,93 @@ auto get_dependencies(const fs::path& file) -> std::vector<std::string>
     return parse_dependencies(result.out_output, parent_path);
 }
 
+#if !DOTNETPP_BACKEND_MONO
+/// Parse a leading dotted version from a directory name (e.g. "8.0.4").
+auto parse_version_name(const std::string& name) -> std::vector<int>
+{
+    std::vector<int> parts;
+    std::string current;
+    for(char c : name)
+    {
+        if(c >= '0' && c <= '9')
+        {
+            current += c;
+        }
+        else if(c == '.')
+        {
+            parts.push_back(current.empty() ? 0 : std::atoi(current.c_str()));
+            current.clear();
+        }
+        else
+        {
+            break;
+        }
+    }
+    if(!current.empty())
+    {
+        parts.push_back(std::atoi(current.c_str()));
+    }
+    return parts;
+}
+
+/// Pick the subdirectory of base with the highest dotted version name
+/// (e.g. host/fxr/8.0.4 vs host/fxr/9.0.0). When preferred_major >= 0,
+/// versions with that major are preferred; other versions are only a
+/// fallback. Returns empty on no match.
+auto pick_highest_version_dir(const fs::path& base, int preferred_major = -1) -> fs::path
+{
+    fs::path best;
+    std::vector<int> best_version;
+    bool best_matches_major = false;
+
+    fs::error_code ec;
+    for(const auto& entry : fs::directory_iterator(base, ec))
+    {
+        if(!entry.is_directory(ec))
+        {
+            continue;
+        }
+        auto version = parse_version_name(entry.path().filename().string());
+        if(version.empty())
+        {
+            continue;
+        }
+        bool matches_major = preferred_major >= 0 && version[0] == preferred_major;
+        // A major-matching candidate always beats a non-matching one;
+        // within the same tier, the higher version wins.
+        bool better = best.empty();
+        if(!better && matches_major != best_matches_major)
+        {
+            better = matches_major;
+        }
+        else if(!better)
+        {
+            better = std::lexicographical_compare(best_version.begin(),
+                                                  best_version.end(),
+                                                  version.begin(),
+                                                  version.end());
+        }
+        if(better)
+        {
+            best = entry.path();
+            best_version = version;
+            best_matches_major = matches_major;
+        }
+    }
+    return best;
+}
+
+/// Major component of a "major.minor" version string, or -1 on parse failure.
+auto version_major(const std::string& version) -> int
+{
+    int major = std::atoi(version.c_str());
+    return major > 0 ? major : -1;
+}
+#endif
+
 auto save_scene_impl(rtti::context& ctx, const fs::path& path) -> bool
 {
-    auto& ev = ctx.get_cached<events>();
-    if(ev.is_playing)
-    {
-        return false;
-    }
-
-    auto& ec = ctx.get_cached<ecs>();
-    if(asset_writer::atomic_save_to_file(path.string(), ec.get_scene()))
-    {
-        ImGui::PushNotification(ImGuiToast(ImGuiToastType_Success, 1000, "Scene saved."));
-
-        auto& em = ctx.get_cached<editing_manager>();
-        em.clear_unsaved_changes();
-    }
-
-    return true;
+    return editor_actions::save_scene_to_path(ctx, path, false, true);
 }
 
 auto add_extension_if_missing(const std::string& p) -> fs::path
@@ -790,7 +890,8 @@ auto add_extension_if_missing(const std::string& p) -> fs::path
 auto save_scene_as_impl(rtti::context& ctx, fs::path& path, const std::string& default_name = {}) -> bool
 {
     auto& ev = ctx.get_cached<events>();
-    if(ev.is_playing)
+    auto& play = ctx.get_cached<play_mode>();
+    if(play.is_active())
     {
         return false;
     }
@@ -928,31 +1029,134 @@ void remove_unreferenced_files(const fs::path& root)
 
 auto editor_actions::new_scene(rtti::context& ctx) -> bool
 {
-    auto& ev = ctx.get_cached<events>();
-    if(ev.is_playing)
+    auto& play = ctx.get_cached<play_mode>();
+    if(play.is_active())
     {
         return false;
     }
-    prompt_save_scene(ctx, [&ctx]() {
-        create_scene_modal::show([&ctx](defaults::scene_preset preset) {
-            auto& em = ctx.get_cached<editing_manager>();
-            em.clear();
+    prompt_save_scene(ctx,
+                      [&ctx]()
+                      {
+                          create_scene_modal::show(
+                              [&ctx](defaults::scene_preset preset)
+                              {
+                                  editor_actions::new_scene_from_preset(ctx, preset);
+                              });
+                      });
 
-            auto& ec = ctx.get_cached<ecs>();
-            ec.unload_scene();
+    return true;
+}
 
-            defaults::create_scene_from_preset(ctx, ec.get_scene(), preset);
-        });
-    });
+auto editor_actions::load_scene_from_asset(rtti::context& ctx,
+                                           const asset_handle<scene_prefab>& asset,
+                                           std::string* error) -> bool
+{
+    auto& em = ctx.get_cached<editing_manager>();
+    em.clear();
+
+    auto& ec = ctx.get_cached<ecs>();
+    ec.unload_scene();
+
+    auto& scene = ec.get_scene();
+    if(!scene.load_from(asset))
+    {
+        if(error)
+        {
+            *error = "Failed to load scene: " + asset.id();
+        }
+        return false;
+    }
+
+    em.sync_prefab_instances(ctx, &scene);
+    em.clear_unsaved_changes();
+
+    if(ctx.has<project_manager>())
+    {
+        auto& pm = ctx.get_cached<project_manager>();
+        pm.get_project_editor_settings().scene.opened_scene = asset;
+        pm.save_project_editor_settings();
+    }
+    return true;
+}
+
+auto editor_actions::new_scene_from_preset(rtti::context& ctx, defaults::scene_preset preset) -> bool
+{
+    create_scene_modal::cancel_if_pending();
+
+    auto& em = ctx.get_cached<editing_manager>();
+    em.clear();
+
+    auto& ec = ctx.get_cached<ecs>();
+    ec.unload_scene();
+
+    defaults::create_scene_from_preset(ctx, ec.get_scene(), preset);
+    em.clear_unsaved_changes();
+
+    if(ctx.has<project_manager>())
+    {
+        auto& pm = ctx.get_cached<project_manager>();
+        pm.get_project_editor_settings().scene.opened_scene = {};
+        pm.save_project_editor_settings();
+    }
+    return true;
+}
+
+auto editor_actions::save_scene_to_path(rtti::context& ctx,
+                                        const fs::path& path,
+                                        bool update_source,
+                                        bool show_notification) -> bool
+{
+    auto& play = ctx.get_cached<play_mode>();
+    if(play.is_active())
+    {
+        return false;
+    }
+
+    fs::path absolute = path;
+    if(fs::has_known_protocol(path))
+    {
+        absolute = fs::resolve_protocol(path);
+    }
+    absolute = fs::absolute(absolute);
+
+    auto& ec = ctx.get_cached<ecs>();
+    auto& scene = ec.get_scene();
+    if(!asset_writer::atomic_save_to_file(absolute.string(), scene))
+    {
+        return false;
+    }
+
+    auto& em = ctx.get_cached<editing_manager>();
+    em.clear_unsaved_changes();
+
+    if(show_notification)
+    {
+        ImGui::PushNotification(ImGuiToast(ImGuiToastType_Success, 1000, "Scene saved."));
+    }
+
+    if(update_source)
+    {
+        auto& am = ctx.get_cached<asset_manager>();
+        const auto protocol_key = fs::convert_to_protocol(absolute).generic_string();
+        scene.source = am.get_asset<scene_prefab>(protocol_key);
+
+        if(ctx.has<project_manager>())
+        {
+            auto& pm = ctx.get_cached<project_manager>();
+            pm.get_project_editor_settings().scene.opened_scene = scene.source;
+            pm.save_project_editor_settings();
+        }
+    }
 
     return true;
 }
 auto editor_actions::open_scene(rtti::context& ctx) -> bool
 {
     auto& ev = ctx.get_cached<events>();
-    if(ev.is_playing)
+    auto& play = ctx.get_cached<play_mode>();
+    if(play.is_active())
     {
-        ev.set_play_mode(ctx, false);
+        play.set_active(ctx, false);
     }
 
     std::string picked;
@@ -976,29 +1180,15 @@ auto editor_actions::open_scene(rtti::context& ctx) -> bool
 
 auto editor_actions::open_scene_from_asset(rtti::context& ctx, const asset_handle<scene_prefab>& asset) -> bool
 {
-    return prompt_save_scene(ctx, [&ctx, asset]() {
-        auto& em = ctx.get_cached<editing_manager>();
-        em.clear();
-        
-        auto& ec = ctx.get_cached<ecs>();
-        ec.unload_scene();
-    
-        auto& scene = ec.get_scene();
-        bool loaded = scene.load_from(asset);
-    
-        if(loaded)
-        {
-            em.sync_prefab_instances(ctx, &scene);
-            auto& pm = ctx.get_cached<project_manager>();
-            pm.get_project_editor_settings().scene.opened_scene = asset;
-            pm.save_project_editor_settings();
-        }
-
-        if(!loaded)
-        {
-            editor_actions::new_scene(ctx);
-        }
-    });
+    return prompt_save_scene(ctx,
+                             [&ctx, asset]()
+                             {
+                                 std::string error;
+                                 if(!editor_actions::load_scene_from_asset(ctx, asset, &error))
+                                 {
+                                     editor_actions::new_scene(ctx);
+                                 }
+                             });
 }
 auto editor_actions::save_scene(rtti::context& ctx) -> bool
 {
@@ -1044,7 +1234,8 @@ auto editor_actions::save_scene_as(rtti::context& ctx) -> bool
 auto editor_actions::prompt_save_scene(rtti::context& ctx, const std::function<void()>& on_continue) -> bool
 {
     auto& ev = ctx.get_cached<events>();
-    if(ev.is_playing)
+    auto& play = ctx.get_cached<play_mode>();
+    if(play.is_active())
     {
         on_continue();
         return false;
@@ -1078,7 +1269,8 @@ auto editor_actions::prompt_save_scene(rtti::context& ctx, const std::function<v
 auto editor_actions::close_project(rtti::context& ctx) -> bool
 {
     auto& ev = ctx.get_cached<events>();
-    if(ev.is_playing)
+    auto& play = ctx.get_cached<play_mode>();
+    if(play.is_active())
     {
         return false;
     }
@@ -1094,7 +1286,8 @@ auto editor_actions::close_project(rtti::context& ctx) -> bool
 auto editor_actions::reload_project(rtti::context& ctx) -> bool
 {
     auto& ev = ctx.get_cached<events>();
-    if(ev.is_playing)
+    auto& play = ctx.get_cached<play_mode>();
+    if(play.is_active())
     {
         return false;
     }
@@ -1113,6 +1306,13 @@ auto editor_actions::reload_project(rtti::context& ctx) -> bool
         pm.open_project(ctx, project_path);
     });
     return true;
+}
+
+auto editor_actions::restart_editor(rtti::context& ctx) -> bool
+{
+    (void)ctx;
+    APPLOG_INFO("Editor restart requested from menu (reason=user_menu)");
+    return engine::request_restart();
 }
 
 void editor_actions::run_project(const fs::path& executable_path)
@@ -1162,7 +1362,7 @@ auto editor_actions::deploy_project(rtti::context& ctx,
                                APPLOG_INFO("Deploying Dependencies...");
 
                                fs::path app_executable =
-                                   fs::resolve_protocol("binary:/game" + fs::executable_extension());
+                                   fs::resolve_protocol("binary:/" + std::string(PLAYER_NAME) + fs::executable_extension());
                                auto deps = get_dependencies(app_executable);
 
                                fs::error_code ec;
@@ -1291,6 +1491,7 @@ auto editor_actions::deploy_project(rtti::context& ctx,
         jobs_seq.emplace_back(job);
     }
 
+#if DOTNETPP_BACKEND_MONO
     {
         auto job =
             th.pool
@@ -1300,8 +1501,8 @@ auto editor_actions::deploy_project(rtti::context& ctx,
                     {
                         APPLOG_INFO("Deploying Mono...");
 
-                        auto paths = script_system::find_mono(ctx);
-                        fs::path assembly_path = mono::get_core_assembly_path();
+                        auto paths = script_system::find_dotnet_paths(ctx);
+                        fs::path assembly_path = dotnet::get_core_assembly_path();
                         fs::path assembly_dir = assembly_path.parent_path();
                         fs::path lib_version = assembly_dir.filename();
 
@@ -1318,7 +1519,7 @@ auto editor_actions::deploy_project(rtti::context& ctx,
                             APPLOG_TRACE("Creating directories {}", cached_data.generic_string());
                             fs::create_directories(cached_data, ec);
 
-                            auto mono_libraries = mono::get_common_library_names_for_deploy();
+                            auto mono_libraries = dotnet::get_common_library_names_for_deploy();
 
                             fs::path lib_dir = assembly_dir.parent_path().parent_path();
                             for(const auto& path : mono_libraries)
@@ -1372,6 +1573,92 @@ auto editor_actions::deploy_project(rtti::context& ctx,
         jobs["Deploying Mono..."] = job;
         jobs_seq.emplace_back(job);
     }
+#else
+    {
+        auto job =
+            th.pool
+                ->schedule(
+                    "Deploying .NET",
+                    [params]()
+                    {
+                        APPLOG_INFO("Deploying .NET...");
+
+                        fs::error_code ec;
+
+                        // The managed bridge payload (Clrpp.Managed.dll + runtimeconfig +
+                        // optional NuGet deps) is self-contained in one folder. Ship it
+                        // next to the bundled dotnet root; the game passes this location
+                        // to the runtime at init (compiler_paths::assembly_dir).
+                        {
+                            const std::string runtime_dir = dotnet::managed_runtime_dir();
+                            fs::path src = fs::resolve_protocol("binary:/" + runtime_dir);
+                            fs::path dst = params.deploy_location / "data" / "engine" / runtime_dir;
+
+                            APPLOG_TRACE("Clearing {}", dst.generic_string());
+                            fs::remove_all(dst, ec);
+                            fs::create_directories(dst, ec);
+
+                            APPLOG_TRACE("Copying {} -> {}", src.generic_string(), dst.generic_string());
+                            fs::copy(src, dst, fs::copy_options::recursive, ec);
+                        }
+
+                        // Bundle a pruned dotnet root (hostfxr + shared framework) so the
+                        // deployed game runs without a machine-wide .NET install. The game
+                        // passes this folder to the runtime as the dotnet root override.
+                        {
+                            fs::path dotnet_root = dotnet::get_core_assembly_path();
+
+                            // Prefer the runtime major we target (see
+                            // dotnet::get_dotnet_version); fall back to the
+                            // newest installed one.
+                            int preferred_major = version_major(dotnet::get_dotnet_version());
+
+                            fs::path fxr_src =
+                                pick_highest_version_dir(dotnet_root / "host" / "fxr", preferred_major);
+                            fs::path shared_src =
+                                pick_highest_version_dir(dotnet_root / "shared" / "Microsoft.NETCore.App",
+                                                         preferred_major);
+
+                            if(fxr_src.empty() || shared_src.empty())
+                            {
+                                APPLOG_WARNING("Deploying .NET - could not locate hostfxr/shared framework "
+                                               "under {}; the deployed game will require an installed .NET "
+                                               "runtime",
+                                               dotnet_root.generic_string());
+                            }
+                            else
+                            {
+                                fs::path runtime_dst = params.deploy_location / "data" / "engine" / "dotnet";
+
+                                APPLOG_TRACE("Clearing {}", runtime_dst.generic_string());
+                                fs::remove_all(runtime_dst, ec);
+
+                                fs::path fxr_dst = runtime_dst / "host" / "fxr" / fxr_src.filename();
+                                fs::path shared_dst =
+                                    runtime_dst / "shared" / "Microsoft.NETCore.App" / shared_src.filename();
+
+                                fs::create_directories(fxr_dst, ec);
+                                fs::create_directories(shared_dst, ec);
+
+                                APPLOG_TRACE("Copying {} -> {}",
+                                             fxr_src.generic_string(),
+                                             fxr_dst.generic_string());
+                                fs::copy(fxr_src, fxr_dst, fs::copy_options::recursive, ec);
+
+                                APPLOG_TRACE("Copying {} -> {}",
+                                             shared_src.generic_string(),
+                                             shared_dst.generic_string());
+                                fs::copy(shared_src, shared_dst, fs::copy_options::recursive, ec);
+                            }
+                        }
+
+                        APPLOG_INFO("Deploying .NET - Done");
+                    })
+                .share();
+        jobs["Deploying .NET..."] = job;
+        jobs_seq.emplace_back(job);
+    }
+#endif
 
     tpp::when_all(std::begin(jobs_seq), std::end(jobs_seq))
         .then(tpp::this_thread::get_id(),
@@ -1422,7 +1709,11 @@ void editor_actions::generate_script_workspace()
 
     auto output_path = fs::resolve_protocol("app:/");
 
-    generate_csproj_legacy(source_path, {engine_dep}, output_path, project_name);
+#if DOTNETPP_BACKEND_MONO
+    (void)generate_csproj_legacy(source_path, {engine_dep}, output_path, project_name);
+#else
+    (void)generate_csproj(source_path, {engine_dep}, output_path, project_name);
+#endif
 }
 
 void editor_actions::open_workspace_on_file(const fs::path& file, int line)
@@ -1468,14 +1759,16 @@ void editor_actions::recompile_shaders(const std::string& group)
     auto& ctx = engine::context();
     auto& am = ctx.get_cached<asset_manager>();
     auto shaders = am.get_assets<gfx::shader>(group);
-    fs::watcher::pause();
-    for(auto& asset : shaders)
-    {
-        fs::error_code ec;
-        auto path = fs::absolute(fs::resolve_protocol(asset.id()).string(), ec);
-        fs::watcher::touch(path, false);
-    }
-    fs::watcher::resume();
+    fs::watcher::with_paused(
+        [&]
+        {
+            for(auto& asset : shaders)
+            {
+                fs::error_code ec;
+                auto path = fs::absolute(fs::resolve_protocol(asset.id()).string(), ec);
+                fs::watcher::touch(path, false);
+            }
+        });
 }
 
 void editor_actions::recompile_textures(const std::string& group)
@@ -1483,14 +1776,16 @@ void editor_actions::recompile_textures(const std::string& group)
     auto& ctx = engine::context();
     auto& am = ctx.get_cached<asset_manager>();
     auto textures = am.get_assets<gfx::texture>(group);
-    fs::watcher::pause();
-    for(auto& asset : textures)
-    {
-        fs::error_code ec;
-        auto path = fs::absolute(fs::resolve_protocol(asset.id()).string(), ec);
-        fs::watcher::touch(path, false);
-    }
-    fs::watcher::resume();
+    fs::watcher::with_paused(
+        [&]
+        {
+            for(auto& asset : textures)
+            {
+                fs::error_code ec;
+                auto path = fs::absolute(fs::resolve_protocol(asset.id()).string(), ec);
+                fs::watcher::touch(path, false);
+            }
+        });
 }
 
 void editor_actions::recompile_meshes(const std::string& group)
@@ -1498,69 +1793,76 @@ void editor_actions::recompile_meshes(const std::string& group)
     auto& ctx = engine::context();
     auto& am = ctx.get_cached<asset_manager>();
     auto meshes = am.get_assets<mesh>(group);
-    fs::watcher::pause();
-    for(auto& asset : meshes)
-    {
-        fs::error_code ec;
-        auto path = fs::absolute(fs::resolve_protocol(asset.id()).string(), ec);
-        fs::watcher::touch(path, false);
-    }
-    fs::watcher::resume();
+    fs::watcher::with_paused(
+        [&]
+        {
+            for(auto& asset : meshes)
+            {
+                fs::error_code ec;
+                auto path = fs::absolute(fs::resolve_protocol(asset.id()).string(), ec);
+                fs::watcher::touch(path, false);
+            }
+        });
 }
 
 void editor_actions::recompile_ui(const std::string& group)
 {
     auto& ctx = engine::context();
     auto& am = ctx.get_cached<asset_manager>();
-    fs::watcher::pause();
-    {
-        auto assets = am.get_assets<ui_tree>(group);
-        for(auto& asset : assets)
+    fs::watcher::with_paused(
+        [&]
         {
-            fs::error_code ec;
-            auto path = fs::absolute(fs::resolve_protocol(asset.id()).string(), ec);
-            fs::watcher::touch(path, false);
-        }
-    }
-    {
-        auto assets = am.get_assets<style_sheet>(group);
-        for(auto& asset : assets)
-        {
-            fs::error_code ec;
-            auto path = fs::absolute(fs::resolve_protocol(asset.id()).string(), ec);
-            fs::watcher::touch(path, false);
-        }
-    }
-   
-    fs::watcher::resume();
+            {
+                auto assets = am.get_assets<ui_tree>(group);
+                for(auto& asset : assets)
+                {
+                    fs::error_code ec;
+                    auto path = fs::absolute(fs::resolve_protocol(asset.id()).string(), ec);
+                    fs::watcher::touch(path, false);
+                }
+            }
+            {
+                auto assets = am.get_assets<style_sheet>(group);
+                for(auto& asset : assets)
+                {
+                    fs::error_code ec;
+                    auto path = fs::absolute(fs::resolve_protocol(asset.id()).string(), ec);
+                    fs::watcher::touch(path, false);
+                }
+            }
+        });
 }
 void editor_actions::recompile_scripts(const std::string& group)
 {
     auto& ctx = engine::context();
     auto& am = ctx.get_cached<asset_manager>();
     auto scripts = am.get_assets<script>(group);
-    fs::watcher::pause();
-    for(auto& asset : scripts)
-    {
-        fs::error_code ec;
-        auto path = fs::absolute(fs::resolve_protocol(asset.id()).string(), ec);
-        fs::watcher::touch(path, false);
-    }
-    fs::watcher::resume();
+    fs::watcher::with_paused(
+        [&]
+        {
+            for(auto& asset : scripts)
+            {
+                fs::error_code ec;
+                auto path = fs::absolute(fs::resolve_protocol(asset.id()).string(), ec);
+                fs::watcher::touch(path, false);
+            }
+        });
 }
 void editor_actions::recompile_all(const std::string& group)
 {
     auto& ctx = engine::context();
     auto& am = ctx.get_cached<asset_manager>();
     auto assets = am.get_all_assets(group);
-    fs::watcher::pause();
-    for(auto& asset : assets)
-    {
-        fs::error_code ec;
-        auto path = fs::absolute(fs::resolve_protocol(asset).string(), ec);
-        fs::watcher::touch(path, false);
-    }
-    fs::watcher::resume();
+    fs::watcher::with_paused(
+        [&]
+        {
+            for(auto& asset : assets)
+            {
+                fs::error_code ec;
+                auto path = fs::absolute(fs::resolve_protocol(asset).string(), ec);
+                fs::watcher::touch(path, false);
+            }
+        });
 }
 
 auto editor_actions::rebuild_reflection_probes(rtti::context& /*ctx*/, bool force_full_first_frame) -> size_t
@@ -1576,5 +1878,460 @@ auto editor_actions::rebuild_reflection_probes(rtti::context& /*ctx*/, bool forc
         count += reflection_probe_system::mark_all_dirty(*scn, force_full_first_frame);
     }
     return count;
+}
+
+auto editor_actions::can_enter_play(rtti::context& ctx, std::string* error) -> bool
+{
+    auto& play = ctx.get_cached<play_mode>();
+    if(play.is_active())
+    {
+        return true;
+    }
+    auto& scripting = ctx.get_cached<script_system>();
+    if(scripting.has_compilation_errors())
+    {
+        if(error)
+        {
+            *error = "All compiler errors must be fixed before you can enter Play Mode!";
+        }
+        return false;
+    }
+    return true;
+}
+
+auto editor_actions::get_play_state(rtti::context& ctx) -> play_state_info
+{
+    play_state_info info;
+    if(!ctx.has<play_mode>())
+    {
+        return info;
+    }
+    auto& play = ctx.get_cached<play_mode>();
+    info.is_active = play.is_active();
+    info.is_paused = play.is_paused();
+    info.is_splash = play.is_splash();
+    info.is_simulation_running = play.is_simulation_running();
+    info.frames_running = play.frames_running();
+    if(play.is_splash())
+    {
+        info.phase = "splash";
+    }
+    else if(play.is_simulation_running())
+    {
+        info.phase = "running";
+    }
+    else if(play.is_active())
+    {
+        info.phase = "active";
+    }
+    else
+    {
+        info.phase = "inactive";
+    }
+    return info;
+}
+
+auto editor_actions::set_play_active(rtti::context& ctx, bool active, bool allow_splash, std::string* error) -> bool
+{
+    if(active && !can_enter_play(ctx, error))
+    {
+        return false;
+    }
+    ctx.get_cached<play_mode>().set_active(ctx, active, allow_splash);
+    return true;
+}
+
+auto editor_actions::toggle_play(rtti::context& ctx, bool allow_splash, std::string* error) -> bool
+{
+    auto& play = ctx.get_cached<play_mode>();
+    if(!play.is_active() && !can_enter_play(ctx, error))
+    {
+        return false;
+    }
+    play.toggle(ctx, allow_splash);
+    return true;
+}
+
+auto editor_actions::set_play_paused(rtti::context& ctx, bool paused, std::string* error) -> bool
+{
+    auto& play = ctx.get_cached<play_mode>();
+    if(!play.is_active())
+    {
+        if(error)
+        {
+            *error = "Play mode is not active";
+        }
+        return false;
+    }
+    play.set_paused(ctx, paused);
+    return true;
+}
+
+auto editor_actions::skip_play_frame(rtti::context& ctx, std::string* error) -> bool
+{
+    auto& play = ctx.get_cached<play_mode>();
+    if(!play.is_active())
+    {
+        if(error)
+        {
+            *error = "Play mode is not active";
+        }
+        return false;
+    }
+    if(!play.is_paused())
+    {
+        if(error)
+        {
+            *error = "Play mode must be paused to skip a frame";
+        }
+        return false;
+    }
+    play.skip_next_frame(ctx);
+    return true;
+}
+
+auto editor_actions::get_selection(rtti::context& ctx) -> selection_info
+{
+    selection_info info;
+    auto& em = ctx.get_cached<editing_manager>();
+    if(auto* active = em.try_get_active_selection_as<entt::handle>())
+    {
+        info.active_entity_id = entity_id_string(*active);
+    }
+    for(const auto& handle : em.try_get_selections_as_copy<entt::handle>())
+    {
+        if(handle)
+        {
+            info.entity_ids.push_back(entity_id_string(handle));
+        }
+    }
+    return info;
+}
+
+auto editor_actions::set_selection(rtti::context& ctx,
+                                   const std::vector<std::string>& entity_ids,
+                                   bool add,
+                                   std::string* error) -> bool
+{
+    auto& em = ctx.get_cached<editing_manager>();
+    auto* scn = em.get_active_scene(ctx);
+    if(!scn || !scn->registry)
+    {
+        if(error)
+        {
+            *error = "No active scene";
+        }
+        return false;
+    }
+    if(!add)
+    {
+        em.unselect();
+    }
+    bool any = false;
+    for(const auto& id : entity_ids)
+    {
+        auto entity = find_entity_by_id(*scn, id);
+        if(!entity)
+        {
+            if(error)
+            {
+                *error = "Entity not found: " + id;
+            }
+            return false;
+        }
+        const auto mode = (!add && !any) ? editing_manager::select_mode::normal : editing_manager::select_mode::ctrl;
+        em.select(entity, mode);
+        any = true;
+    }
+    if(!any && !add)
+    {
+        em.unselect();
+    }
+    return true;
+}
+
+void editor_actions::clear_selection(rtti::context& ctx)
+{
+    ctx.get_cached<editing_manager>().unselect();
+}
+
+auto editor_actions::get_recent_logs(rtti::context& ctx,
+                                     level::level_enum min_level,
+                                     size_t max_count,
+                                     uint64_t after_id) -> std::vector<log_query_entry>
+{
+    if(!ctx.has<hub>())
+    {
+        return {};
+    }
+    auto snapshot = ctx.get_cached<hub>().get_panels().get_console_log_panel().snapshot_logs(min_level,
+                                                                                           max_count,
+                                                                                           after_id);
+    std::vector<log_query_entry> out;
+    out.reserve(snapshot.size());
+    for(auto& entry : snapshot)
+    {
+        log_query_entry item;
+        item.id = entry.id;
+        item.level = entry.level;
+        item.text = std::move(entry.text);
+        item.filename = std::move(entry.filename);
+        item.funcname = std::move(entry.funcname);
+        item.line = entry.line;
+        out.push_back(std::move(item));
+    }
+    return out;
+}
+
+auto editor_actions::inspect_entity(rtti::context& ctx,
+                                    const std::string& entity_id,
+                                    bool include_components,
+                                    std::string* error) -> std::string
+{
+    auto& em = ctx.get_cached<editing_manager>();
+    auto* scn = em.get_active_scene(ctx);
+    if(!scn || !scn->registry)
+    {
+        if(error)
+        {
+            *error = "No active scene";
+        }
+        return {};
+    }
+    entt::handle entity;
+    if(entity_id.empty())
+    {
+        if(auto* active = em.try_get_active_selection_as<entt::handle>())
+        {
+            entity = *active;
+        }
+        if(!entity)
+        {
+            if(error)
+            {
+                *error = "No entity_id provided and no active entity selection";
+            }
+            return {};
+        }
+    }
+    else
+    {
+        entity = find_entity_by_id(*scn, entity_id);
+        if(!entity)
+        {
+            if(error)
+            {
+                *error = "Entity not found: " + entity_id;
+            }
+            return {};
+        }
+    }
+    auto summary = entity_to_summary_json(entity, 0, 0);
+    if(!include_components)
+    {
+        return summary;
+    }
+    auto components = entity_components_serialized(entity);
+    std::string escaped;
+    escaped.reserve(components.size() + 8);
+    for(char c : components)
+    {
+        switch(c)
+        {
+            case '\\':
+                escaped += "\\\\";
+                break;
+            case '"':
+                escaped += "\\\"";
+                break;
+            case '\n':
+                escaped += "\\n";
+                break;
+            case '\r':
+                escaped += "\\r";
+                break;
+            case '\t':
+                escaped += "\\t";
+                break;
+            default:
+                escaped += c;
+                break;
+        }
+    }
+    if(!summary.empty() && summary.back() == '}')
+    {
+        summary.pop_back();
+        summary += ",\"components_serialized\":\"" + escaped + "\"}";
+    }
+    return summary;
+}
+
+auto editor_actions::focus_scene_panel(rtti::context& ctx, std::string* error) -> bool
+{
+    if(!ctx.has<hub>())
+    {
+        if(error)
+        {
+            *error = "Hub is not available";
+        }
+        return false;
+    }
+    auto& panel = ctx.get_cached<hub>().get_panels().get_scene_panel();
+    panel.set_visible(true);
+    panel.focus();
+    return true;
+}
+
+auto editor_actions::focus_game_panel(rtti::context& ctx, std::string* error) -> bool
+{
+    if(!ctx.has<hub>())
+    {
+        if(error)
+        {
+            *error = "Hub is not available";
+        }
+        return false;
+    }
+    auto& panel = ctx.get_cached<hub>().get_panels().get_game_panel();
+    panel.set_visible(true);
+    panel.focus();
+    return true;
+}
+
+auto editor_actions::request_main_window_focus(rtti::context& ctx, std::string* error) -> bool
+{
+    if(!ctx.has<renderer>())
+    {
+        if(error)
+        {
+            *error = "Renderer is not available";
+        }
+        return false;
+    }
+    auto* main_window = ctx.get_cached<renderer>().get_main_window();
+    if(!main_window)
+    {
+        if(error)
+        {
+            *error = "Main window is not available";
+        }
+        return false;
+    }
+    auto& window = main_window->get_window();
+    if(!window.is_open())
+    {
+        if(error)
+        {
+            *error = "Main window is not open";
+        }
+        return false;
+    }
+    if(window.is_minimized())
+    {
+        window.restore();
+    }
+    window.show();
+    window.raise();
+    window.request_focus();
+    return true;
+}
+
+auto editor_actions::import_files(rtti::context& ctx,
+                                  const std::vector<std::string>& paths,
+                                  const fs::path& target_path,
+                                  bool async) -> import_files_result
+{
+    import_files_result result;
+    result.items.reserve(paths.size());
+    fs::error_code ec;
+    fs::create_directories(target_path, ec);
+    for(const auto& path : paths)
+    {
+        import_files_item item{};
+        fs::path source = fs::path(path).make_preferred();
+        fs::path filename = source.filename();
+        fs::path dest = target_path / filename;
+        item.source_path = source.generic_string();
+        item.dest_path = dest.generic_string();
+        item.is_directory = fs::is_directory(source, ec);
+        const auto protocol = fs::convert_to_protocol(dest);
+        if(!protocol.empty())
+        {
+            item.dest_key = protocol.generic_string();
+        }
+        result.items.push_back(std::move(item));
+    }
+    auto copy_batch = [items = result.items]() -> bool
+    {
+        auto copy_one = [](const fs::path& source, const fs::path& dest, bool is_directory) -> bool
+        {
+            fs::error_code err;
+            if(is_directory)
+            {
+                fs::copy(source, dest, fs::copy_options::recursive | fs::copy_options::overwrite_existing, err);
+                if(err)
+                {
+                    APPLOG_ERROR("Failed to import directory {}, error: {}", source.string(), err.message());
+                    return false;
+                }
+                return true;
+            }
+            asset_writer::atomic_copy_file(source, dest, err);
+            if(err)
+            {
+                APPLOG_ERROR("Failed to import file {}, error: {}", source.string(), err.message());
+                return false;
+            }
+            return true;
+        };
+        // Pause for the whole batch so glTF/.bin/texture sets are never observed mid-copy.
+        fs::watcher::scoped_pause pause_guard;
+        bool all_ok = true;
+        for(const auto& item : items)
+        {
+            const fs::path source(item.source_path);
+            const fs::path dest(item.dest_path);
+            APPLOG_INFO("Importing {0}", source.filename().string());
+            const bool ok = copy_one(source, dest, item.is_directory);
+            if(ok)
+            {
+                // Ensure the watcher notices the full import even if OS events were coalesced.
+                fs::watcher::touch(dest, item.is_directory);
+            }
+            else
+            {
+                all_ok = false;
+            }
+        }
+        return all_ok;
+    };
+    if(async)
+    {
+        auto& ts = ctx.get_cached<threader>();
+        auto job = ts.pool->schedule("Importing files", std::move(copy_batch));
+        result.future = job.share();
+    }
+    else
+    {
+        const bool ok = copy_batch();
+        result.future = tpp::make_ready_future<bool>(bool(ok)).share();
+    }
+    return result;
+}
+
+auto editor_actions::wait_import_jobs(import_files_result& result,
+                                      std::chrono::milliseconds timeout) -> bool
+{
+    tpp::this_thread::register_this_thread();
+    if(!result.future.valid())
+    {
+        return false;
+    }
+    const auto status = result.future.wait_for(timeout);
+    if(status != std::future_status::ready)
+    {
+        return false;
+    }
+    return result.future.get();
 }
 } // namespace unravel

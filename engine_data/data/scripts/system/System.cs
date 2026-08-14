@@ -27,29 +27,57 @@ namespace Unravel.Core
         }
     }
 
+    /// <summary>
+    /// Per-frame timing values pushed from native into managed code.
+    /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     public struct UpdateInfo
     {
+        /// <summary>Elapsed time in seconds since play began.</summary>
         public float time;
+        /// <summary>Seconds since the previous update frame.</summary>
         public float deltaTime;
+        /// <summary>Current time scale multiplier.</summary>
         public float timeScale;
+        /// <summary>Number of update frames since play began.</summary>
         public long frameCount;
     }
 
+    /// <summary>
+    /// Fixed-step timing values pushed from native into managed code.
+    /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     public struct FixedUpdateInfo
     {
+        /// <summary>Seconds for the current fixed update step.</summary>
         public float deltaTime;
     }
 
+    /// <summary>
+    /// Provides global timing information for gameplay scripts.
+    /// </summary>
     public static class Time
     {
+        /// <summary>
+        /// Elapsed time in seconds since play began.
+        /// </summary>
         public static float time;
+
+        /// <summary>
+        /// Seconds since the previous update frame (scaled by <see cref="timeScale"/>).
+        /// </summary>
         public static float deltaTime;
+
         internal static float _timeScale = 1.0f;
 
+        /// <summary>
+        /// Seconds for the current fixed update step.
+        /// </summary>
         public static float fixedDeltaTime;
 
+        /// <summary>
+        /// Number of update frames since play began.
+        /// </summary>
         public static long frameCount;
 
         /// <summary>
@@ -114,6 +142,10 @@ namespace Unravel.Core
         // Base ScriptComponent type for override detection
         private static readonly Type scriptComponentBaseType = typeof(ScriptComponent);
 
+        /// <summary>
+        /// Creates a manager, optionally seeding per-type update priorities.
+        /// </summary>
+        /// <param name="typePriorityMap">Optional map of script type to update priority.</param>
         public ScriptComponentManager(Dictionary<Type, int> typePriorityMap = null)
         {
             if (typePriorityMap != null)
@@ -126,10 +158,11 @@ namespace Unravel.Core
         }
 
         /// <summary>
-        /// Add a ScriptComponent. 
-        /// If we're currently invoking, we defer it into 'pendingOps'. 
+        /// Add a ScriptComponent.
+        /// If we're currently invoking, we defer it into 'pendingOps'.
         /// Otherwise, we insert it directly into the appropriate type bucket.
         /// </summary>
+        /// <param name="comp">Script component instance to register for updates.</param>
         public void Add(ScriptComponent comp)
         {
             if (ReferenceEquals(comp, null)) return;
@@ -147,10 +180,11 @@ namespace Unravel.Core
         }
 
         /// <summary>
-        /// Remove a ScriptComponent. 
+        /// Remove a ScriptComponent.
         /// Uses O(1) dictionary lookup instead of linear search.
         /// If we are invoking, defer the operation and collapse with existing operations.
         /// </summary>
+        /// <param name="comp">Script component instance to unregister.</param>
         public void Remove(ScriptComponent comp)
         {
             if (ReferenceEquals(comp, null)) return;
@@ -181,9 +215,19 @@ namespace Unravel.Core
             isInvoking = false;
         }
 
-        // Public update methods
+        /// <summary>
+        /// Invokes <see cref="ScriptComponent.OnUpdate"/> for registered components in priority order.
+        /// </summary>
         public void InvokeUpdate() => InvokeInternal(updateAction);
+
+        /// <summary>
+        /// Invokes <see cref="ScriptComponent.OnFixedUpdate"/> for registered components in priority order.
+        /// </summary>
         public void InvokeFixedUpdate() => InvokeInternal(fixedUpdateAction);
+
+        /// <summary>
+        /// Invokes <see cref="ScriptComponent.OnLateUpdate"/> for registered components in priority order.
+        /// </summary>
         public void InvokeLateUpdate() => InvokeInternal(lateUpdateAction);
 
         // The core logic for iteration in priority order, plus deferred add & remove cleanup
@@ -565,6 +609,9 @@ namespace Unravel.Core
     }
 
 
+    /// <summary>
+    /// Tracks managed GC activity and optionally logs collection/memory deltas.
+    /// </summary>
     public class GCMonitor
     {
         private int lastGen0Count;
@@ -572,11 +619,17 @@ namespace Unravel.Core
         private int lastGen2Count;
         private long lastMemory;
 
+        /// <summary>
+        /// Creates a monitor and captures the current GC baseline.
+        /// </summary>
         public GCMonitor()
         {
             Reset();
         }
 
+        /// <summary>
+        /// Resets the baseline collection counts and managed memory size.
+        /// </summary>
         public void Reset()
         {
             lastGen0Count = GC.CollectionCount(0);
@@ -585,6 +638,10 @@ namespace Unravel.Core
             lastMemory = GC.GetTotalMemory(false);
         }
 
+        /// <summary>
+        /// Compares current GC stats to the baseline and logs notable changes.
+        /// </summary>
+        /// <param name="context">Optional label included in the log message.</param>
         public void CheckAndLog(string context = "")
         {
             int gen0 = GC.CollectionCount(0);
@@ -601,8 +658,8 @@ namespace Unravel.Core
             if (gen0Delta > 0 || gen1Delta > 0 || gen2Delta > 0 || Math.Abs(memDelta) > 1024)
             {
                 // Get Mono heap size (native memory used by Mono runtime)
-                long monoHeap = internal_m2n_get_mono_heap_size();
-                long monoUsed = internal_m2n_get_mono_used_size();
+                long monoHeap = internal_m2n_get_dotnet_heap_size();
+                long monoUsed = internal_m2n_get_dotnet_used_size();
 
                 Log.Info($"[GC] {context} - Collections: Gen0={gen0Delta}, Gen1={gen1Delta}, Gen2={gen2Delta} | Managed: {memDelta / 1024.0:F2} KB (Total: {memory / 1024.0:F2} KB) | Mono Heap: {monoHeap / (1024.0 * 1024.0):F2} MB (Used: {monoUsed / (1024.0 * 1024.0):F2} MB)");
             }
@@ -614,15 +671,38 @@ namespace Unravel.Core
         }
 
         [MethodImpl(MethodImplOptions.InternalCall)]
-        private static extern long internal_m2n_get_mono_heap_size();
+        private static extern long internal_m2n_get_dotnet_heap_size();
 
         [MethodImpl(MethodImplOptions.InternalCall)]
-        private static extern long internal_m2n_get_mono_used_size();
+        private static extern long internal_m2n_get_dotnet_used_size();
     }
+    /// <summary>
+    /// Entry point for native-to-managed frame updates and script component dispatch.
+    /// </summary>
+    [AutoStaticsCleanup]
     public static class SystemManager
     {
+        /// <summary>
+        /// Global manager that invokes script component update callbacks.
+        /// </summary>
         public static ScriptComponentManager ScriptManager = new ScriptComponentManager();
         private static GCMonitor gcMonitor = new GCMonitor();
+
+        /// <summary>
+        /// Invoked by the runtime before a script domain unloads. Re-creates
+        /// the manager so no script instances, Type buckets or method
+        /// override caches keep the unloading domain alive, while native
+        /// update callbacks keep working against a fresh, empty manager.
+        /// </summary>
+        private static void OnStaticsCleanup()
+        {
+            ScriptManager = new ScriptComponentManager();
+            gcMonitor = new GCMonitor();
+        }
+        /// <summary>
+        /// Native-to-managed frame update entry point. Updates <see cref="Time"/> and dispatches OnUpdate.
+        /// </summary>
+        /// <param name="info">Per-frame timing values from the engine.</param>
         public static void internal_n2m_update(UpdateInfo info)
         {
             Time.time = info.time;
@@ -635,7 +715,10 @@ namespace Unravel.Core
             // gcMonitor.CheckAndLog("Update");
         }
 
-
+        /// <summary>
+        /// Native-to-managed fixed update entry point. Updates fixed delta time and dispatches OnFixedUpdate.
+        /// </summary>
+        /// <param name="info">Fixed-step timing values from the engine.</param>
         public static void internal_n2m_fixed_update(FixedUpdateInfo info)
         {
             Time.fixedDeltaTime = info.deltaTime;
@@ -643,6 +726,9 @@ namespace Unravel.Core
             ScriptManager.InvokeFixedUpdate();
         }
 
+        /// <summary>
+        /// Native-to-managed late update entry point. Dispatches OnLateUpdate.
+        /// </summary>
         public static void internal_n2m_late_update()
         {
             ScriptManager.InvokeLateUpdate();
@@ -652,8 +738,15 @@ namespace Unravel.Core
 
 
 
+    /// <summary>
+    /// Helpers for throwing managed exceptions from native bridge code.
+    /// </summary>
     public static class ExceptionHelper
     {
+        /// <summary>
+        /// Throws an <see cref="InvalidOperationException"/> with the given message.
+        /// </summary>
+        /// <param name="message">Exception message.</param>
         public static void ThrowException(string message)
         {
             throw new InvalidOperationException(message);

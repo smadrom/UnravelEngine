@@ -2,6 +2,7 @@
 #include <engine/assets/asset_manager.h>
 #include <engine/defaults/defaults.h>
 #include <engine/loading_screen.h>
+#include <engine/play_mode.h>
 #include <engine/profiler/profiler.h>
 #include <engine/rendering/renderer.h>
 #include <engine/scripting/ecs/systems/script_system.h>
@@ -11,6 +12,7 @@
 #include <engine/ecs/ecs.h>
 
 #include "events.h"
+#include <engine/settings/boot_config.h>
 #include <engine/animation/ecs/systems/animation_system.h>
 #include <engine/audio/ecs/systems/audio_system.h>
 #include <engine/ecs/systems/transform_system.h>
@@ -28,6 +30,7 @@
 #include <cstdlib>
 #include <exception>
 #include <logging/logging.h>
+#include <service/service.h>
 
 
 #include <seq/seq.h>
@@ -45,6 +48,7 @@ auto context_ptr() -> rtti::context*&
     return ctx;
 }
 std::atomic<bool> is_shutting_down{false};
+std::atomic<bool> is_restart_requested{false};
 
 void update_input_zone(const renderer& rend, input_system& input)
 {
@@ -86,10 +90,19 @@ void engine_termination_handler(const crash::signal_info& info)
 
 void engine_crash_handler(const crash::signal_info& info, const crash::trace_info& trace)
 {
-    // Log the crash with full details
-    APPLOG_CRITICAL("Crash signal ({}) -> {}\n{}", info.signal_number, info.signal_name, trace.formatted_trace);
-
-    // Try emergency cleanup
+    // Best-effort only: CrashLog.txt / minidump are already written by the crash module
+    // with async-signal/SEH-safe I/O. spdlog may deadlock if the faulting thread holds a lock.
+    try
+    {
+        APPLOG_CRITICAL("Crash ({:#x}) -> {}\n{}",
+                        static_cast<unsigned>(info.signal_number),
+                        info.signal_name,
+                        trace.formatted_trace);
+        APPLOG_FLUSH();
+    }
+    catch(...)
+    {
+    }
     engine::interrupt();
 
     APPLOG_FLUSH();
@@ -97,9 +110,14 @@ void engine_crash_handler(const crash::signal_info& info, const crash::trace_inf
 
 void engine_exception_handler(const crash::exception_info& info, const crash::trace_info& trace)
 {
-    APPLOG_CRITICAL("{}\n{}", info.exception_message, trace.formatted_trace);
-
-    // Same emergency cleanup as crash handler
+    try
+    {
+        APPLOG_CRITICAL("{}\n{}", info.exception_message, trace.formatted_trace);
+        APPLOG_FLUSH();
+    }
+    catch(...)
+    {
+    }
     engine::interrupt();
 
     APPLOG_FLUSH();
@@ -135,18 +153,23 @@ auto engine::create(rtti::context& ctx, cmd_line::parser& parser) -> bool
     ctx.add<logging>();
     ctx.add<loading_screen>();
 
-    // Install engine crash handlers immediately after logging is available
+    // Install engine crash handlers immediately after logging is available.
+    // Windows AVs go through SEH; CrashLog.txt (+ .dmp) are written crash-safely
+    // before these callbacks run.
     crash::install_handlers(crash::crash_handlers{
         .interrupt_handler = engine_interrupt_handler,
         .termination_handler = engine_termination_handler,
         .crash_handler = engine_crash_handler,
         .exception_handler = engine_exception_handler,
+        .crash_log_path = "CrashLog.txt",
+        .write_minidump = true,
     });
 
-    APPLOG_INFO("Engine crash handlers installed");
+    APPLOG_INFO("Engine crash handlers installed (CrashLog.txt / minidump enabled)");
 
     ctx.add<simulation>();
     ctx.add<events>();
+    ctx.add<play_mode>();
     ctx.add<threader>();
     ctx.add<renderer>(ctx, parser);
     ctx.add<audio_system>();
@@ -162,8 +185,11 @@ auto engine::create(rtti::context& ctx, cmd_line::parser& parser) -> bool
     ctx.add<particle_system>();
     ctx.add<physics_system>();
     ctx.add<input_system>();
-    ctx.add<script_system>();
+    ctx.add<script_system>(ctx, parser);
     ctx.add<ui_system>();
+
+    parser.set_optional<std::string>("B", "physics", "auto", "Select preferred physics backend.");
+
     return true;
 }
 
@@ -271,13 +297,19 @@ auto engine::init_systems(const cmd_line::parser& parser) -> bool
     }
 
     ls.begin_module("Scripting");
-    if(!ls.check(ctx.get_cached<script_system>().init(ctx)))
+    if(!ls.check(ctx.get_cached<script_system>().init(ctx, parser)))
     {
         return false;
     }
 
     ls.begin_module("UI");
     if(!ls.check(ctx.get_cached<ui_system>().init(ctx)))
+    {
+        return false;
+    }
+
+    ls.begin_module("Play Mode");
+    if(!ls.check(ctx.get_cached<play_mode>().init(ctx)))
     {
         return false;
     }
@@ -299,7 +331,13 @@ auto engine::deinit() -> bool
     {
         return false;
     }
-    
+
+    if(!ctx.get_cached<play_mode>().deinit(ctx))
+    {
+        return false;
+    }
+
+
     if(!ctx.get_cached<ui_system>().deinit(ctx))
     {
         return false;
@@ -355,13 +393,12 @@ auto engine::deinit() -> bool
     {
         return false;
     }
-
+    
     if(!ctx.get_cached<ecs>().deinit(ctx))
     {
         return false;
     }
 
-    
     if(!ctx.get_cached<particle_system>().deinit(ctx))
     {
         return false;
@@ -412,12 +449,14 @@ auto engine::destroy() -> bool
     ctx.remove<asset_manager>();
     ctx.remove<audio_system>();
     ctx.remove<renderer>();
+    ctx.remove<play_mode>();
     ctx.remove<events>();
     ctx.remove<simulation>();
     ctx.remove<threader>();
     ctx.remove<logging>();
 
     ctx.remove<loading_screen>();
+    ctx.remove<boot_config>();
 
     bool empty = ctx.empty();
     if(!empty)
@@ -450,17 +489,17 @@ auto engine::process() -> int
         sim.run_one_frame(true);
 
         auto dt = sim.get_delta_time();
+        auto& play = ctx.get_cached<play_mode>();
 
-        if(ev.is_playing)
+        // First simulation frame: zero dt so Start/init work cannot integrate
+        // a hitch. Increment frames_running at frame end so consumers can also
+        // detect this via frames_running() == 0 (e.g. mid-frame enter_running).
+        if(play.is_simulation_running() && play.frames_running() == 0)
         {
-            if(ev.frames_playing == 0)
-            {
-                dt = delta_t(0.0166);
-            }
-            ev.frames_playing++;
+            dt = {};
         }
 
-        if(ev.is_paused)
+        if(play.is_paused())
         {
             dt = {};
         }
@@ -469,22 +508,18 @@ auto engine::process() -> int
 
         input.manager.before_events_update();
 
-        bool should_quit = false;
+        bool should_quit = is_shutting_down;
 
         {
             APP_SCOPE_PERF("Poll OS Events");
             os::event e{};
-            while(os::poll_event(e))
+            while(!should_quit && os::poll_event(e))
             {
                 ev.on_os_event(ctx, e);
 
                 input.manager.on_os_event(e);
 
-                should_quit = rend.get_main_window() == nullptr || is_shutting_down;
-                if(should_quit)
-                {
-                    break;
-                }
+                should_quit |= rend.get_main_window() == nullptr;
             }
         }
 
@@ -495,9 +530,15 @@ auto engine::process() -> int
 
         if(should_quit)
         {
-            ev.set_play_mode(ctx, false);
+            ctx.get_cached<play_mode>().set_active(ctx, false);
+            const bool restart = is_restart_requested.exchange(false);
             is_shutting_down = false;
-            return 0;
+            if(restart)
+            {
+                APPLOG_INFO("Engine process returning restart action");
+                return SERVICE_RESULT_RESTART;
+            }
+            return SERVICE_RESULT_EXIT;
         }
 
         {   
@@ -535,6 +576,11 @@ auto engine::process() -> int
             APP_SCOPE_PERF("Frame End");
             ev.on_frame_end(ctx, dt);
         }
+
+        if(play.is_simulation_running())
+        {
+            play.on_simulation_frame();
+        }
     }
 
     get_app_profiler()->swap();
@@ -543,6 +589,14 @@ auto engine::process() -> int
 }
 auto engine::interrupt() -> bool
 {
+    is_shutting_down = true;
+    return true;
+}
+
+auto engine::request_restart() -> bool
+{
+    APPLOG_INFO("Application restart requested");
+    is_restart_requested = true;
     is_shutting_down = true;
     return true;
 }

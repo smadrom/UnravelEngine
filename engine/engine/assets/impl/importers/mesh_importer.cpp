@@ -1,8 +1,10 @@
 #include "mesh_importer.h"
 #include "bimg/bimg.h"
+#include "bimg/decode.h"
 #include "bimg/encode.h"
 
 #include "../asset_extensions.h"
+#include "../asset_writer.h"
 
 #include <graphics/graphics.h>
 #include <logging/logging.h>
@@ -25,14 +27,17 @@
 #include <graphics/utils/bgfx_utils.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <filesystem/filesystem.h>
+#include <fstream>
 #include <functional>
 #include <optional>
 #include <numeric>
 #include <queue>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <unordered_set>
 #include <unordered_map>
@@ -52,6 +57,7 @@ void apply_texture_conversion(bimg::ImageContainer* image, const std::string& se
 void process_raw_texture_data(const aiTexture* assimp_tex, const fs::path& output_file,
                              const std::string& semantic, bool inverse);
 void apply_specular_to_metallic_roughness_conversion(bimg::ImageContainer* image);
+auto atomic_image_save(const fs::path& output_file, bimg::ImageContainer* image) -> bool;
 
 /**
  * @brief Per-material scalar/vector multipliers from the KHR_materials_pbrSpecularGlossiness
@@ -405,380 +411,6 @@ auto find_root_motion_node_bfs(const aiScene* scene, const aiAnimation* animatio
     return find_first_animated_node_bfs(scene, animation, req);
 }
 
-// Helper function to interpolate between two keyframes for position
-auto interpolate_position(float animation_time, const aiNodeAnim* node_anim) -> aiVector3D
-{
-    if(node_anim->mNumPositionKeys == 1)
-    {
-        return node_anim->mPositionKeys[0].mValue;
-    }
-
-    for(unsigned int i = 0; i < node_anim->mNumPositionKeys - 1; ++i)
-    {
-        if(animation_time < (float)node_anim->mPositionKeys[i + 1].mTime)
-        {
-            float time1 = (float)node_anim->mPositionKeys[i].mTime;
-            float time2 = (float)node_anim->mPositionKeys[i + 1].mTime;
-            float factor = (animation_time - time1) / (time2 - time1);
-            const aiVector3D& start = node_anim->mPositionKeys[i].mValue;
-            const aiVector3D& end = node_anim->mPositionKeys[i + 1].mValue;
-            aiVector3D delta = end - start;
-            return start + factor * delta;
-        }
-    }
-    return node_anim->mPositionKeys[0].mValue; // Default to first position
-}
-
-// Helper function to interpolate between two keyframes for rotation
-auto interpolate_rotation(float animation_time, const aiNodeAnim* node_anim) -> aiQuaternion
-{
-    if(node_anim->mNumRotationKeys == 1)
-    {
-        return node_anim->mRotationKeys[0].mValue;
-    }
-
-    for(unsigned int i = 0; i < node_anim->mNumRotationKeys - 1; ++i)
-    {
-        if(animation_time < (float)node_anim->mRotationKeys[i + 1].mTime)
-        {
-            float time1 = (float)node_anim->mRotationKeys[i].mTime;
-            float time2 = (float)node_anim->mRotationKeys[i + 1].mTime;
-            float factor = (animation_time - time1) / (time2 - time1);
-            const aiQuaternion& start = node_anim->mRotationKeys[i].mValue;
-            const aiQuaternion& end = node_anim->mRotationKeys[i + 1].mValue;
-            aiQuaternion result;
-            aiQuaternion::Interpolate(result, start, end, factor);
-            return result.Normalize();
-        }
-    }
-    return node_anim->mRotationKeys[0].mValue; // Default to first rotation
-}
-
-// Helper function to interpolate between two keyframes for scaling
-auto interpolate_scaling(float animation_time, const aiNodeAnim* node_anim) -> aiVector3D
-{
-    if(node_anim->mNumScalingKeys == 1)
-    {
-        return node_anim->mScalingKeys[0].mValue;
-    }
-
-    for(unsigned int i = 0; i < node_anim->mNumScalingKeys - 1; ++i)
-    {
-        if(animation_time < (float)node_anim->mScalingKeys[i + 1].mTime)
-        {
-            float time1 = (float)node_anim->mScalingKeys[i].mTime;
-            float time2 = (float)node_anim->mScalingKeys[i + 1].mTime;
-            float factor = (animation_time - time1) / (time2 - time1);
-            const aiVector3D& start = node_anim->mScalingKeys[i].mValue;
-            const aiVector3D& end = node_anim->mScalingKeys[i + 1].mValue;
-            aiVector3D delta = end - start;
-            return start + factor * delta;
-        }
-    }
-    return node_anim->mScalingKeys[0].mValue; // Default to first scaling
-}
-
-// Find the animation channel that matches the node name (bone)
-auto find_node_anim(const aiAnimation* animation, const aiString& node_name) -> const aiNodeAnim*
-{
-    for(unsigned int i = 0; i < animation->mNumChannels; ++i)
-    {
-        const aiNodeAnim* node_anim = animation->mChannels[i];
-        if(std::string(node_anim->mNodeName.C_Str()) == node_name.C_Str())
-        {
-            return node_anim;
-        }
-    }
-    return nullptr;
-}
-
-// Recursively calculate the bone transform for the current node (bone)
-auto calculate_bone_transform(const aiNode* node,
-                              const aiString& bone_name,
-                              const aiAnimation* animation,
-                              float animation_time,
-                              const aiMatrix4x4& parent_transform) -> aiMatrix4x4
-{
-    std::string node_name(node->mName.C_Str());
-
-    // Find the corresponding animation channel for this bone/node
-    const aiNodeAnim* node_anim = find_node_anim(animation, node->mName);
-
-    // Local transformation matrix
-    aiMatrix4x4 local_transform = node->mTransformation;
-
-    // If we have animation data for this node, interpolate the transformation
-    if(node_anim)
-    {
-        // Interpolate translation, rotation, and scaling
-        aiVector3D interpolated_position = interpolate_position(animation_time, node_anim);
-        aiQuaternion interpolated_rotation = interpolate_rotation(animation_time, node_anim);
-        aiVector3D interpolated_scaling = interpolate_scaling(animation_time, node_anim);
-
-        // Build the transformation matrix from interpolated values
-        aiMatrix4x4 position_matrix;
-        aiMatrix4x4::Translation(interpolated_position, position_matrix);
-
-        aiMatrix4x4 rotation_matrix = aiMatrix4x4(interpolated_rotation.GetMatrix());
-
-        aiMatrix4x4 scaling_matrix;
-        aiMatrix4x4::Scaling(interpolated_scaling, scaling_matrix);
-
-        // Combine them into a single local transformation matrix
-        local_transform = position_matrix * rotation_matrix * scaling_matrix;
-    }
-
-    // Combine with parent transformation
-    aiMatrix4x4 global_transform = parent_transform * local_transform;
-
-    // If this node is the bone we're looking for, return the global transformation
-    if(node_name == bone_name.C_Str())
-    {
-        return global_transform;
-    }
-
-    // Recursively calculate the bone transform for all child nodes
-    for(unsigned int i = 0; i < node->mNumChildren; ++i)
-    {
-        auto child_transform =
-            calculate_bone_transform(node->mChildren[i], bone_name, animation, animation_time, global_transform);
-        if(child_transform != aiMatrix4x4())
-        {
-            return child_transform;
-        }
-    }
-
-    // If not found, return identity matrix
-    return aiMatrix4x4();
-}
-
-using animation_bounding_box_map = std::unordered_map<const aiAnimation*, std::vector<math::bbox>>;
-using mesh_attaching_nodes_map = std::unordered_map<unsigned int, std::vector<const aiNode*>>;
-
-struct affected_mesh_entry
-{
-    const aiMesh* mesh{};
-    std::vector<const aiNode*> attaching_nodes;
-};
-
-auto build_mesh_attaching_nodes_map(const aiScene* scene) -> mesh_attaching_nodes_map
-{
-    mesh_attaching_nodes_map map;
-    if(!scene || !scene->mRootNode)
-    {
-        return map;
-    }
-
-    const std::function<void(const aiNode*)> visit = [&](const aiNode* node)
-    {
-        for(unsigned int i = 0; i < node->mNumMeshes; ++i)
-        {
-            map[node->mMeshes[i]].push_back(node);
-        }
-
-        for(unsigned int i = 0; i < node->mNumChildren; ++i)
-        {
-            visit(node->mChildren[i]);
-        }
-    };
-
-    visit(scene->mRootNode);
-    return map;
-}
-
-auto transform_point(const aiMatrix4x4& transform, const aiVector3D& point) -> math::vec3
-{
-    aiVector3D transformed_point = transform * point;
-    return math::vec3(transformed_point.x, transformed_point.y, transformed_point.z);
-}
-
-auto get_transformed_vertices(const aiMesh* mesh,
-                              const aiScene* scene,
-                              float time_in_seconds,
-                              const aiAnimation* animation,
-                              const std::vector<const aiNode*>& attaching_nodes) -> std::vector<math::vec3>
-{
-    if(mesh->mNumBones > 0)
-    {
-        std::vector<math::vec3> transformed_vertices(mesh->mNumVertices, math::vec3(0.0f));
-
-        std::for_each(mesh->mBones,
-                      mesh->mBones + mesh->mNumBones,
-                      [&](const aiBone* bone)
-                      {
-                          const aiMatrix4x4 bone_offset = bone->mOffsetMatrix;
-                          const aiMatrix4x4 bone_transform = calculate_bone_transform(scene->mRootNode,
-                                                                                      bone->mName,
-                                                                                      animation,
-                                                                                      time_in_seconds,
-                                                                                      aiMatrix4x4());
-
-                          std::for_each(bone->mWeights,
-                                        bone->mWeights + bone->mNumWeights,
-                                        [&](const aiVertexWeight& weight)
-                                        {
-                                            const unsigned int vertex_id = weight.mVertexId;
-                                            const float weight_value = weight.mWeight;
-                                            const aiVector3D position = mesh->mVertices[vertex_id];
-                                            const math::vec3 transformed_pos =
-                                                transform_point(bone_transform * bone_offset, position);
-                                            transformed_vertices[vertex_id] += transformed_pos * weight_value;
-                                        });
-                      });
-
-        return transformed_vertices;
-    }
-
-    std::vector<math::vec3> transformed_vertices;
-    transformed_vertices.reserve(mesh->mNumVertices * std::max<size_t>(1, attaching_nodes.size()));
-
-    for(const aiNode* node : attaching_nodes)
-    {
-        const aiMatrix4x4 node_transform =
-            calculate_bone_transform(scene->mRootNode, node->mName, animation, time_in_seconds, aiMatrix4x4());
-
-        for(unsigned int i = 0; i < mesh->mNumVertices; ++i)
-        {
-            transformed_vertices.push_back(transform_point(node_transform, mesh->mVertices[i]));
-        }
-    }
-
-    return transformed_vertices;
-}
-
-// Calculate the bounding box in parallel
-auto calculate_bounding_box(const std::vector<math::vec3>& vertices) -> math::bbox
-{
-    math::bbox box;
-
-    // Use parallel execution to find the min/max extents of the bounding box
-    std::for_each(vertices.begin(),
-                  vertices.end(),
-                  [&](const math::vec3& vertex)
-                  {
-                      box.add_point(vertex);
-                  });
-
-    return box;
-}
-
-// Recursive function to propagate bone influence to child nodes
-void propagate_bone_influence(const aiNode* node, std::unordered_set<std::string>& affected_bones)
-{
-    // Mark this node as affected
-    affected_bones.insert(node->mName.C_Str());
-
-    // Recursively propagate to all child nodes
-    for(unsigned int i = 0; i < node->mNumChildren; ++i)
-    {
-        propagate_bone_influence(node->mChildren[i], affected_bones);
-    }
-}
-
-// Helper function to collect directly and indirectly affected bones (nodes) by the animation
-auto get_affected_bones_and_children(const aiScene* scene, const aiAnimation* animation)
-    -> std::unordered_set<std::string>
-{
-    std::unordered_set<std::string> affected_bones;
-
-    // Step 1: Collect directly affected bones (from animation channels)
-    for(unsigned int i = 0; i < animation->mNumChannels; ++i)
-    {
-        const aiNodeAnim* node_anim = animation->mChannels[i];
-        affected_bones.insert(node_anim->mNodeName.C_Str());
-
-        // Step 2: Find the corresponding node in the scene and propagate influence to its children
-        const aiNode* affected_node = scene->mRootNode->FindNode(node_anim->mNodeName);
-        if(affected_node)
-        {
-            propagate_bone_influence(affected_node, affected_bones); // Recursively mark all children
-        }
-    }
-
-    return affected_bones;
-}
-
-// Function to check if a mesh is affected by the animation (skinned bones or node-attached rigid meshes).
-auto is_mesh_affected_by_animation(unsigned int mesh_index,
-                                   const aiMesh* mesh,
-                                   const std::unordered_set<std::string>& affected_nodes,
-                                   const mesh_attaching_nodes_map& attaching_nodes) -> bool
-{
-    for(unsigned int i = 0; i < mesh->mNumBones; ++i)
-    {
-        if(affected_nodes.find(mesh->mBones[i]->mName.C_Str()) != affected_nodes.end())
-        {
-            return true;
-        }
-    }
-
-    const auto it = attaching_nodes.find(mesh_index);
-    if(it != attaching_nodes.end())
-    {
-        for(const aiNode* node : it->second)
-        {
-            if(affected_nodes.find(node->mName.C_Str()) != affected_nodes.end())
-            {
-                return true;
-            }
-        }
-    }
-
-    return false;
-}
-
-auto get_affected_meshes(const aiScene* scene,
-                         const std::unordered_set<std::string>& affected_nodes,
-                         const mesh_attaching_nodes_map& attaching_nodes) -> std::vector<affected_mesh_entry>
-{
-    std::vector<affected_mesh_entry> affected_meshes;
-    for(unsigned int mesh_index = 0; mesh_index < scene->mNumMeshes; ++mesh_index)
-    {
-        const aiMesh* mesh = scene->mMeshes[mesh_index];
-        if(!is_mesh_affected_by_animation(mesh_index, mesh, affected_nodes, attaching_nodes))
-        {
-            continue;
-        }
-
-        affected_mesh_entry entry;
-        entry.mesh = mesh;
-        const auto it = attaching_nodes.find(mesh_index);
-        if(it != attaching_nodes.end())
-        {
-            entry.attaching_nodes = it->second;
-        }
-        affected_meshes.emplace_back(std::move(entry));
-    }
-
-    return affected_meshes;
-}
-
-auto try_accumulate_animation_bounding_boxes(const animation_bounding_box_map& boxes, math::bbox& out) -> bool
-{
-    bool found = false;
-    for(const auto& kvp : boxes)
-    {
-        for(const auto& box : kvp.second)
-        {
-            if(!box.is_populated())
-            {
-                continue;
-            }
-
-            if(!found)
-            {
-                out = {};
-                found = true;
-            }
-
-            out.add_point(box.min);
-            out.add_point(box.max);
-        }
-    }
-
-    return found;
-}
-
 void apply_import_facing_correction_to_load_data(mesh::load_data& load_data)
 {
     if(!load_data.root_node)
@@ -833,84 +465,6 @@ void accumulate_bounds_from_armature(const mesh::load_data& load_data, math::bbo
     };
 
     visit(*load_data.root_node, math::transform::identity());
-}
-
-/// Evenly spaced animation samples used to expand import-time bounds (ticks, not seconds).
-constexpr unsigned int animation_bounds_sample_count = 5;
-
-auto build_animation_sample_times(float animation_duration_ticks) -> std::vector<float>
-{
-    std::vector<float> times;
-    times.reserve(animation_bounds_sample_count);
-
-    if(animation_duration_ticks <= 0.0f || animation_bounds_sample_count <= 1)
-    {
-        times.push_back(0.0f);
-        return times;
-    }
-
-    for(unsigned int i = 0; i < animation_bounds_sample_count; ++i)
-    {
-        times.push_back(animation_duration_ticks * float(i) / float(animation_bounds_sample_count - 1));
-    }
-
-    return times;
-}
-
-// Main function to compute bounding boxes for animations, skipping unaffected meshes
-auto compute_bounding_boxes_for_animations(const aiScene* scene) -> animation_bounding_box_map
-{
-    APPLOG_TRACE_PERF(std::chrono::seconds);
-
-    animation_bounding_box_map animation_bounding_boxes;
-
-    if(!scene->HasAnimations())
-    {
-        return animation_bounding_boxes;
-    }
-
-    const auto attaching_nodes = build_mesh_attaching_nodes_map(scene);
-
-    for(unsigned int anim_index = 0; anim_index < scene->mNumAnimations; ++anim_index)
-    {
-        const aiAnimation* animation = scene->mAnimations[anim_index];
-        auto& boxes = animation_bounding_boxes[animation];
-
-        const float animation_duration = float(animation->mDuration);
-        const auto sample_times = build_animation_sample_times(animation_duration);
-        boxes.reserve(sample_times.size());
-
-        const auto affected_nodes = get_affected_bones_and_children(scene, animation);
-        const auto affected_meshes = get_affected_meshes(scene, affected_nodes, attaching_nodes);
-
-        for(const float time : sample_times)
-        {
-            math::bbox sample_bounds;
-
-            for(const auto& entry : affected_meshes)
-            {
-                const auto transformed_vertices =
-                    get_transformed_vertices(entry.mesh, scene, time, animation, entry.attaching_nodes);
-
-                auto frame_bounding_box = calculate_bounding_box(transformed_vertices);
-                if(!frame_bounding_box.is_populated())
-                {
-                    continue;
-                }
-
-                frame_bounding_box.inflate(frame_bounding_box.get_extents() * 0.05f);
-                sample_bounds.add_point(frame_bounding_box.min);
-                sample_bounds.add_point(frame_bounding_box.max);
-            }
-
-            if(sample_bounds.is_populated())
-            {
-                boxes.push_back(sample_bounds);
-            }
-        }
-    }
-
-    return animation_bounding_boxes;
 }
 
 // Helper function to get the file extension from the compressed texture format
@@ -1275,9 +829,65 @@ void process_bones(aiMesh* mesh, std::uint32_t submesh_offset, mesh::load_data& 
                 influence.weight = assimp_influence.mWeight;
 
                 bone_ptr->influences.emplace_back(influence);
+
+                // Accumulate the bone-space bounds of every influenced vertex (mesh-space
+                // position pre-multiplied by the offset/bind-pose matrix). At runtime,
+                // bone_world_transform * bounds yields a conservative world-space bound of
+                // the skinned geometry for frustum culling of animated meshes.
+                if(assimp_influence.mVertexId < mesh->mNumVertices && assimp_influence.mWeight > 0.0f)
+                {
+                    const auto& vertex = mesh->mVertices[assimp_influence.mVertexId];
+                    const math::vec3 mesh_space_position(vertex.x, vertex.y, vertex.z);
+                    const math::vec3 bone_space_position =
+                        bone_ptr->bind_pose_transform.transform_coord(mesh_space_position);
+                    bone_ptr->bounds.add_point(bone_space_position);
+                }
             }
         }
     }
+}
+
+auto make_stable_submesh_id(const char* name, const mesh::load_data& load_data) -> uint32_t
+{
+    // FNV-1a hash of the source mesh name. The id must be deterministic across reimports so
+    // scene/prefab references (submesh_component entries) survive submesh reordering.
+    uint32_t hash = 2166136261u;
+    bool empty = true;
+    for(const char* c = name; *c != '\0'; ++c)
+    {
+        hash ^= static_cast<uint8_t>(*c);
+        hash *= 16777619u;
+        empty = false;
+    }
+    if(empty)
+    {
+        // Unnamed meshes fall back to an ordinal-derived id (still deterministic as long as
+        // the exporter emits meshes in a stable order).
+        hash = 2166136261u ^ static_cast<uint32_t>(load_data.submeshes.size() + 1);
+    }
+    if(hash == 0)
+    {
+        hash = 1;
+    }
+    // Disambiguate duplicate names with deterministic probing.
+    auto collides = [&](uint32_t candidate)
+    {
+        return std::any_of(load_data.submeshes.begin(),
+                           load_data.submeshes.end(),
+                           [candidate](const mesh::submesh& sm)
+                           {
+                               return sm.stable_id == candidate;
+                           });
+    };
+    while(collides(hash))
+    {
+        hash = hash * 16777619u + 1u;
+        if(hash == 0)
+        {
+            hash = 1;
+        }
+    }
+    return hash;
 }
 
 void process_mesh(aiMesh* mesh, mesh::load_data& load_data)
@@ -1290,6 +900,7 @@ void process_mesh(aiMesh* mesh, mesh::load_data& load_data)
     submesh.face_count = mesh->mNumFaces;
     submesh.data_group_id = mesh->mMaterialIndex;
     submesh.skinned = mesh->HasBones();
+    submesh.stable_id = make_stable_submesh_id(mesh->mName.C_Str(), load_data);
     load_data.material_count = std::max(load_data.material_count, submesh.data_group_id + 1);
 
     process_faces(mesh, submesh.vertex_start, load_data);
@@ -1694,7 +1305,7 @@ void process_embedded_texture(const aiTexture* assimp_tex,
                 // Apply workflow-specific texture conversions
                 apply_texture_conversion(image, texture.semantic, texture.inverse);
 
-                imageSave(output_file.string().c_str(), image);
+                atomic_image_save(output_file, image);
 
                 bimg::imageFree(image);
             }
@@ -2135,6 +1746,32 @@ void apply_diffuse_to_base_color_conversion(bimg::ImageContainer* diffuse_image,
 }
 
 /**
+ * @brief Atomically save an ImageContainer via imageSave.
+ * Callback only writes the temp path; atomic_write_file owns rename/cleanup.
+ */
+auto atomic_image_save(const fs::path& output_file, bimg::ImageContainer* image) -> bool
+{
+    fs::error_code ec;
+    bool wrote = false;
+    const std::string format_hint = output_file.string();
+    asset_writer::atomic_write_file(
+        output_file,
+        [&](const fs::path& temp)
+        {
+            // Temp is `.<uuid>.temp` (watcher-safe). Pass the final destination as
+            // format_hint so imageSave can still pick dds/png/etc.
+            wrote = imageSave(temp.string().c_str(), image, format_hint.c_str());
+            if(!wrote)
+            {
+                fs::error_code remove_ec;
+                fs::remove(temp, remove_ec);
+            }
+        },
+        ec);
+    return wrote && !ec;
+}
+
+/**
  * @brief Write a raw RGBA8 buffer to a PNG file. Used for sibling outputs that
  * we synthesize directly without going through bimg::ImageContainer.
  *
@@ -2144,28 +1781,38 @@ void apply_diffuse_to_base_color_conversion(bimg::ImageContainer* diffuse_image,
  * that stb_image — and any other compliant TGA reader — re-interprets as BGRA,
  * yielding an R↔B swap at load time. PNG carries explicit format metadata and
  * imageWritePng honors the RGBA8 parameter, so this round-trips correctly.
+ *
+ * Writes through asset_writer::atomic_write_file so watchers never observe a
+ * partial PNG.
  */
 auto write_rgba8_png(const fs::path& output_file,
                      uint32_t width,
                      uint32_t height,
                      const uint8_t* rgba8_data) -> bool
 {
-    bx::FileWriter writer;
-    bx::Error err;
-    if(!bx::open(&writer, output_file.string().c_str(), false, &err))
-    {
-        return false;
-    }
-    bimg::imageWritePng(&writer,
-                        width,
-                        height,
-                        width * 4,
-                        rgba8_data,
-                        bimg::TextureFormat::RGBA8,
-                        false,
-                        &err);
-    bx::close(&writer);
-    return err.isOk();
+    fs::error_code ec;
+    asset_writer::atomic_write_file(
+        output_file,
+        [&](const fs::path& temp)
+        {
+            bx::FileWriter writer;
+            bx::Error err;
+            if(!bx::open(&writer, temp.string().c_str(), false, &err))
+            {
+                return;
+            }
+            bimg::imageWritePng(&writer,
+                                width,
+                                height,
+                                width * 4,
+                                rgba8_data,
+                                bimg::TextureFormat::RGBA8,
+                                false,
+                                &err);
+            bx::close(&writer);
+        },
+        ec);
+    return !ec;
 }
 
 /**
@@ -3401,7 +3048,7 @@ void execute_texture_job(const texture_job& job,
             if(image)
             {
                 apply_texture_conversion(image, result.semantic, result.inverse);
-                imageSave(converted_file.string().c_str(), image);
+                atomic_image_save(converted_file, image);
                 bimg::imageFree(image);
                 result.name = converted_name;
                 APPLOG_TRACE("Mesh Importer: Applied {} conversion to external texture: {}", result.semantic, result.name);
@@ -3843,6 +3490,231 @@ auto is_material_two_sided(const aiMaterial* material) -> bool
     return false;
 }
 
+constexpr float k_import_opaque_opacity_threshold = 0.999f;
+
+auto material_opacity_factor_suggests_cutout(const aiMaterial* material, ai_real& out_opacity) -> bool
+{
+    out_opacity = 1.0f;
+    return material
+           && material->Get(AI_MATKEY_OPACITY, out_opacity) == AI_SUCCESS
+           && out_opacity < k_import_opaque_opacity_threshold;
+}
+
+auto resolve_import_alpha_cutoff(const aiMaterial* material, ai_real fallback = 0.5f) -> ai_real
+{
+    ai_real cutoff = fallback;
+    if(material && material->Get(AI_MATKEY_GLTF_ALPHACUTOFF, cutoff) == AI_SUCCESS && cutoff > 0.0f)
+    {
+        return math::clamp(cutoff, 0.0f, 1.0f);
+    }
+    return fallback;
+}
+
+constexpr float k_import_border_alpha_opaque_threshold = 0.95f;
+
+auto compressed_texture_format_has_alpha(bimg::TextureFormat::Enum format) -> bool
+{
+    switch(format)
+    {
+    case bimg::TextureFormat::BC2:     // DXT3 — explicit alpha
+    case bimg::TextureFormat::BC3:     // DXT5 — interpolated alpha
+    case bimg::TextureFormat::BC7:
+    case bimg::TextureFormat::ETC2A:
+    case bimg::TextureFormat::ETC2A1:
+    case bimg::TextureFormat::PTC12A:
+    case bimg::TextureFormat::PTC14A:
+    case bimg::TextureFormat::ATCE:
+    case bimg::TextureFormat::ATCI:
+        return true;
+    default:
+        break;
+    }
+
+    if(format >= bimg::TextureFormat::ASTC4x4 && format <= bimg::TextureFormat::ASTC12x12)
+    {
+        return true;
+    }
+
+    return false;
+}
+
+auto texture_format_has_alpha(bimg::TextureFormat::Enum format, bool parser_reported_alpha) -> bool
+{
+    if(parser_reported_alpha)
+    {
+        return true;
+    }
+
+    if(!bimg::isValid(format))
+    {
+        return false;
+    }
+
+    if(bimg::getBlockInfo(format).aBits > 0)
+    {
+        return true;
+    }
+
+    // bimg block info has aBits=0 for block-compressed formats; DDS DXT5/BC3 also omits
+    // DDPF_ALPHAPIXELS so m_hasAlpha stays false even though the block encoding has alpha.
+    if(bimg::isCompressed(format) && compressed_texture_format_has_alpha(format))
+    {
+        return true;
+    }
+
+    return false;
+}
+
+auto image_mip_border_has_transparency(const bimg::ImageMip& mip,
+                                       bimg::TextureFormat::Enum format,
+                                       float opaque_threshold) -> bool
+{
+    if(mip.m_width == 0 || mip.m_height == 0 || !mip.m_data)
+    {
+        return false;
+    }
+
+    const bimg::UnpackFn unpack = bimg::getUnpack(format);
+    if(!unpack)
+    {
+        return false;
+    }
+
+    const uint32_t bpp = bimg::getBitsPerPixel(format);
+    if(bpp == 0 || (bpp % 8) != 0)
+    {
+        return false;
+    }
+
+    const uint32_t bytes_per_pixel = bpp / 8;
+    const uint32_t width = mip.m_width;
+    const uint32_t height = mip.m_height;
+    const uint32_t row_stride = width * bytes_per_pixel;
+
+    auto alpha_below_threshold = [&](uint32_t x, uint32_t y) -> bool
+    {
+        const uint8_t* pixel = mip.m_data + (static_cast<size_t>(y) * row_stride + x * bytes_per_pixel);
+        float rgba[4];
+        unpack(rgba, pixel);
+        return rgba[3] < opaque_threshold;
+    };
+
+    for(uint32_t x = 0; x < width; ++x)
+    {
+        if(alpha_below_threshold(x, 0) || alpha_below_threshold(x, height - 1))
+        {
+            return true;
+        }
+    }
+
+    for(uint32_t y = 1; y + 1 < height; ++y)
+    {
+        if(alpha_below_threshold(0, y) || alpha_below_threshold(width - 1, y))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+auto image_border_has_transparency(const bimg::ImageContainer& image, float opaque_threshold) -> bool
+{
+    if(image.m_width == 0 || image.m_height == 0 || !image.m_data)
+    {
+        return false;
+    }
+
+    if(!texture_format_has_alpha(image.m_format, image.m_hasAlpha))
+    {
+        return false;
+    }
+
+    bimg::ImageMip mip{};
+    if(!bimg::imageGetRawData(image, 0, 0, image.m_data, image.m_size, mip))
+    {
+        return false;
+    }
+
+    if(!bimg::isCompressed(image.m_format) && bimg::getUnpack(image.m_format) != nullptr)
+    {
+        return image_mip_border_has_transparency(mip, image.m_format, opaque_threshold);
+    }
+
+    if(bimg::isCompressed(image.m_format))
+    {
+        const uint32_t width = mip.m_width;
+        const uint32_t height = mip.m_height;
+        if(width == 0 || height == 0)
+        {
+            return false;
+        }
+
+        std::vector<uint8_t> decoded(static_cast<size_t>(width) * height * 4);
+        bimg::imageDecodeToRgba8(get_bimg_allocator(),
+                                 decoded.data(),
+                                 mip.m_data,
+                                 width,
+                                 height,
+                                 width * 4,
+                                 image.m_format);
+
+        bimg::ImageMip decoded_mip{};
+        decoded_mip.m_format = bimg::TextureFormat::RGBA8;
+        decoded_mip.m_width = width;
+        decoded_mip.m_height = height;
+        decoded_mip.m_depth = 1;
+        decoded_mip.m_bpp = 32;
+        decoded_mip.m_hasAlpha = true;
+        decoded_mip.m_data = decoded.data();
+
+        return image_mip_border_has_transparency(decoded_mip, bimg::TextureFormat::RGBA8, opaque_threshold);
+    }
+
+    bimg::ImageContainer* converted =
+        bimg::imageConvert(get_bimg_allocator(), bimg::TextureFormat::RGBA8, image, false);
+    if(!converted)
+    {
+        return false;
+    }
+
+    const bool suggests_cutout = image_border_has_transparency(*converted, opaque_threshold);
+    bimg::imageFree(converted);
+    return suggests_cutout;
+}
+
+auto color_map_border_suggests_alpha_cutout(const fs::path& output_dir, const std::string& relative) -> bool
+{
+    if(relative.empty() || !texture_file_exists(output_dir, relative))
+    {
+        return false;
+    }
+
+    const fs::path filepath =
+        output_dir / resolve_external_texture_path(output_dir, normalize_assimp_path(relative));
+    const bx::FilePath bimg_path(filepath.string().c_str());
+
+    bimg::ImageContainer header{};
+    if(imageParseInfo(bimg_path, header)
+       && !texture_format_has_alpha(header.m_format, header.m_hasAlpha))
+    {
+        APPLOG_TRACE("Mesh Importer: Texture format does not have alpha: {}", relative);
+        return false;
+    }
+
+    bimg::ImageContainer* loaded = imageLoad(bimg_path);
+    if(!loaded)
+    {
+        APPLOG_TRACE("Mesh Importer: Failed to load image: {}", relative);
+        return false;
+    }
+
+    const bool suggests_cutout = image_border_has_transparency(*loaded, k_import_border_alpha_opaque_threshold);
+    APPLOG_TRACE("Mesh Importer: Probing base color map border for transparency: {}", suggests_cutout);
+    bimg::imageFree(loaded);
+    return suggests_cutout;
+}
+
 void process_material(asset_manager& am,
                       const fs::path& filename,
                       const fs::path& output_dir,
@@ -3987,7 +3859,7 @@ void process_material(asset_manager& am,
                     fs::error_code ec;
                     if(fs::exists(old_filepath, ec))
                     {
-                        fs::rename(old_filepath, fixed_filepath, ec);
+                        asset_writer::atomic_rename_file(old_filepath, fixed_filepath, ec);
                     }
                     else
                     {
@@ -3996,7 +3868,7 @@ void process_material(asset_manager& am,
                         fixed_filepath = output_dir / fixed_relative;
                         if(fs::exists(old_filepath, ec))
                         {
-                            fs::copy_file(old_filepath, fixed_filepath, ec);
+                            asset_writer::atomic_copy_file(old_filepath, fixed_filepath, ec);
                         }
                     }
                     tex.name = fixed_relative.generic_string();
@@ -4132,7 +4004,7 @@ void process_material(asset_manager& am,
             if(image)
             {
                 apply_texture_conversion(image, texture.semantic, texture.inverse);
-                imageSave(converted_file.string().c_str(), image);
+                atomic_image_save(converted_file, image);
                 bimg::imageFree(image);
                 texture.name = converted_name;
                 APPLOG_TRACE("Mesh Importer: Applied {} conversion to external texture: {}", texture.semantic, texture.name);
@@ -4147,6 +4019,7 @@ void process_material(asset_manager& am,
 
     // KHR spec-gloss: diffuse + specular pair -> Khronos bake (base color + MR).
     std::string combined_mr_relative;
+    std::string base_color_map_relative;
 
     bool khr_textures_baked = false;
     bool spec_gloss_mr_baked = false;
@@ -4306,11 +4179,13 @@ void process_material(asset_manager& am,
                 process_texture(texture, textures);
             }
 
+            base_color_map_relative = texture.name;
+
             if(binding)
             {
                 if(const auto key = try_make_texture_asset_key(output_dir, texture.name))
                 {
-                    mat.set_color_map(am.get_asset<gfx::texture>(*key));
+                    mat.set_color_map(am.get_asset<gfx::texture>(*key, load_flags::standard, load_mode::deferred));
                 }
                 else
                 {
@@ -4369,7 +4244,7 @@ void process_material(asset_manager& am,
         {
             if(const auto key = try_make_texture_asset_key(output_dir, combined_mr_relative))
             {
-                auto texture_asset = am.get_asset<gfx::texture>(*key);
+                auto texture_asset = am.get_asset<gfx::texture>(*key, load_flags::standard, load_mode::deferred);
 
                 mat.set_metalness_map(texture_asset);
                 mat.set_roughness_map(texture_asset);
@@ -4396,7 +4271,7 @@ void process_material(asset_manager& am,
             {
                 if(const auto key = try_make_texture_asset_key(output_dir, combined_texture.name))
                 {
-                    auto texture_asset = am.get_asset<gfx::texture>(*key);
+                    auto texture_asset = am.get_asset<gfx::texture>(*key, load_flags::standard, load_mode::deferred);
 
                     mat.set_metalness_map(texture_asset);
                     mat.set_roughness_map(texture_asset);
@@ -4426,7 +4301,7 @@ void process_material(asset_manager& am,
                 {
                     if(const auto key = try_make_texture_asset_key(output_dir, texture.name))
                     {
-                        mat.set_metalness_map(am.get_asset<gfx::texture>(*key));
+                        mat.set_metalness_map(am.get_asset<gfx::texture>(*key, load_flags::standard, load_mode::deferred));
                         has_metallic_tex = true;
                     }
                     else
@@ -4447,7 +4322,7 @@ void process_material(asset_manager& am,
                 {
                     if(const auto key = try_make_texture_asset_key(output_dir, texture.name))
                     {
-                        mat.set_roughness_map(am.get_asset<gfx::texture>(*key));
+                        mat.set_roughness_map(am.get_asset<gfx::texture>(*key, load_flags::standard, load_mode::deferred));
                         has_roughness_tex = true;
 
                         if(texture.semantic == "ShininessToRoughness")
@@ -4505,7 +4380,7 @@ void process_material(asset_manager& am,
             {
                 if(const auto key = try_make_texture_asset_key(output_dir, texture.name))
                 {
-                    mat.set_normal_map(am.get_asset<gfx::texture>(*key));
+                    mat.set_normal_map(am.get_asset<gfx::texture>(*key, load_flags::standard, load_mode::deferred));
                 }
                 else
                 {
@@ -4575,7 +4450,7 @@ void process_material(asset_manager& am,
             {
                 if(const auto key = try_make_texture_asset_key(output_dir, texture.name))
                 {
-                    mat.set_ao_map(am.get_asset<gfx::texture>(*key));
+                    mat.set_ao_map(am.get_asset<gfx::texture>(*key, load_flags::standard, load_mode::deferred));
                 }
                 else
                 {
@@ -4625,7 +4500,7 @@ void process_material(asset_manager& am,
             {
                 if(const auto key = try_make_texture_asset_key(output_dir, texture.name))
                 {
-                    mat.set_emissive_map(am.get_asset<gfx::texture>(*key));
+                    mat.set_emissive_map(am.get_asset<gfx::texture>(*key, load_flags::standard, load_mode::deferred));
                 }
                 else
                 {
@@ -4673,20 +4548,61 @@ void process_material(asset_manager& am,
             mat.set_emissive_intensity(math::clamp(mat.get_emissive_intensity() * texture_strength, 0.0f, 100.0f));
         }
     }
-    // ALPHA CUTOUT / OPACITY (feeds deferred_geom alpha-test discard)
+    // ALPHA MODE / CUTOFF (glTF alphaMode + alphaCutoff, legacy opacity, border alpha probe)
     {
-        ai_real alpha_cutoff{};
-        if(material->Get(AI_MATKEY_GLTF_ALPHACUTOFF, alpha_cutoff) == AI_SUCCESS)
+        alpha_mode resolved = alpha_mode::opaque;
+        ai_real resolved_cutoff = 0.5f;
+
+        aiString alpha_mode_str;
+        const bool has_alpha_mode = material->Get(AI_MATKEY_GLTF_ALPHAMODE, alpha_mode_str) == AI_SUCCESS;
+
+        if(has_alpha_mode)
         {
-            mat.set_alpha_test_value(math::clamp(alpha_cutoff, 0.0f, 1.0f));
+            APPLOG_TRACE("Mesh Importer: glTF alphaMode: {}", alpha_mode_str.C_Str());
+
+            if(alpha_mode_str == aiString("MASK"))
+            {
+                resolved = alpha_mode::mask;
+                material->Get(AI_MATKEY_GLTF_ALPHACUTOFF, resolved_cutoff);
+                if(resolved_cutoff <= 0.0f)
+                {
+                    resolved_cutoff = 0.5f;
+                }
+            }
+            else if(alpha_mode_str == aiString("BLEND"))
+            {
+                resolved = alpha_mode::blend;
+            }
         }
         else
         {
             ai_real opacity = 1.0f;
-            if(material->Get(AI_MATKEY_OPACITY, opacity) == AI_SUCCESS)
+            if(material_opacity_factor_suggests_cutout(material, opacity))
             {
-                mat.set_alpha_test_value(math::clamp(1.0f - opacity, 0.0f, 1.0f));
+                resolved = alpha_mode::mask;
+                resolved_cutoff = 1.0f - opacity;
             }
+        }
+
+        // When mode is still opaque, probe the base color map border for transparency (common on
+        // foliage/fences exported without alphaMode). Skipped when glTF declares BLEND/MASK.
+        if(binding && resolved == alpha_mode::opaque && !base_color_map_relative.empty())
+        {
+            APPLOG_TRACE("Mesh Importer: Probing base color map border for transparency: {}", base_color_map_relative);
+            if(color_map_border_suggests_alpha_cutout(output_dir, base_color_map_relative))
+            {
+                APPLOG_TRACE(
+                    "Mesh Importer: Promoting to alpha cutout — base color map '{}' has transparent border pixels",
+                    base_color_map_relative);
+                resolved = alpha_mode::mask;
+                resolved_cutoff = resolve_import_alpha_cutoff(material);
+            }
+        }
+
+        mat.set_alpha_mode(resolved);
+        if(resolved == alpha_mode::mask)
+        {
+            mat.set_alpha_cutoff(math::clamp(resolved_cutoff, 0.0f, 1.0f));
         }
     }
 }
@@ -4825,24 +4741,10 @@ void process_imported_scene(asset_manager& am,
     APPLOG_TRACE("Mesh Importer: Processing animations ...");
     process_animations(scene, filename, load_data, name_to_index_lut, animations);
 
-    APPLOG_TRACE("Mesh Importer: Processing animations bounding boxes ...");
-    const auto boxes = compute_bounding_boxes_for_animations(scene);
-
-    math::bbox animation_bounds;
-    if(try_accumulate_animation_bounding_boxes(boxes, animation_bounds))
-    {
-        // Animation bounds only cover affected meshes — expand the static scene bounds, never replace.
-        if(load_data.bbox.is_populated())
-        {
-            load_data.bbox.add_point(animation_bounds.min);
-            load_data.bbox.add_point(animation_bounds.max);
-        }
-        else
-        {
-            load_data.bbox = animation_bounds;
-        }
-    }
-    else if(!load_data.bbox.is_populated())
+    // Note: bounds are intentionally bind-pose only. Animation-driven expansion happens at
+    // runtime from per-bone bind-space bounds (skinned) and per-node submesh proxy bounds
+    // (rigid attachments), which track the actual pose instead of pre-sampled clips.
+    if(!load_data.bbox.is_populated())
     {
         load_data.bbox = {};
         accumulate_bounds_from_armature(load_data, load_data.bbox);
@@ -4956,6 +4858,536 @@ auto convert_specular_gloss_to_metallic_roughness(const aiColor3D& diffuse_color
 
 } // namespace
 
+namespace
+{
+
+// Mesh formats whose geometry (or required sidecars) can live outside the root file.
+// Single-file containers (.glb / .emesh / .fbx / ...) keep vertex buffers in-file.
+auto is_multi_file_mesh_format(const fs::path& path) -> bool
+{
+    const auto ext = string_utils::to_lower(path.extension().string());
+    return ext == ".gltf" || ext == ".obj";
+}
+
+auto read_text_file(const fs::path& path) -> std::string
+{
+    std::ifstream file(path, std::ios::in | std::ios::binary);
+    if(!file.is_open())
+    {
+        return {};
+    }
+    return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+}
+
+struct mesh_sidecar_dependency
+{
+    fs::path path;
+    /// When non-zero (glTF buffer byteLength), wait until file_size >= this value.
+    std::uintmax_t minimum_size{0};
+};
+
+enum class gltf_dependency_status
+{
+    /// JSON still truncated / buffers section not fully readable.
+    not_ready,
+    /// No external files required (embedded data: URIs only, or empty buffers).
+    ready_embedded,
+    /// External sidecar paths are known and should be waited on.
+    ready_external,
+};
+
+auto skip_json_ws(const std::string& json, size_t pos) -> size_t
+{
+    while(pos < json.size() &&
+          (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n' || json[pos] == '\r'))
+    {
+        ++pos;
+    }
+    return pos;
+}
+
+auto read_json_string(const std::string& json, size_t& pos) -> std::string
+{
+    pos = skip_json_ws(json, pos);
+    if(pos >= json.size() || json[pos] != '"')
+    {
+        return {};
+    }
+    ++pos;
+    const size_t end = json.find('"', pos);
+    if(end == std::string::npos)
+    {
+        pos = json.size();
+        return {};
+    }
+    std::string value = json.substr(pos, end - pos);
+    pos = end + 1;
+    return value;
+}
+
+auto read_json_uint(const std::string& json, size_t& pos) -> std::uintmax_t
+{
+    pos = skip_json_ws(json, pos);
+    if(pos >= json.size() || json[pos] < '0' || json[pos] > '9')
+    {
+        return 0;
+    }
+    std::uintmax_t value = 0;
+    while(pos < json.size() && json[pos] >= '0' && json[pos] <= '9')
+    {
+        value = (value * 10) + static_cast<std::uintmax_t>(json[pos] - '0');
+        ++pos;
+    }
+    return value;
+}
+
+/**
+ * @brief Parse glTF `buffers` / `images` objects for external uri + optional byteLength.
+ *
+ * Assimp has no public pre-ReadFile API for listing external URIs; it resolves them
+ * only while loading. We scrape the JSON ourselves and wait for companions on disk.
+ */
+auto parse_gltf_external_dependencies(const std::string& json, const fs::path& parent)
+    -> std::pair<gltf_dependency_status, std::vector<mesh_sidecar_dependency>>
+{
+    std::vector<mesh_sidecar_dependency> deps;
+    bool saw_buffers_key = false;
+    bool saw_external_buffer = false;
+    bool saw_embedded_buffer = false;
+    // Prefer structured scrape of buffer/image objects; fall back to any "uri" for images.
+    auto append_uri = [&](const std::string& uri, std::uintmax_t minimum_size)
+    {
+        if(uri.empty() || uri.rfind("data:", 0) == 0)
+        {
+            if(!uri.empty())
+            {
+                saw_embedded_buffer = true;
+            }
+            return;
+        }
+        mesh_sidecar_dependency dep;
+        dep.path = fs::absolute(parent / uri);
+        dep.minimum_size = minimum_size;
+        deps.push_back(std::move(dep));
+    };
+    auto parse_object_uri_and_length = [&](size_t object_begin, size_t object_end)
+    {
+        std::string uri;
+        std::uintmax_t byte_length = 0;
+        size_t pos = object_begin;
+        while(pos < object_end)
+        {
+            const size_t uri_key = json.find("\"uri\"", pos);
+            const size_t len_key = json.find("\"byteLength\"", pos);
+            size_t next = std::string::npos;
+            bool is_uri = false;
+            if(uri_key != std::string::npos && uri_key < object_end)
+            {
+                next = uri_key;
+                is_uri = true;
+            }
+            if(len_key != std::string::npos && len_key < object_end &&
+               (next == std::string::npos || len_key < next))
+            {
+                next = len_key;
+                is_uri = false;
+            }
+            if(next == std::string::npos)
+            {
+                break;
+            }
+            pos = next;
+            if(is_uri)
+            {
+                pos += 5; // "uri"
+                pos = skip_json_ws(json, pos);
+                if(pos < json.size() && json[pos] == ':')
+                {
+                    ++pos;
+                }
+                uri = read_json_string(json, pos);
+            }
+            else
+            {
+                pos += 12; // "byteLength"
+                pos = skip_json_ws(json, pos);
+                if(pos < json.size() && json[pos] == ':')
+                {
+                    ++pos;
+                }
+                byte_length = read_json_uint(json, pos);
+            }
+        }
+        if(uri.rfind("data:", 0) == 0)
+        {
+            saw_embedded_buffer = true;
+            return;
+        }
+        if(!uri.empty())
+        {
+            saw_external_buffer = true;
+            append_uri(uri, byte_length);
+        }
+    };
+    auto parse_named_array_objects = [&](const char* array_key, bool is_buffers)
+    {
+        const std::string key = array_key;
+        size_t key_pos = json.find(key);
+        if(key_pos == std::string::npos)
+        {
+            return false;
+        }
+        if(is_buffers)
+        {
+            saw_buffers_key = true;
+        }
+        size_t pos = key_pos + key.size();
+        pos = skip_json_ws(json, pos);
+        if(pos >= json.size() || json[pos] != ':')
+        {
+            return false;
+        }
+        ++pos;
+        pos = skip_json_ws(json, pos);
+        if(pos >= json.size() || json[pos] != '[')
+        {
+            return false;
+        }
+        ++pos;
+        while(pos < json.size())
+        {
+            pos = skip_json_ws(json, pos);
+            if(pos >= json.size())
+            {
+                return false;
+            }
+            if(json[pos] == ']')
+            {
+                return true;
+            }
+            if(json[pos] != '{')
+            {
+                return false;
+            }
+            const size_t object_begin = pos;
+            int depth = 0;
+            do
+            {
+                if(json[pos] == '{')
+                {
+                    ++depth;
+                }
+                else if(json[pos] == '}')
+                {
+                    --depth;
+                }
+                ++pos;
+            } while(pos < json.size() && depth > 0);
+            if(depth != 0)
+            {
+                return false;
+            }
+            parse_object_uri_and_length(object_begin, pos);
+            pos = skip_json_ws(json, pos);
+            if(pos < json.size() && json[pos] == ',')
+            {
+                ++pos;
+            }
+        }
+        return false;
+    };
+    const bool buffers_ok = parse_named_array_objects("\"buffers\"", true);
+    const bool images_ok = parse_named_array_objects("\"images\"", false);
+    // Truncated glTF often has meshes/nodes but an incomplete trailing buffers array.
+    if(saw_buffers_key && !buffers_ok)
+    {
+        return {gltf_dependency_status::not_ready, {}};
+    }
+    if(!images_ok && json.find("\"images\"") != std::string::npos)
+    {
+        // Images are optional for geometry, but if the key exists and is truncated,
+        // the file is still landing — keep waiting so Assimp does not race.
+        return {gltf_dependency_status::not_ready, {}};
+    }
+    if(!saw_buffers_key)
+    {
+        // No buffers key yet: either still copying, or malformed. Do not treat as ready.
+        if(json.find("\"meshes\"") != std::string::npos || json.find("\"asset\"") != std::string::npos)
+        {
+            return {gltf_dependency_status::not_ready, {}};
+        }
+        return {gltf_dependency_status::not_ready, {}};
+    }
+    if(deps.empty())
+    {
+        if(saw_embedded_buffer || !saw_external_buffer)
+        {
+            return {gltf_dependency_status::ready_embedded, {}};
+        }
+        return {gltf_dependency_status::not_ready, {}};
+    }
+    return {gltf_dependency_status::ready_external, std::move(deps)};
+}
+
+auto collect_obj_external_dependencies(const fs::path& obj_path) -> std::vector<mesh_sidecar_dependency>
+{
+    std::vector<mesh_sidecar_dependency> deps;
+    std::ifstream file(obj_path);
+    if(!file.is_open())
+    {
+        return deps;
+    }
+    const fs::path parent = obj_path.parent_path();
+    std::string line;
+    while(std::getline(file, line))
+    {
+        line.erase(0, line.find_first_not_of(" \t"));
+        if(line.rfind("mtllib", 0) != 0)
+        {
+            continue;
+        }
+        std::string rest = line.substr(6);
+        const auto begin = rest.find_first_not_of(" \t");
+        if(begin == std::string::npos)
+        {
+            continue;
+        }
+        const auto end = rest.find_last_not_of(" \t\r\n");
+        rest = rest.substr(begin, end - begin + 1);
+        if(rest.empty())
+        {
+            continue;
+        }
+        mesh_sidecar_dependency dep;
+        dep.path = fs::absolute(parent / rest);
+        deps.push_back(std::move(dep));
+    }
+    return deps;
+}
+
+auto is_regular_file_nonempty(const fs::path& path) -> bool
+{
+    fs::error_code ec;
+    if(!fs::exists(path, ec) || !fs::is_regular_file(path, ec))
+    {
+        return false;
+    }
+    const auto size = fs::file_size(path, ec);
+    return !ec && size > 0;
+}
+
+/**
+ * @brief Wait until every sidecar exists, meets minimum_size, and size is stable.
+ *
+ * Used so a .gltf is not compiled while its .bin / textures are still being copied.
+ */
+auto wait_until_sidecars_ready(const std::vector<mesh_sidecar_dependency>& deps,
+                               std::chrono::milliseconds timeout,
+                               std::chrono::milliseconds poll_interval = std::chrono::milliseconds(50),
+                               int required_stable_samples = 2) -> bool
+{
+    if(deps.empty())
+    {
+        return true;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::unordered_map<std::string, std::uintmax_t> last_sizes;
+    std::unordered_map<std::string, int> stable_counts;
+    last_sizes.reserve(deps.size());
+    stable_counts.reserve(deps.size());
+    while(std::chrono::steady_clock::now() < deadline)
+    {
+        bool all_ready = true;
+        for(const auto& dep : deps)
+        {
+            APPLOG_TRACE("Mesh Importer: waiting for sidecar {} (size={}, required>={})",
+                         dep.path.generic_string(),
+                         dep.minimum_size,
+                         dep.minimum_size);
+            fs::error_code ec;
+            if(!fs::exists(dep.path, ec) || !fs::is_regular_file(dep.path, ec))
+            {
+                all_ready = false;
+                continue;
+            }
+            const auto size = fs::file_size(dep.path, ec);
+            if(ec || size == 0)
+            {
+                all_ready = false;
+                continue;
+            }
+            if(dep.minimum_size > 0 && size < dep.minimum_size)
+            {
+                all_ready = false;
+                continue;
+            }
+            const auto key = dep.path.generic_string();
+            auto size_it = last_sizes.find(key);
+            if(size_it != last_sizes.end() && size_it->second == size)
+            {
+                ++stable_counts[key];
+            }
+            else
+            {
+                last_sizes[key] = size;
+                stable_counts[key] = 0;
+            }
+            if(stable_counts[key] < required_stable_samples)
+            {
+                all_ready = false;
+            }
+        }
+        if(all_ready)
+        {
+            return true;
+        }
+        std::this_thread::sleep_for(poll_interval);
+    }
+    return false;
+}
+
+auto wait_until_files_ready(const std::vector<fs::path>& paths,
+                            std::chrono::milliseconds timeout) -> bool
+{
+    std::vector<mesh_sidecar_dependency> deps;
+    deps.reserve(paths.size());
+    for(const auto& path : paths)
+    {
+        mesh_sidecar_dependency dep;
+        dep.path = path;
+        deps.push_back(std::move(dep));
+    }
+    return wait_until_sidecars_ready(deps, timeout);
+}
+
+auto wait_for_mesh_source_dependencies(const fs::path& path) -> bool
+{
+    constexpr auto k_timeout = std::chrono::seconds(3);
+    // Always wait for the root source to finish landing (atomic copy / watcher races).
+    if(!wait_until_files_ready({path}, k_timeout))
+    {
+        APPLOG_ERROR("Mesh Importer: timed out waiting for source file {}", path.generic_string());
+        return false;
+    }
+    if(!is_multi_file_mesh_format(path))
+    {
+        return true;
+    }
+    const auto ext = string_utils::to_lower(path.extension().string());
+    const auto deadline = std::chrono::steady_clock::now() + k_timeout;
+    std::vector<mesh_sidecar_dependency> deps;
+    if(ext == ".gltf")
+    {
+        // Re-read JSON until buffers/images parse cleanly. A size-stable but truncated
+        // .gltf (copy still flushing) previously yielded zero URIs and skipped the .bin wait.
+        while(std::chrono::steady_clock::now() < deadline)
+        {
+            const std::string json = read_text_file(path);
+            if(json.empty())
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+            const auto parsed = parse_gltf_external_dependencies(json, path.parent_path());
+            if(parsed.first == gltf_dependency_status::not_ready)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+            if(parsed.first == gltf_dependency_status::ready_embedded)
+            {
+                return true;
+            }
+            deps = parsed.second;
+            break;
+        }
+        if(deps.empty() && std::chrono::steady_clock::now() >= deadline)
+        {
+            APPLOG_ERROR("Mesh Importer: timed out parsing external dependencies for {}",
+                         path.generic_string());
+            return false;
+        }
+    }
+    else if(ext == ".obj")
+    {
+        deps = collect_obj_external_dependencies(path);
+        if(deps.empty())
+        {
+            return true;
+        }
+    }
+    if(deps.empty())
+    {
+        return true;
+    }
+    APPLOG_TRACE("Mesh Importer: waiting for {} external dependenc{} for {}",
+                 deps.size(),
+                 deps.size() == 1 ? "y" : "ies",
+                 path.generic_string());
+                 
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now());
+    if(remaining.count() <= 0)
+    {
+        return false;
+    }
+    if(wait_until_sidecars_ready(deps, remaining))
+    {
+        return true;
+    }
+    for(const auto& dep : deps)
+    {
+        fs::error_code ec;
+        const auto size = fs::exists(dep.path, ec) ? fs::file_size(dep.path, ec) : 0;
+        if(!is_regular_file_nonempty(dep.path) ||
+           (dep.minimum_size > 0 && size < dep.minimum_size))
+        {
+            APPLOG_ERROR("Mesh Importer: missing or incomplete dependency {} "
+                         "(size={}, required>={}, required by {})",
+                         dep.path.generic_string(),
+                         size,
+                         dep.minimum_size,
+                         path.generic_string());
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+auto collect_mesh_external_dependencies(const fs::path& path) -> std::vector<fs::path>
+{
+    const auto ext = string_utils::to_lower(path.extension().string());
+    std::vector<fs::path> deps;
+    if(ext == ".gltf")
+    {
+        const std::string json = read_text_file(path);
+        if(json.empty())
+        {
+            return deps;
+        }
+        const auto parsed = parse_gltf_external_dependencies(json, path.parent_path());
+        if(parsed.first != gltf_dependency_status::ready_external)
+        {
+            return deps;
+        }
+        deps.reserve(parsed.second.size());
+        for(const auto& dep : parsed.second)
+        {
+            deps.push_back(dep.path);
+        }
+        return deps;
+    }
+    if(ext == ".obj")
+    {
+        for(const auto& dep : collect_obj_external_dependencies(path))
+        {
+            deps.push_back(dep.path);
+        }
+    }
+    return deps;
+}
+
 void mesh_importer_init()
 {
     struct log_stream : public Assimp::LogStream
@@ -5005,8 +5437,13 @@ auto load_mesh_data_from_file(asset_manager& am,
                               std::vector<imported_material>& materials,
                               std::vector<imported_texture>& textures) -> bool
 {
+    // Multi-file formats (glTF + .bin/textures, OBJ + mtllib) must be complete on disk
+    // before Assimp reads them; otherwise vertex buffers can import as empty.
+    if(!wait_for_mesh_source_dependencies(path))
+    {
+        return false;
+    }
     Assimp::Importer importer;
-
     int rvc_flags = aiComponent_CAMERAS | aiComponent_LIGHTS;
 
     if(!import_meta.model.import_meshes)

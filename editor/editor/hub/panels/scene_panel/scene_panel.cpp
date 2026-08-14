@@ -992,9 +992,13 @@ void manipulation_gizmos(bool& gizmo_at_center,
         movetype = handle_standard_gizmo_manipulation(*active_sel, center, camera_comp, em, snap);
     }
 
-    // After all manipulations, compute the delta and apply it to all selections
+    // After all manipulations, compute the delta and apply it to all selections.
+    // IMPORTANT: only rewrite locals when the gizmo/bounds actually moved. Reconstructing
+    // from a mat4 every frame (even with an identity delta) drops the authored Euler hint
+    // and makes inspector XYZ jump at gimbal lock after typing e.g. Y=90.
     math::mat4 center_final_global = center_transform_comp.get_transform_global();
     math::mat4 center_delta = center_final_global * glm::inverse(center_initial_global);
+    const bool should_apply_gizmo_delta = (movetype != ImGuizmo::MT_NONE) || bounds_changed;
 
     auto batch_action = std::make_shared<composite_action_t>();
     // Apply transforms and create undoable actions
@@ -1012,6 +1016,11 @@ void manipulation_gizmos(bool& gizmo_at_center,
                 // IK algorithm adjusts parent bones to make the end effector reach the target.
                 // Do NOT apply any direct transform to the selection - let IK handle it.
                 handle_inverse_kinematics(sel, center, em);
+                continue;
+            }
+
+            if(!should_apply_gizmo_delta)
+            {
                 continue;
             }
 
@@ -1499,6 +1508,16 @@ auto scene_panel::get_camera() -> entt::handle
     return camera_entity;
 }
 
+void scene_panel::reset_camera(rtti::context& ctx)
+{
+    auto camera = get_camera();
+    if(camera)
+    {
+        camera.destroy();
+    }
+    defaults::create_camera_entity(ctx, panel_scene_, "Scene Camera");
+}
+
 auto scene_panel::get_center() -> entt::handle
 {
     entt::handle center_entity;
@@ -1710,6 +1729,19 @@ void scene_panel::draw_gizmos_settings_menu(editing_manager& em)
         ImGui::Separator();
         ImGui::TextUnformatted("Selection Gizmos");
         ImGui::Checkbox("Selection Outline", &em.gizmos.show_selection_outline);
+        ImGui::Checkbox("Selection Wireframe", &em.gizmos.show_selection_wireframe);
+        ImGui::SetItemTooltipEx("%s", "Draw a vertex-pulling wireframe overlay on top of the selected entity's mesh.");
+        if(em.gizmos.show_selection_wireframe)
+        {
+            ImGui::ColorEdit4("Wireframe Color",
+                              math::value_ptr(em.gizmos.selection_wireframe_color),
+                              ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_AlphaPreviewHalf | ImGuiColorEditFlags_NoInputs);
+            ImGui::KnobSliderScalarT("Wireframe Thickness",
+                               &em.gizmos.selection_wireframe_thickness,
+                               0.5f,
+                               5.0f,
+                               "%.2f px");
+        }
         ImGui::Checkbox("Camera Gizmos", &em.gizmos.show_camera);
         ImGui::Checkbox("Model Gizmos", &em.gizmos.show_model);
         ImGui::Checkbox("Light Gizmos", &em.gizmos.show_light);
@@ -1721,10 +1753,8 @@ void scene_panel::draw_gizmos_settings_menu(editing_manager& em)
 
         ImGui::Separator();
         ImGui::TextUnformatted("Model Details");
-        ImGui::Checkbox("World Bounds", &em.gizmos.show_model_bounds);
-        ImGui::Checkbox("Local Bounds", &em.gizmos.show_model_local_bounds);
-        ImGui::Checkbox("Submesh Local Bounds", &em.gizmos.show_model_submesh_local_bounds);
-        ImGui::Checkbox("LOD", &em.gizmos.show_model_lod);
+        ImGui::Checkbox("World Bounds & LOD", &em.gizmos.show_model_bounds);
+        ImGui::Checkbox("World Submesh Bounds & LOD", &em.gizmos.show_model_submesh_bounds);
 
         ImGui::Separator();
         ImGui::TextUnformatted("Particle Emitter Details");
@@ -1821,12 +1851,7 @@ void scene_panel::draw_camera_settings_menu(rtti::context& ctx)
     {
         if(ImGui::Button("Reset Camera"))
         {
-            auto camera = get_camera();
-            if(camera)
-            {
-                camera.destroy();
-            }
-            defaults::create_camera_entity(ctx, panel_scene_, "Scene Camera");
+            reset_camera(ctx);
         }
 
         ImGui::SetItemTooltipEx("%s", "Reset the Scene camera.");

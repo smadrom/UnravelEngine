@@ -7,6 +7,7 @@
 #include <filesystem/file_istream.h>
 #include <serialization/serialization.h>
 #include "components/all_components.h"
+#include <engine/assets/impl/asset_writer.h>
 #include <engine/engine.h>
 #include <engine/events.h>
 #include <engine/rendering/ecs/systems/rendering_system.h>
@@ -501,6 +502,19 @@ auto should_save_component(const entt::const_handle& obj) -> bool
 template<typename Component>
 auto should_load_component(const entt::handle& obj) -> bool
 {
+    if constexpr(std::is_same_v<Component, id_component>)
+    {
+        // Instance entity UIDs are per-instance (implicit override). When syncing /
+        // loading into an existing prefab hierarchy, never overwrite them from the
+        // prefab asset. New entities still get a UID via generate_if_nil.
+        auto& load_ctx = get_load_context();
+        if(load_ctx.is_updating_prefab())
+        {
+            auto& id_comp = obj.get_or_emplace<id_component>();
+            id_comp.generate_if_nil();
+            return false;
+        }
+    }
     return true;
 }
 
@@ -923,6 +937,36 @@ void save_to_file(const std::string& absolute_path, entt::const_handle obj)
     }
     writing = false;
 }
+
+namespace asset_writer
+{
+auto atomic_save_to_file(const fs::path& key, entt::const_handle obj) -> bool
+{
+    try
+    {
+        fs::path absolute_key = fs::absolute(fs::resolve_protocol(key));
+        fs::error_code err;
+        atomic_write_file(
+            absolute_key,
+            [&](const fs::path& temp)
+            {
+                save_to_file(temp.string(), obj);
+            },
+            err);
+        return !err;
+    }
+    catch(const std::exception& e)
+    {
+        APPLOG_ERROR("Failed to save object to file: {0}", e.what());
+        return false;
+    }
+}
+
+auto atomic_save_to_file(const fs::path& key, entt::handle obj) -> bool
+{
+    return atomic_save_to_file(key, entt::const_handle{obj});
+}
+} // namespace asset_writer
 
 void save_to_stream_bin(std::ostream& stream, entt::const_handle obj)
 {

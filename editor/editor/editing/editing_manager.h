@@ -68,15 +68,16 @@ struct editing_manager
     struct gizmos_data
     {
         bool show_selection_outline {true};
+        bool show_selection_wireframe {false};
+        math::vec4 selection_wireframe_color {0.15f, 0.85f, 0.75f, 1.0f};
+        float selection_wireframe_thickness {1.5f};
         bool show_camera {true};
         bool show_light {true};
         bool show_reflection_probe {true};
         bool show_volume {true};
         bool show_model {true};
         bool show_model_bounds {false};
-        bool show_model_local_bounds {false};
-        bool show_model_submesh_local_bounds {false};
-        bool show_model_lod {false};
+        bool show_model_submesh_bounds {false};
         bool show_text {true};
         bool show_particle_emitter {true};
         bool show_component_gizmos {true};
@@ -114,6 +115,7 @@ struct editing_manager
     auto deinit(rtti::context& ctx) -> bool;
 
     void on_play_before_begin(rtti::context& ctx);
+    void on_play_begin(rtti::context& ctx);
     void on_play_after_end(rtti::context& ctx);
     void on_frame_update(rtti::context& ctx, delta_t);
     void on_script_recompile(rtti::context& ctx, const std::string& protocol, uint64_t version);

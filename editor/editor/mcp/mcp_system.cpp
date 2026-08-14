@@ -1921,28 +1921,28 @@ auto read_login_effect_elements(const json& effect_doc) -> std::vector<login_eff
     return elements;
 }
 
-auto login_effect_shape_for_type(const std::string& type_name) -> EmitterShape::Enum
+auto login_effect_shape_for_type(const std::string& type_name) -> ps_soa::emitter_shape
 {
     if(type_name == "particleBox")
     {
-        return EmitterShape::Box;
+        return ps_soa::emitter_shape::box;
     }
     if(type_name == "decal3d" || type_name == "decalBillboard")
     {
-        return EmitterShape::Rect;
+        return ps_soa::emitter_shape::rect;
     }
 
-    return EmitterShape::Sphere;
+    return ps_soa::emitter_shape::sphere;
 }
 
-auto login_effect_direction_for_type(const std::string& type_name) -> EmitterDirection::Enum
+auto login_effect_direction_for_type(const std::string& type_name) -> ps_soa::emitter_direction
 {
     if(type_name == "particlePoint" || type_name == "particleBox" || type_name == "particleEllipsoid")
     {
-        return EmitterDirection::Outward;
+        return ps_soa::emitter_direction::outward;
     }
 
-    return EmitterDirection::Up;
+    return ps_soa::emitter_direction::up;
 }
 
 auto login_effect_sprite_scale_for_type(const std::string& type_name) -> float
@@ -2007,12 +2007,12 @@ void configure_login_effect_emitter(particle_emitter_component& emitter,
     emitter.set_max_particles(max_particles);
     emitter.set_shape(login_effect_shape_for_type(element.type_name));
     emitter.set_direction(login_effect_direction_for_type(element.type_name));
-    emitter.set_spawn_location(EmitterSpawnLocation::Inside);
-    emitter.set_simulation_space(SimulationSpace::World);
+    emitter.set_spawn_location(ps_soa::spawn_location::inside);
+    emitter.set_simulation_space(ps_soa::simulation_space::world);
     emitter.set_texture(texture_handle);
-    emitter.set_texture_mode(TextureMode::MultiChannel);
-    emitter.set_render_mode(RenderMode::Billboard);
-    emitter.set_blend_mode(BlendMode::Additive);
+    emitter.set_texture_mode(ps_soa::texture_mode::multi_channel);
+    emitter.set_render_mode(ps_soa::render_mode::billboard);
+    emitter.set_blend_mode(ps_soa::blend_mode::additive);
     emitter.set_loop(true);
     emitter.set_lifetime(std::chrono::duration<float>(lifetime));
     emitter.set_emission_lifetime(std::chrono::duration<float>(std::clamp(2.0f / safe_speed, 0.3f, 8.0f)));
@@ -2282,7 +2282,7 @@ auto create_login_character(rtti::context& ctx, const std::string& content_root)
             {
                 pbr->set_cull_type(cull_type::none);
                 pbr->set_alpha_blend(false);
-                pbr->set_alpha_test_value(0.0f);
+                pbr->set_alpha_mode(alpha_mode::opaque);
                 // Force-load the color map so the (freshly imported) armor texture is resident at render
                 // instead of sampling a white default. Buildings/foliage submit their textures the same way.
                 auto color_map = pbr->get_color_map();
@@ -2563,9 +2563,18 @@ auto create_login_building(rtti::context& ctx,
         material_instance->set_roughness(0.85f);
         material_instance->set_cull_type(cull_type::none);
         material_instance->set_alpha_blend(building.alpha_blend);
-        if(building.alpha_test)
+        if(building.alpha_blend)
         {
-            material_instance->set_alpha_test_value(0.5f);
+            material_instance->set_alpha_mode(alpha_mode::blend);
+        }
+        else if(building.alpha_test)
+        {
+            material_instance->set_alpha_mode(alpha_mode::mask);
+            material_instance->set_alpha_cutoff(0.5f);
+        }
+        else
+        {
+            material_instance->set_alpha_mode(alpha_mode::opaque);
         }
         if(slot_index < texture_handles.size() && texture_usable[slot_index])
         {
@@ -2720,9 +2729,18 @@ auto create_login_foliage(rtti::context& ctx,
         material_instance->set_cull_type(cull_type::none);
         material_instance->set_double_sided_normal_flip(true);
         material_instance->set_alpha_blend(foliage.alpha_blend);
-        if(foliage.alpha_test)
+        if(foliage.alpha_blend)
         {
-            material_instance->set_alpha_test_value(0.35f);
+            material_instance->set_alpha_mode(alpha_mode::blend);
+        }
+        else if(foliage.alpha_test)
+        {
+            material_instance->set_alpha_mode(alpha_mode::mask);
+            material_instance->set_alpha_cutoff(0.35f);
+        }
+        else
+        {
+            material_instance->set_alpha_mode(alpha_mode::opaque);
         }
         if(slot_index < texture_handles.size() && texture_usable[slot_index])
         {

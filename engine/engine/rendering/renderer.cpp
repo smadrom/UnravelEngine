@@ -3,7 +3,9 @@
 #include "../events.h"
 #include "spdlog/common.h"
 #include "gpu_program.h"
+#include <engine/engine.h>
 #include <engine/profiler/profiler.h>
+#include <engine/settings/boot_config.h>
 #include <engine/settings/settings.h>
 
 #include <base/assert.hpp>
@@ -13,7 +15,9 @@
 
 #include <logging/logging.h>
 
+#include <cstdio>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace unravel
@@ -116,6 +120,10 @@ renderer::renderer(rtti::context& ctx, cmd_line::parser& parser)
 
     parser.set_optional<std::string>("r", "renderer", "auto", "Select preferred renderer.");
     parser.set_optional<bool>("n", "novsync", false, "Disable vsync.");
+    parser.set_optional<std::string>("W",
+                                     "window",
+                                     "",
+                                     "Main window geometry as x,y,w,h[,maximized] (used across restarts).");
 }
 
 auto renderer::init(rtti::context& ctx, const cmd_line::parser& parser) -> bool
@@ -156,9 +164,106 @@ auto renderer::create_window_for_display(int index, const std::string& title, ui
     return render_window_;
 }
 
+auto renderer::create_window(const std::string& title,
+                             int32_t x,
+                             int32_t y,
+                             uint32_t width,
+                             uint32_t height,
+                             uint32_t flags) -> const std::unique_ptr<render_window>&
+{
+    os::window window(title, x, y, width, height, flags);
+    set_main_window(std::move(window));
+    return render_window_;
+}
+
 void renderer::set_main_window(os::window&& window)
 {
     render_window_ = std::make_unique<render_window>(std::move(window));
+}
+
+namespace
+{
+constexpr const char* WINDOW_GEOMETRY_PREFIX = "--window=";
+constexpr uint32_t MIN_WINDOW_DIMENSION = 64;
+
+void strip_window_geometry_arguments(std::vector<std::string>& arguments)
+{
+    std::vector<std::string> filtered;
+    filtered.reserve(arguments.size());
+    for(std::size_t i = 0; i < arguments.size(); ++i)
+    {
+        const std::string& argument = arguments[i];
+        if(argument.rfind(WINDOW_GEOMETRY_PREFIX, 0) == 0)
+        {
+            continue;
+        }
+        if(argument == "-W" || argument == "--window")
+        {
+            if(i + 1 < arguments.size())
+            {
+                ++i;
+            }
+            continue;
+        }
+        filtered.push_back(argument);
+    }
+    arguments = std::move(filtered);
+}
+} // namespace
+
+auto renderer::parse_window_geometry(const std::string& value,
+                                     int32_t& x,
+                                     int32_t& y,
+                                     uint32_t& width,
+                                     uint32_t& height,
+                                     bool& maximized) -> bool
+{
+    if(value.empty())
+    {
+        return false;
+    }
+    int parsed_x = 0;
+    int parsed_y = 0;
+    int parsed_w = 0;
+    int parsed_h = 0;
+    int parsed_maximized = 0;
+    const int field_count =
+        std::sscanf(value.c_str(), "%d,%d,%d,%d,%d", &parsed_x, &parsed_y, &parsed_w, &parsed_h, &parsed_maximized);
+    if(field_count != 4 && field_count != 5)
+    {
+        return false;
+    }
+    if(parsed_w < static_cast<int>(MIN_WINDOW_DIMENSION) || parsed_h < static_cast<int>(MIN_WINDOW_DIMENSION))
+    {
+        return false;
+    }
+    x = parsed_x;
+    y = parsed_y;
+    width = static_cast<uint32_t>(parsed_w);
+    height = static_cast<uint32_t>(parsed_h);
+    maximized = field_count == 5 && parsed_maximized != 0;
+    return true;
+}
+
+void renderer::prepare_restart(std::vector<std::string>& arguments)
+{
+    strip_window_geometry_arguments(arguments);
+    auto* main_window = get_main_window();
+    if(!main_window)
+    {
+        return;
+    }
+    auto& window = main_window->get_window();
+    const auto position = window.get_position();
+    const auto size = window.get_size();
+    if(size.w < MIN_WINDOW_DIMENSION || size.h < MIN_WINDOW_DIMENSION)
+    {
+        return;
+    }
+    const int maximized = window.is_maximized() ? 1 : 0;
+    arguments.emplace_back(std::string(WINDOW_GEOMETRY_PREFIX) + std::to_string(position.x) + "," +
+                           std::to_string(position.y) + "," + std::to_string(size.w) + "," +
+                           std::to_string(size.h) + "," + std::to_string(maximized));
 }
 
 auto renderer::deinit(rtti::context& ctx) -> bool
@@ -187,6 +292,10 @@ auto renderer::init_backend(const cmd_line::parser& parser) -> bool
         init_data.platformData.type = bgfx::NativeWindowHandleType::Wayland;
     }
     reset_flags_ = init_data.resolution.reset;
+
+    init_data.limits.numDrawCalls = 65536;
+    init_data.limits.numDrawCallPeakFrames = 0;
+
     if(!gfx::init(init_data))
     {
         APPLOG_ERROR("Could not initialize rendering backend!");
@@ -243,31 +352,17 @@ void renderer::on_os_event(rtti::context& ctx, os::event& e)
 
 auto renderer::get_renderer_type(const cmd_line::parser& parser) const -> gfx::renderer_type
 {
-    // auto detect
-    auto preferred_renderer_type = gfx::renderer_type::Count;
-
-    std::string preferred_renderer;
-    if(parser.try_get("renderer", preferred_renderer))
+    auto& ctx = engine::context();
+    if(ctx.has<boot_config>())
     {
-        if(preferred_renderer == "opengl")
-        {
-            preferred_renderer_type = gfx::renderer_type::OpenGL;
-        }
-        else if(preferred_renderer == "vulkan")
-        {
-            preferred_renderer_type = gfx::renderer_type::Vulkan;
-        }
-        else if(preferred_renderer == "directx11" || preferred_renderer == "direct3d11" || preferred_renderer == "dx11")
-        {
-            preferred_renderer_type = gfx::renderer_type::Direct3D11;
-        }
-        else if(preferred_renderer == "directx12" || preferred_renderer == "direct3d12" || preferred_renderer == "dx12")
-        {
-            preferred_renderer_type = gfx::renderer_type::Direct3D12;
-        }
+        return preferred_renderer_to_gfx_type(ctx.get<boot_config>().renderer);
     }
-
-    return preferred_renderer_type;
+    std::string preferred_renderer_arg;
+    if(parser.try_get("renderer", preferred_renderer_arg))
+    {
+        return preferred_renderer_to_gfx_type(preferred_renderer_from_string(preferred_renderer_arg));
+    }
+    return gfx::renderer_type::Count;
 }
 
 auto renderer::get_reset_flags(const cmd_line::parser& parser) const -> uint32_t
@@ -295,6 +390,7 @@ auto renderer::get_reset_flags(bool vsync) const -> uint32_t
 
 renderer::~renderer()
 {
+    gfx::frames(2, BGFX_FRAME_FLUSH);
     render_window_.reset();
 
     gfx::set_trace_logger(nullptr);
@@ -372,11 +468,11 @@ void renderer::frame_end(rtti::context& /*ctx*/, delta_t /*dt*/)
 
     gfx::frame();
 
-    // if(!request_screenshot_.empty())
-    // {
-    //     gfx::request_screen_shot(get_main_window()->get_surface()->native_handle(), request_screenshot_.c_str());
-    //     request_screenshot_ = {};
-    // }
+    if(!request_screenshot_.empty())
+    {
+        gfx::request_screen_shot(get_main_window()->get_surface()->native_handle(), request_screenshot_.c_str());
+        request_screenshot_ = {};
+    }
 
     gfx::render_pass::reset();
 }

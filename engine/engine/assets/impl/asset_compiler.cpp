@@ -40,12 +40,16 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cmath>
 #include <fstream>
+#include <dotnetpp/dotnetpp.h>
 #include <iterator>
-#include <monopp/mono_jit.h>
 #include <optional>
 #include <regex>
+#include <sstream>
+#include <hpp/string_view.hpp>
 #include <subprocess/subprocess.hpp>
+#include <string_utils/utils.h>
 
 #include <core/base/platform/config.hpp>
 
@@ -101,6 +105,135 @@ auto run_process(const std::string& process,
 
     return result.retcode == 0;
 }
+
+struct input_texture_info
+{
+    gfx::texture_format format{gfx::texture_format::RGBA8};
+    uint32_t width{};
+    uint32_t height{};
+    bool fits_max_size{true};
+};
+
+/// Lat-long HDRIs are authored at 2:1. Allow a small tolerance for odd sizes.
+constexpr float k_equirect_aspect_ratio = 2.0f;
+constexpr float k_equirect_aspect_tolerance = 0.05f;
+
+auto texture_size_to_pixel_limit(texture_importer_meta::texture_size size) -> uint32_t
+{
+    switch(size)
+    {
+        case texture_importer_meta::texture_size::size_32:
+            return 32;
+        case texture_importer_meta::texture_size::size_64:
+            return 64;
+        case texture_importer_meta::texture_size::size_128:
+            return 128;
+        case texture_importer_meta::texture_size::size_256:
+            return 256;
+        case texture_importer_meta::texture_size::size_512:
+            return 512;
+        case texture_importer_meta::texture_size::size_1024:
+            return 1024;
+        case texture_importer_meta::texture_size::size_2048:
+            return 2048;
+        case texture_importer_meta::texture_size::size_4096:
+            return 4096;
+        case texture_importer_meta::texture_size::size_8192:
+            return 8192;
+        case texture_importer_meta::texture_size::size_16384:
+            return 16384;
+        case texture_importer_meta::texture_size::project_default:
+        default:
+            return 0;
+    }
+}
+
+auto append_texture_max_size_args(std::vector<std::string>& args, texture_importer_meta::texture_size max_size) -> void
+{
+    const uint32_t limit = texture_size_to_pixel_limit(max_size);
+    if(limit > 0)
+    {
+        args.emplace_back("--max");
+        args.emplace_back(std::to_string(limit));
+    }
+}
+
+auto fill_input_texture_info_from_container(const bimg::ImageContainer& info, input_texture_info& out) -> void
+{
+    out.format = static_cast<gfx::texture_format>(info.m_format);
+    out.width = info.m_width;
+    out.height = info.m_height;
+}
+
+auto get_input_texture_info(const fs::path& input_path, texture_importer_meta::texture_size max_size) -> input_texture_info
+{
+    input_texture_info result{};
+    const bx::FilePath file_path(input_path.string().c_str());
+
+    bimg::ImageContainer header{};
+    if(imageParseInfo(file_path, header))
+    {
+        fill_input_texture_info_from_container(header, result);
+    }
+    else
+    {
+        bimg::ImageContainer* image = imageLoad(file_path, bgfx::TextureFormat::Count);
+        if(image == nullptr)
+        {
+            return result;
+        }
+
+        fill_input_texture_info_from_container(*image, result);
+        bimg::imageFree(image);
+    }
+
+    const uint32_t limit = texture_size_to_pixel_limit(max_size);
+    if(limit > 0)
+    {
+        const uint32_t largest_dimension = std::max(result.width, result.height);
+        result.fits_max_size = largest_dimension <= limit;
+    }
+
+    return result;
+}
+
+auto is_approximately_equirect_aspect(uint32_t width, uint32_t height) -> bool
+{
+    if(width == 0 || height == 0)
+    {
+        return false;
+    }
+    const float aspect = static_cast<float>(width) / static_cast<float>(height);
+    return std::fabs(aspect - k_equirect_aspect_ratio) <= k_equirect_aspect_tolerance;
+}
+
+/**
+ * @brief Builds default texture importer settings for a newly discovered source.
+ *
+ * Radiance HDR panoramas almost always feed sky/IBL cubemaps (Unreal-like), so
+ * `.hdr` defaults to equirect. EXR is also used for regular HDR maps, so only
+ * promote when the image is a ~2:1 lat-long panorama.
+ */
+auto create_default_texture_importer_meta(const fs::path& input_path) -> std::shared_ptr<texture_importer_meta>
+{
+    auto importer = std::make_shared<texture_importer_meta>();
+    const auto extension = string_utils::to_lower(input_path.extension().string());
+    if(extension == ".hdr")
+    {
+        importer->type = texture_importer_meta::texture_type::equirect;
+        return importer;
+    }
+    if(extension == ".exr")
+    {
+        const auto info = get_input_texture_info(input_path, texture_importer_meta::texture_size::project_default);
+        if(is_approximately_equirect_aspect(info.width, info.height))
+        {
+            importer->type = texture_importer_meta::texture_type::equirect;
+        }
+    }
+    return importer;
+}
+
 // auto run_process(const std::string& process, const std::vector<std::string>& args_array, bool check_retcode, std::string& err) -> bool
 // {
 //     auto now = std::chrono::high_resolution_clock::now();
@@ -409,27 +542,6 @@ auto wrap_ktx2_bc_as_dds(const fs::path& input_path, const fs::path& output_path
     return true;
 }
 
-auto get_input_texture_format(const fs::path& input_path) -> gfx::texture_format
-{
-    const bx::FilePath file_path(input_path.string().c_str());
-
-    bimg::ImageContainer info;
-    if(imageParseInfo(file_path, info))
-    {
-        return static_cast<gfx::texture_format>(info.m_format);
-    }
-
-    bimg::ImageContainer* image = imageLoad(file_path, bgfx::TextureFormat::Count);
-    if(image == nullptr)
-    {
-        return gfx::texture_format::RGBA8;
-    }
-
-    const auto format = static_cast<gfx::texture_format>(image->m_format);
-    bimg::imageFree(image);
-    return format;
-}
-
 auto select_compressed_format(gfx::texture_format input_format,
                               const fs::path& extension,
                               texture_importer_meta::compression_quality quality) -> gfx::texture_format
@@ -647,11 +759,25 @@ auto compile_texture_to_file(const fs::path& input_path,
         quality.max_size = texture_importer_meta::texture_size::size_2048;
     }
 
-    const auto input_format = get_input_texture_format(compile_input);
-    auto format = select_compressed_format(input_format, compile_input.extension(), quality.compression);
-    
-    if(input_format != format || is_ktx2_input)
+    const auto input_info = get_input_texture_info(compile_input, quality.max_size);
+    auto format = select_compressed_format(input_info.format, compile_input.extension(), quality.compression);
+
+    const bool needs_format_conversion = input_info.format != format;
+    const bool needs_downscale = !input_info.fits_max_size;
+    // Equirect must always run through texturec; a raw copy cannot produce a cubemap.
+    const bool needs_equirect_projection = importer.type == texture_importer_meta::texture_type::equirect;
+
+    if(needs_format_conversion || needs_downscale || is_ktx2_input || needs_equirect_projection)
     {
+        if(needs_downscale && !needs_format_conversion)
+        {
+            APPLOG_INFO("Downscaling {0} ({1}x{2}) to fit max size {3}",
+                        compile_input.filename().string(),
+                        input_info.width,
+                        input_info.height,
+                        texture_size_to_pixel_limit(quality.max_size));
+        }
+
         std::vector<std::string> args_array = {
             "-f",
             str_input,
@@ -661,7 +787,7 @@ auto compile_texture_to_file(const fs::path& input_path,
             "dds",
         };
         
-        if(try_compress && format != input_format)
+        if(try_compress)
         {
             args_array.emplace_back("-t");
             args_array.emplace_back(gfx::to_string(format));
@@ -673,7 +799,8 @@ auto compile_texture_to_file(const fs::path& input_path,
                 args_array.emplace_back("-q");
                 args_array.emplace_back("fastest");
             }
-            else if(quality.compression == texture_importer_meta::compression_quality::high_quality)
+            else if(needs_format_conversion
+                    && quality.compression == texture_importer_meta::compression_quality::high_quality)
             {
                 args_array.emplace_back("-q");
                 args_array.emplace_back("highest");
@@ -685,73 +812,7 @@ auto compile_texture_to_file(const fs::path& input_path,
             args_array.emplace_back("-m");
         }
 
-        switch(quality.max_size)
-        {
-            case texture_importer_meta::texture_size::project_default:
-            {
-                break;
-            }
-            case texture_importer_meta::texture_size::size_32:
-            {
-                args_array.emplace_back("--max");
-                args_array.emplace_back("32");
-                break;
-            }
-            case texture_importer_meta::texture_size::size_64:
-            {
-                args_array.emplace_back("--max");
-                args_array.emplace_back("64");
-                break;
-            }
-            case texture_importer_meta::texture_size::size_128:
-            {
-                args_array.emplace_back("--max");
-                args_array.emplace_back("128");
-                break;
-            }
-            case texture_importer_meta::texture_size::size_256:
-            {
-                args_array.emplace_back("--max");
-                args_array.emplace_back("256");
-                break;
-            }
-            case texture_importer_meta::texture_size::size_512:
-            {
-                args_array.emplace_back("--max");
-                args_array.emplace_back("512");
-                break;
-            }
-            case texture_importer_meta::texture_size::size_1024:
-            {
-                args_array.emplace_back("--max");
-                args_array.emplace_back("1024");
-                break;
-            }
-            case texture_importer_meta::texture_size::size_2048:
-            {
-                args_array.emplace_back("--max");
-                args_array.emplace_back("2048");
-                break;
-            }
-            case texture_importer_meta::texture_size::size_4096:
-            {
-                args_array.emplace_back("--max");
-                args_array.emplace_back("4096");
-                break;
-            }
-            case texture_importer_meta::texture_size::size_8192:
-            {
-                args_array.emplace_back("--max");
-                args_array.emplace_back("8192");
-                break;
-            }
-            case texture_importer_meta::texture_size::size_16384:
-            {
-                args_array.emplace_back("--max");
-                args_array.emplace_back("16384");
-                break;
-            }
-        }
+        append_texture_max_size_args(args_array, quality.max_size);
 
         switch(importer.type)
         {
@@ -856,6 +917,25 @@ auto compile_shader_to_file(const fs::path& input_path,
     bool fs = hpp::string_view(file).starts_with("fs_");
     bool cs = hpp::string_view(file).starts_with("cs_");
 
+    // Vertex/fragment shaders that reference compute-style read/write buffers
+    // (BUFFER_RO / BUFFER_RW / BUFFER_WO) need SSBO support, which requires a
+    // higher GLSL profile. Detect that up-front by scanning the shader source
+    // so the correct OpenGL profile is selected below.
+    bool needs_compute_buffers = false;
+    if(vs || fs)
+    {
+        std::ifstream shader_file(str_input);
+        if(shader_file.is_open())
+        {
+            std::stringstream buffer;
+            buffer << shader_file.rdbuf();
+            const std::string source = buffer.str();
+            needs_compute_buffers = source.find("BUFFER_RO(") != std::string::npos
+                                 || source.find("BUFFER_RW(") != std::string::npos
+                                 || source.find("BUFFER_WO(") != std::string::npos;
+        }
+    }
+
     if(renderer == gfx::renderer_type::Vulkan)
     {
         str_platform = "windows";
@@ -894,9 +974,15 @@ auto compile_shader_to_file(const fs::path& input_path,
         str_platform = "linux";
 
         if(vs || fs)
-            str_profile = "140";
+        {
+            // GLSL 4.30 is needed to expose SSBOs (compute-style buffers) in
+            // vertex/fragment stages. Otherwise stick with the more portable 1.40.
+            str_profile = needs_compute_buffers ? "430" : "140";
+        }
         else if(cs)
+        {
             str_profile = "430";
+        }
     }
     else if(renderer == gfx::renderer_type::Metal)
     {
@@ -1080,9 +1166,10 @@ auto read_importer<gfx::texture>(asset_manager& am, const fs::path& key) -> std:
     {
         if(!meta.importer)
         {
-            meta.importer = std::make_shared<texture_importer_meta>();
+            const fs::path input_path = resolve_input_file(key);
+            meta.importer = create_default_texture_importer_meta(input_path);
 
-            meta.uid = am.add_asset_info_for_path(resolve_input_file(key), meta, true);
+            meta.uid = am.add_asset_info_for_path(input_path, meta, true);
 
             fs::error_code err;
             asset_writer::atomic_write_file(absolute, [&](const fs::path& temp) -> void
@@ -1238,75 +1325,71 @@ auto compile<mesh>(asset_manager& am, const fs::path& key, const fs::path& outpu
     std::vector<animation_clip> animations;
     std::vector<importer::imported_material> materials;
     std::vector<importer::imported_texture> textures;
-
+    // load_mesh_data_from_file waits for multi-file companions (.gltf/.bin, .obj/.mtl)
+    // before Assimp runs, so incomplete copies cannot produce empty mesh buffers.
     if(!importer::load_mesh_data_from_file(am, absolute_path, *importer, data, animations, materials, textures))
     {
         APPLOG_ERROR("Failed compilation of {0}", str_input);
         return false;
     }
-    if(!data.vertex_data.empty())
+    // Never write a manifest / "successful" compile for an empty mesh. That happens when a
+    // multi-file source (.gltf + .bin) was observed before companions finished copying.
+    if(data.vertex_data.empty())
     {
-        // IMPORTANT:
-        // For skinned meshes, the skin binding step can duplicate vertices and rewrite triangle indices
-        // to ensure a consistent bone palette per submesh. LODs must be generated AFTER this rewrite,
-        // otherwise the stored LOD index buffers will reference the wrong vertices at runtime.
-        if(data.skin_data.has_bones())
+        APPLOG_ERROR("Failed compilation of {0}: imported mesh has no vertex data "
+                     "(source companions may still be incomplete)",
+                     str_input);
+        return false;
+    }
+    // IMPORTANT:
+    // For skinned meshes, the skin binding step can duplicate vertices and rewrite triangle indices
+    // to ensure a consistent bone palette per submesh. LODs must be generated AFTER this rewrite,
+    // otherwise the stored LOD index buffers will reference the wrong vertices at runtime.
+    if(data.skin_data.has_bones())
+    {
+        APP_SCOPE_PERF("Apply Skin to Load Data");
+        if(!mesh::apply_skin_to_load_data(data))
         {
-            APP_SCOPE_PERF("Apply Skin to Load Data");
-            if(!mesh::apply_skin_to_load_data(data))
-            {
-                APPLOG_ERROR("Failed to apply skinning data before generating LODs for {0}", str_input);
-                return false;
-            }
+            APPLOG_ERROR("Failed to apply skinning data before generating LODs for {0}", str_input);
+            return false;
         }
-
-        // Generate LODs offline during compilation (no GPU buffers created)
-        if(importer->model.generate_lods)
+    }
+    // Generate LODs offline during compilation (no GPU buffers created)
+    if(importer->model.generate_lods)
+    {
+        // Use custom LOD configs if provided, otherwise use defaults
+        auto lod_configs = mesh::generate_default_lod_configs(data, importer->model.lod_target_error);
+        if(!lod_configs.empty())
         {
-            // Use custom LOD configs if provided, otherwise use defaults
-            auto lod_configs = mesh::generate_default_lod_configs(data, importer->model.lod_target_error);
-            
-            
-            if(!lod_configs.empty())
-            {
-                APP_SCOPE_PERF("Generate LODs for Load Data");
-                mesh::generate_lods_for_load_data(data, lod_configs);
-            }
+            APP_SCOPE_PERF("Generate LODs for Load Data");
+            mesh::generate_lods_for_load_data(data, lod_configs);
         }
-        
-        // Save materials and register their UIDs before writing the mesh binary
-        data.default_material_uids.reserve(materials.size());
-
-        APPLOG_INFO("Adding default material UIDs for {0}", str_input);
-
-        for(const auto& material : materials)
+    }
+    // Save materials and register their UIDs before writing the mesh binary
+    data.default_material_uids.reserve(materials.size());
+    APPLOG_INFO("Adding default material UIDs for {0}", str_input);
+    for(const auto& material : materials)
+    {
+        fs::path mat_output;
+        if(material.name.empty())
         {
-            fs::path mat_output;
-
-            if(material.name.empty())
-            {
-                mat_output = (dir / file).string() + ".mat";
-            }
-            else
-            {
-                mat_output = dir / (material.name + ".mat");
-            }
-
-            auto uid = am.add_asset_for_path(mat_output, false);
-            data.default_material_uids.push_back(uid);
-
-            asset_writer::atomic_write_file(mat_output, [&](const fs::path& temp) -> void
-            {
-                save_to_file(temp.string(), material.mat);
-            }, err);
-
+            mat_output = (dir / file).string() + ".mat";
         }
-
-        asset_writer::atomic_write_file(output, [&](const fs::path& temp) -> void
+        else
         {
-            save_to_file_bin(temp.string(), data);
+            mat_output = dir / (material.name + ".mat");
+        }
+        auto uid = am.add_asset_for_path(mat_output, false);
+        data.default_material_uids.push_back(uid);
+        asset_writer::atomic_write_file(mat_output, [&](const fs::path& temp) -> void
+        {
+            save_to_file(temp.string(), material.mat);
         }, err);
     }
+    asset_writer::atomic_write_file(output, [&](const fs::path& temp) -> void
+    {
+        save_to_file_bin(temp.string(), data);
+    }, err);
 
     {
         APP_SCOPE_PERF("Write Animations");
@@ -1663,10 +1746,6 @@ auto compile<audio_clip>(asset_manager& am, const fs::path& key, const fs::path&
         {
             clip.convert_to_mono();
         }
-        else
-        {
-            clip.convert_to_stereo();
-        }
 
         asset_writer::atomic_write_file(output, [&](const fs::path& temp) -> void
         {
@@ -1697,59 +1776,51 @@ struct script_compilation_entry
     std::string msg{};  // Full error line
 };
 
-// Function to parse all compilation errors
-auto parse_compilation_errors(const std::string& log) -> std::vector<script_compilation_entry>
+/**
+ * Parse csc/dotnet diagnostics line-by-line.
+ * Avoid greedy .* over the full compiler log: that pattern triggers
+ * std::regex_error(error_complexity) on large outputs (MSVC STL).
+ * Expected line form: path(line,col): error|warning CS....: message
+ */
+auto parse_compilation_entries(const std::string& log, hpp::string_view severity)
+    -> std::vector<script_compilation_entry>
 {
-    // Regular expression to extract the warning details
-    std::regex warning_regex(R"((.*)\((\d+),\d+\): error .*)");
+    // Path cannot contain '(' or newlines; keeps matching linear.
+    const std::string pattern =
+        std::string(R"(^([^\n(]+)\((\d+),\d+\):\s*)") + std::string(severity) + R"(\b.*)";
+    const std::regex entry_regex(pattern, std::regex::ECMAScript | std::regex::optimize);
+
     std::vector<script_compilation_entry> entries;
-
-    // Use std::sregex_iterator to find all matches
-    auto begin = std::sregex_iterator(log.begin(), log.end(), warning_regex);
-    auto end = std::sregex_iterator();
-
-    for(auto it = begin; it != end; ++it)
+    std::istringstream stream(log);
+    std::string line;
+    while(std::getline(stream, line))
     {
-        const std::smatch& match = *it;
-        if(match.size() >= 3)
+        if(!line.empty() && line.back() == '\r')
         {
-            script_compilation_entry entry;
-            entry.file = match[1].str();            // Extract file path
-            entry.line = std::stoi(match[2].str()); // Extract line number
-            entry.msg = match[0].str();             // Extract full warning line
-            entries.emplace_back(std::move(entry));
+            line.pop_back();
         }
+        std::smatch match;
+        if(!std::regex_match(line, match, entry_regex) || match.size() < 3)
+        {
+            continue;
+        }
+        script_compilation_entry entry;
+        entry.file = match[1].str();
+        entry.line = std::stoi(match[2].str());
+        entry.msg = match[0].str();
+        entries.emplace_back(std::move(entry));
     }
-
     return entries;
 }
 
-// Function to parse all compilation warnings
+auto parse_compilation_errors(const std::string& log) -> std::vector<script_compilation_entry>
+{
+    return parse_compilation_entries(log, "error");
+}
+
 auto parse_compilation_warnings(const std::string& log) -> std::vector<script_compilation_entry>
 {
-    // Regular expression to extract the warning details
-    std::regex warning_regex(R"((.*)\((\d+),\d+\): error .*)");
-    std::vector<script_compilation_entry> entries;
-
-    // Use std::sregex_iterator to find all matches
-    auto begin = std::sregex_iterator(log.begin(), log.end(), warning_regex);
-    auto end = std::sregex_iterator();
-
-    for(auto it = begin; it != end; ++it)
-    {
-        const std::smatch& match = *it;
-        if(match.size() >= 3)
-        {
-            script_compilation_entry entry;
-            entry.file = match[1].str();            // Extract file path
-            entry.line = std::stoi(match[2].str()); // Extract line number
-            entry.msg = match[0].str();             // Extract full warning line
-            entries.emplace_back(std::move(entry));
-        }
-
-    }
-
-    return entries;
+    return parse_compilation_entries(log, "warning");
 }
 
 template<>
@@ -1759,7 +1830,7 @@ auto compile<script_library>(asset_manager& am, const fs::path& key, const fs::p
     fs::error_code err;
     fs::path temp = fs::temp_directory_path(err);
 
-    mono::compiler_params params;
+    dotnet::compiler_params params;
 
     auto protocol = fs::extract_protocol(fs::convert_to_protocol(key)).generic_string();
 
@@ -1797,6 +1868,11 @@ auto compile<script_library>(asset_manager& am, const fs::path& key, const fs::p
 
     params.output_name = str_output;
     params.output_doc_name = temp_xml.string();
+    // Project/app scripts: keep /doc for IntelliSense, skip doc/comment noise and
+    // CS0649 for fields assigned from the inspector/native rather than C#.
+    const bool is_app_scripts = (protocol != "engine");
+    params.suppress_doc_warnings = is_app_scripts;
+    params.suppress_unassigned_field_warnings = is_app_scripts;
     if(params.files.empty())
     {
         fs::remove(output, err);
@@ -1814,8 +1890,8 @@ auto compile<script_library>(asset_manager& am, const fs::path& key, const fs::p
     params.debug = flags & script_library::compilation_flags::debug;
 
     std::string error;
-    // auto cmd = mono::create_compile_command_detailed(params);
-    auto cmd = mono::create_compile_command_detailed_rsp(params, temp.string() + ".rsp");
+    // auto cmd = dotnet::create_compile_command_detailed(params);
+    auto cmd = dotnet::create_compile_command_detailed_rsp(params, temp.string() + ".rsp");
 
     // APPLOG_TRACE("Script Compile : \n {0} {1}", cmd.cmd, cmd.args);
 
@@ -1859,7 +1935,7 @@ auto compile<script_library>(asset_manager& am, const fs::path& key, const fs::p
             }
         }
 
-        // mono::compile_cmd aot_cmd;
+        // dotnet::compile_cmd aot_cmd;
         // aot_cmd.cmd = "mono";
         // aot_cmd.args.emplace_back("--aot=full");
         // aot_cmd.args.emplace_back(temp.string());
@@ -1867,6 +1943,14 @@ auto compile<script_library>(asset_manager& am, const fs::path& key, const fs::p
         // bool ok = run_process(aot_cmd.cmd, aot_cmd.args, true, error);
 
         //APPLOG_INFO("Successful compilation of {0}", fs::replace(output, "temp-", "").string());
+
+        // Part of script compilation: rewrite mono-style [InternalCall]
+        // externs with real bodies (coreclr backend; no-op on mono).
+        if(!dotnet::weave_assembly(str_output))
+        {
+            APPLOG_ERROR("Failed internal call weaving of {0}", output.string());
+            return false;
+        }
 
         script_system::copy_compiled_lib(temp, output);
     }

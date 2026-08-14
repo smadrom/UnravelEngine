@@ -305,7 +305,6 @@ void draw_scene_section()
                             "Includes geometry, lighting, shadow, and\n"
                             "post-processing passes.");
 
-    if(stats->numCompute > 0)
     {
         ImGui::BeginGroup();
         draw_label("  Compute Calls");
@@ -314,7 +313,6 @@ void draw_scene_section()
         ImGui::SetItemTooltipEx("Number of GPU compute shader dispatches.\n"
                                 "Used for GPGPU tasks.");
     }
-    if(stats->numBlit > 0)
     {
         ImGui::BeginGroup();
         draw_label("  Blit Calls");
@@ -568,13 +566,14 @@ void viewport_stats_overlay::draw_stats_toggle(state& overlay_state)
         label = fps_label_buf.data();
     }
 
-    auto label_size = ImGui::CalcTextSize(label).x;
+    const auto& style = ImGui::GetStyle();
+    const float item_width = ImGui::CalcTextSize(label).x + style.ItemSpacing.x*2;
 
     ImGui::SameLine();
 
     ImGui::AlignedItem(1.0f,
                        ImGui::GetContentRegionAvail().x,
-                       label_size,
+                       item_width,
                        [&]() -> void
                        {
                            bool is_visible = overlay_state.is_visible;

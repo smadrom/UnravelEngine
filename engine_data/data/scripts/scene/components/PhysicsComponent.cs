@@ -12,6 +12,9 @@ namespace Unravel.Core
     public class PhysicsComponent : Component
     {
     
+        /// <summary>
+        /// Layers that this body should collide with (include filter).
+        /// </summary>
         public LayerMask includeLayers
         {
             get
@@ -23,6 +26,9 @@ namespace Unravel.Core
                 internal_m2n_physics_set_include_layers(owner, value);
             }
         }
+        /// <summary>
+        /// Layers that this body should ignore (exclude filter).
+        /// </summary>
         public LayerMask excludeLayers
         {
             get
@@ -35,6 +41,9 @@ namespace Unravel.Core
             }
         }
 
+        /// <summary>
+        /// Effective collision layer mask after applying include and exclude filters.
+        /// </summary>
         public LayerMask collisionLayers
         {
             get
@@ -74,17 +83,17 @@ namespace Unravel.Core
         }
 
         /// <summary>
-        /// Whether this physics component is kinematic. Kinematic objects are moved by script and don't respond to forces.
+        /// Simulation role: Static (teleport + AABB), Kinematic (ECS-driven, pushes dynamics), or Dynamic.
         /// </summary>
-        public bool isKinematic
+        public RigidbodyType bodyType
         {
             get
             {
-                return internal_m2n_physics_get_is_kinematic(owner);
+                return internal_m2n_physics_get_body_type(owner);
             }
             set
             {
-                internal_m2n_physics_set_is_kinematic(owner, value);
+                internal_m2n_physics_set_body_type(owner, value);
             }
         }
 
@@ -225,10 +234,10 @@ namespace Unravel.Core
         private static extern void internal_m2n_physics_set_mass(Entity eid, float mass);
 
         [MethodImpl(MethodImplOptions.InternalCall)]
-        private static extern bool internal_m2n_physics_get_is_kinematic(Entity eid);
+        private static extern RigidbodyType internal_m2n_physics_get_body_type(Entity eid);
 
         [MethodImpl(MethodImplOptions.InternalCall)]
-        private static extern void internal_m2n_physics_set_is_kinematic(Entity eid, bool kinematic);
+        private static extern void internal_m2n_physics_set_body_type(Entity eid, RigidbodyType type);
 
         [MethodImpl(MethodImplOptions.InternalCall)]
         private static extern bool internal_m2n_physics_get_use_gravity(Entity eid);

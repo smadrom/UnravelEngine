@@ -496,6 +496,19 @@ void run_camera_focus_transition(entt::handle camera,
         target_position = target_center - adjusted_target_distance * dir;
     }
 
+    if(duration <= 0.0f)
+    {
+        trans_comp.set_position_global(target_position);
+        if(!keep_rotation)
+        {
+            trans_comp.look_at(target_center);
+        }
+        camera_comp.set_ortho_size(radius);
+        camera_comp.update(trans_comp.get_transform_global());
+        seq::scope::stop_all("camera_focus");
+        return;
+    }
+
     auto ease = seq::ease::smooth_stop;
     auto seq_duration = std::chrono::duration_cast<seq::duration_t>(std::chrono::duration<float>(duration));
 
@@ -1027,6 +1040,47 @@ auto defaults::create_audio_source_entity(rtti::context& ctx, scene& scn, const 
     return object;
 }
 
+auto defaults::parse_scene_preset(hpp::string_view value, scene_preset& out) -> bool
+{
+    if(value.empty() || value == "medium" || value == "standard" || value == "default")
+    {
+        out = scene_preset::medium;
+        return true;
+    }
+    if(value == "low")
+    {
+        out = scene_preset::low;
+        return true;
+    }
+    if(value == "high")
+    {
+        out = scene_preset::high;
+        return true;
+    }
+    if(value == "showcase")
+    {
+        out = scene_preset::showcase;
+        return true;
+    }
+    return false;
+}
+
+auto defaults::scene_preset_to_string(scene_preset preset) -> const char*
+{
+    switch(preset)
+    {
+        case scene_preset::low:
+            return "low";
+        case scene_preset::medium:
+            return "medium";
+        case scene_preset::high:
+            return "high";
+        case scene_preset::showcase:
+            return "showcase";
+    }
+    return "medium";
+}
+
 void defaults::create_default_3d_scene(rtti::context& ctx, scene& scn)
 {
     create_scene_from_preset(ctx, scn, scene_preset::medium);
@@ -1250,6 +1304,8 @@ auto defaults::create_default_3d_scene_for_asset_preview(rtti::context& ctx,
                                                          const usize32_t& size, bool focus_camera)
     -> asset_preview_result
 {
+    asset.get(true);
+
     auto camera = create_default_3d_scene_for_preview(ctx, scn, size);
 
     
@@ -1276,6 +1332,8 @@ auto defaults::create_default_3d_scene_for_asset_preview(rtti::context& ctx,
                                                          const usize32_t& size, bool focus_camera)
     -> asset_preview_result
 {
+    asset.get(true);
+
     auto camera = create_default_3d_scene_for_preview(ctx, scn, size);
 
     
@@ -1311,6 +1369,8 @@ auto defaults::create_default_3d_scene_for_asset_preview(rtti::context& ctx,
                                                          const usize32_t& size, bool focus_camera)
     -> asset_preview_result
 {
+    asset.get(true);
+
     auto camera = create_default_3d_scene_for_preview(ctx, scn, size);
 
     auto object = create_mesh_entity_at(ctx, scn, asset.id());

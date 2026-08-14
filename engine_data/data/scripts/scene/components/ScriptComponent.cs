@@ -6,10 +6,21 @@ using System.Reflection;
 namespace Unravel.Core
 {
 
+    /// <summary>
+    /// Records the source file path of a script class for editor and tooling use.
+    /// </summary>
     [AttributeUsage(AttributeTargets.Class, Inherited = false, AllowMultiple = false)]
     public sealed class ScriptSourceFileAttribute : Attribute
     {
+        /// <summary>
+        /// Absolute or compiler-provided path to the script source file.
+        /// </summary>
         public string Path { get; }
+
+        /// <summary>
+        /// Creates the attribute, capturing the caller source path by default.
+        /// </summary>
+        /// <param name="path">Source file path; filled by the compiler when omitted.</param>
         public ScriptSourceFileAttribute([CallerFilePath] string path = "") => Path = path;
     }
     /// <summary>
@@ -160,10 +171,12 @@ namespace Unravel.Core
 
         /// <summary>
         /// Internal method invoked when the script is destroyed. Calls <see cref="OnDestroy"/> and unsubscribes <see cref="OnUpdate"/> from the update system.
+        /// Also clears UI event subscriptions owned by this entity so callbacks cannot pin destroyed scripts.
         /// </summary>
         private void internal_n2m_on_destroy()
         {
             SystemManager.ScriptManager.Remove(this);
+            UIEventManager.UnsubscribeAllForOwner(owner);
             OnDestroy();
         }
 

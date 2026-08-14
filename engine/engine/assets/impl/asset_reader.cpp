@@ -15,6 +15,7 @@
 
 #include <engine/assets/asset_manager.h>
 #include <engine/assets/impl/asset_extensions.h>
+#include <engine/threading/main_thread_shared.h>
 #include <cstdint>
 #include <filesystem/filesystem.h>
 #include <filesystem/file_istream.h>
@@ -35,6 +36,46 @@ auto resolve_compiled_path(const std::string& key) -> fs::path
 {
     auto cache_key = resolve_compiled_key(key);
     return fs::absolute(fs::resolve_protocol(cache_key));
+}
+
+auto resolve_compiled_asset_path(const std::string& key, const std::string& source_extension) -> fs::path
+{
+    if(!fs::has_known_protocol(key))
+    {
+        return {};
+    }
+
+    std::string compiled_ext;
+    if(ex::is_format<gfx::shader>(source_extension))
+    {
+        compiled_ext = gfx::get_current_renderer_filename_extension();
+    }
+    else
+    {
+        bool known_source = false;
+        for(const auto& formats : ex::get_all_formats())
+        {
+            for(const auto& format : formats)
+            {
+                if(format == source_extension)
+                {
+                    known_source = true;
+                    break;
+                }
+            }
+            if(known_source)
+            {
+                break;
+            }
+        }
+
+        if(!known_source)
+        {
+            return {};
+        }
+    }
+
+    return fs::path(resolve_compiled_path(key).string() + compiled_ext);
 }
 
 auto resolve_path(const std::string& key) -> fs::path
@@ -240,10 +281,13 @@ auto load_from_file<audio_clip>(tpp::thread_pool& pool, asset_handle<audio_clip>
             audio::sound_data data;
             load_from_file_bin(path, data);
 
+            // Create + destroy on main: OpenAL buffers are context-thread affine.
+            // Creation already hops here; main_thread_deleter covers reload/demote
+            // when the old shared_ptr is dropped on a watcher/worker thread.
             auto create_job = tpp::async(tpp::main_thread::get_id(),
                                          [data = std::move(data)]() mutable
                                          {
-                                             return std::make_shared<audio_clip>(std::move(data), false);
+                                             return make_shared_main_thread<audio_clip>(std::move(data), false);
                                          });
 
             return create_job.get();
@@ -260,7 +304,7 @@ auto load_from_file<font>(tpp::thread_pool& pool, asset_handle<font>& output,
             auto create_job = tpp::async(tpp::main_thread::get_id(),
                                          [path]()
                                          {
-                                             return std::make_shared<font>(path.c_str(), 0, 86,
+                                             return make_shared_main_thread<font>(path.c_str(), 0, 86,
                                                  FONT_TYPE_DISTANCE_OUTLINE_DROP_SHADOW_IMAGE, 8, 8);
                                          });
 

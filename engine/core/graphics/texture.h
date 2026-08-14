@@ -98,16 +98,40 @@ struct texture : public handle_impl<texture, texture_handle>
     //-----------------------------------------------------------------------------
     auto is_render_target() const -> bool;
 
+    //-----------------------------------------------------------------------------
+    //  Name : is_gpu_generated ()
+    /// <summary>
     /// Whether the texture's contents are produced on the GPU (render target or compute-write) rather
     /// than uploaded from CPU memory. Such textures have no CPU backing to restore from, so eviction
-    /// can only recreate them as empty storage. Distinct from @ref is_render_target, which is used for
-    /// render-target-specific behaviour (e.g. ImGui origin flip) and must stay RT-only.
+    /// can only recreate them as empty storage.
+    /// </summary>
+    //-----------------------------------------------------------------------------
     auto is_gpu_generated() const -> bool;
+
+    //-----------------------------------------------------------------------------
+    //  Name : fallback_handle ()
+    /// <summary>
+    ///
+    ///
+    ///
+    /// </summary>
+    //-----------------------------------------------------------------------------
+    auto fallback_handle() const -> texture_handle;
+
+
+    auto get_estimated_gpu_size() const -> std::uint64_t;
 
     /// Texture detail info.
     texture_info info{};
     /// Creation flags.
     std::uint64_t flags = BGFX_TEXTURE_NONE;
+
+private:
+    void adopt_loaded_eviction(eviction::backing_buffer backing,
+                               std::uint64_t estimated_size,
+                               std::uint64_t load_flags,
+                               std::uint8_t skip,
+                               const char* label);
 };
 
 

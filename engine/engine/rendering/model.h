@@ -8,6 +8,8 @@
 #include "gpu_program.h"
 #include "material.h"
 #include "mesh.h"
+#include "render_proxy.h"
+#include "batch_collector.h"
 
 #include <hpp/small_vector.hpp>
 
@@ -21,8 +23,6 @@
 
 namespace unravel
 {
-
-class batch_collector;
 
 /**
  * @struct lod_data
@@ -69,6 +69,7 @@ struct submesh_pose_mat4
     {
         uint32_t index{};
         bool active{};
+        bool casts_shadow{true};
     };
     hpp::small_vector<hpp::small_vector<transform_index>> submesh_to_transform_indices;
     
@@ -101,29 +102,43 @@ struct submesh_pose_mat4
     auto add_transform(const SubmeshIndices& submesh_indices, const math::mat4& transform, bool active) -> uint32_t
     {
         // Add the transform to the pool
-        uint32_t trans_index = static_cast<uint32_t>(transforms.size());
-        transforms.emplace_back(transform);
-        
-        // Find the maximum submesh index to ensure we have enough space
-        uint32_t max_submesh_index = 0;
-        for(uint32_t submesh_index : submesh_indices)
-        {
-            max_submesh_index = std::max(max_submesh_index, submesh_index);
-        }
-        
-        // Resize if needed
-        if(max_submesh_index >= submesh_to_transform_indices.size())
-        {
-            submesh_to_transform_indices.resize(max_submesh_index + 1);
-        }
-        
+        uint32_t trans_index = add_transform(transform);
+
         // Map all submesh indices to this transform
         for(uint32_t submesh_index : submesh_indices)
         {
-            submesh_to_transform_indices[submesh_index].emplace_back(transform_index{trans_index, active});
+            map_submesh(submesh_index, trans_index, active, true);
         }
         
         return trans_index;
+    }
+
+    /**
+     * @brief Adds a transform to the shared pool without mapping any submesh to it.
+     * @param transform The transform to add.
+     * @return The index of the transform in the transforms array.
+     */
+    auto add_transform(const math::mat4& transform) -> uint32_t
+    {
+        uint32_t trans_index = static_cast<uint32_t>(transforms.size());
+        transforms.emplace_back(transform);
+        return trans_index;
+    }
+
+    /**
+     * @brief Maps a single submesh index to a pooled transform with per-instance flags.
+     * @param submesh_index The submesh index to map.
+     * @param trans_index Index of the transform in the pool (see add_transform).
+     * @param active Whether this instance is rendered at all.
+     * @param casts_shadow Whether this instance is rendered into shadow passes.
+     */
+    void map_submesh(uint32_t submesh_index, uint32_t trans_index, bool active, bool casts_shadow)
+    {
+        if(submesh_index >= submesh_to_transform_indices.size())
+        {
+            submesh_to_transform_indices.resize(submesh_index + 1);
+        }
+        submesh_to_transform_indices[submesh_index].emplace_back(transform_index{trans_index, active, casts_shadow});
     }
     
     /**
@@ -192,6 +207,25 @@ struct submesh_pose_mat4
         }
         return false;
     }
+
+    /**
+     * @brief Checks if an instance casts shadows.
+     * @param submesh_index The index of the submesh.
+     * @param instance_index The instance index (0 to get_transform_count()-1).
+     * @return True if the instance casts shadows, false otherwise.
+     */
+    auto get_transform_casts_shadow(uint32_t submesh_index, size_t instance_index) const -> bool
+    {
+        if(submesh_index < submesh_to_transform_indices.size())
+        {
+            const auto& indices = submesh_to_transform_indices[submesh_index];
+            if(instance_index < indices.size())
+            {
+                return indices[instance_index].casts_shadow;
+            }
+        }
+        return true;
+    }
 };
 
 struct pose_mat4
@@ -208,6 +242,30 @@ struct pose_transform
      * @brief Vector of bone transforms.
      */
     std::vector<math::transform> transforms;
+};
+
+/**
+ * @struct model_submit_extras
+ * @brief Optional retained render data consumed by the model submit paths.
+ *
+ * All members are optional; default-constructed extras reproduce the legacy behavior.
+ */
+struct model_submit_extras
+{
+    /// Cached world-space per-submesh bounds (owned by model_component and refreshed with the
+    /// pose data). When available, per-submesh frustum culling and per-submesh LOD selection
+    /// use cheap AABB tests against these bounds - including skinned submeshes, whose bounds
+    /// track the animated pose. Submeshes without cached bounds fall back to the legacy
+    /// OBB classification (large meshes) or are conservatively drawn.
+    const submesh_render_proxies* proxies{nullptr};
+
+    /// Per-submesh material overrides indexed by submesh index. Null entries use the model
+    /// material for the submesh's data group.
+    const std::vector<material::sptr>* material_overrides{nullptr};
+
+    /// True when submitting into a shadow pass. Instances flagged as not casting shadows
+    /// (see submesh_pose_mat4::transform_index::casts_shadow) are skipped.
+    bool shadow_pass{false};
 };
 /**
  * @class model
@@ -356,15 +414,86 @@ public:
      * @brief Calculates the LOD data for the model using distance-based hysteresis with time-based transitions.
      * Hysteresis prevents rapid LOD switching; transitions smooth the actual switch when it occurs.
      * Uses data.current_lod_index for hysteresis and updates target_lod_index when a switch is triggered.
+     *
+     * Screen size is measured from the pose-aware world bounds (the same box culling uses -
+     * see model_component::get_world_bounds), so animated/root-motion models select LOD from
+     * where their geometry actually is, not from the bind-pose box at the entity transform.
+     *
      * @param data The LOD data to calculate and update.
-     * @param world_transform The world transform of the model.
+     * @param world_bounds Pose-aware world-space bounds of the model.
      * @param cam The camera.
      * @param dt Delta time for updating transition progress.
-     * @return True if the LOD data was calculated successfully, false otherwise.
+     * @return True if the LOD data was calculated successfully, false when the model is not
+     *         loaded, has unpopulated bounds, or is below the minimum screen size (culled).
      */
-    auto calculate_lod_data(lod_data& data, const math::transform& world_transform, const camera& cam, float dt) const -> bool;
+    auto calculate_lod_data(lod_data& data, const math::bbox& world_bounds, const camera& cam, float dt) const -> bool;
 
- 
+    /**
+     * @brief Selects a LOD for a specific submesh based on its own screen size.
+     *
+     * Used at submit time when per-submesh culling is active (multi-submesh meshes)
+     * and a view camera is available. Each submesh independently picks its LOD from its world-
+     * space bounding sphere so tiny/distant submeshes on a large model can drop to a cheaper
+     * LOD than the model-wide selection would.
+     *
+     * The returned LOD is CLAMPED to be at least @p base_lod: per-submesh selection is only
+     * allowed to drop quality relative to the model-wide LOD, never raise it. This preserves
+     * the guarantee made by @ref calculate_lod_data (with its hysteresis and dithered
+     * transitions) that the model-wide LOD is a quality floor.
+     *
+     * Returns @p base_lod (i.e. "no change") when per-submesh LOD is not viable:
+     *   - The model uses manual multi-mesh LODs (submesh identity is not comparable across
+     *     different mesh assets).
+     *   - No screen-size table is populated, or the model has only one LOD.
+     *   - LOD override is enabled.
+     *   - The submesh has no populated per-submesh bbox (indistinguishable from the whole model).
+     *
+     * Must run on the graphics API thread.
+     *
+     * @param m The mesh asset (must be the same one returned by @ref get_lod for @p base_lod).
+     * @param submesh_index Index into @p m's submesh array at @p base_lod.
+     * @param base_lod Model-wide LOD (floor for the returned value).
+     * @param world_matrix World transform for this submesh instance.
+     * @param cam Camera whose position/projection drives the screen-size computation.
+     */
+    auto calculate_submesh_lod(const mesh& m,
+                               uint32_t submesh_index,
+                               uint32_t base_lod,
+                               const math::mat4& world_matrix,
+                               const camera& cam) const -> uint32_t;
+
+    /**
+     * @brief Selects a LOD for a submesh from an already-known world-space AABB.
+     *
+     * Same semantics and guards as @ref calculate_submesh_lod but skips the per-call
+     * world matrix decomposition by using cached world bounds (see @ref
+     * submesh_render_proxies). Also usable for skinned submeshes whose animated
+     * bounds are tracked per frame.
+     */
+    auto calculate_submesh_lod_from_world_bounds(const mesh& m,
+                                                 uint32_t submesh_index,
+                                                 uint32_t base_lod,
+                                                 const math::bbox& world_bounds,
+                                                 const camera& cam) const -> uint32_t;
+
+    /**
+     * @brief Computes a LOD index for this model without hysteresis, transitions or
+     * visibility culling.
+     *
+     * Used by passes that need a distance-appropriate LOD but do not track per-camera
+     * LOD state (e.g. shadow rendering, which previously always used LOD 0).
+     *
+     * @param world_bounds Pose-aware world-space bounds of the model (see
+     *                     model_component::get_world_bounds).
+     * @param cam Camera whose position drives the screen-size computation.
+     * @param extra_bias Additional LOD bias on top of the model's own selection bias
+     *                   (positive = coarser).
+     * @return The selected LOD index (0 when no LOD table is available).
+     */
+    auto compute_lod_index(const math::bbox& world_bounds, const camera& cam, float extra_bias = 0.0f) const
+        -> uint32_t;
+
+
     /**
      * @brief Gets the minimum screen size used by the screen-radius-squared LOD and culling method.
      * @return Minimum screen size.
@@ -444,6 +573,10 @@ public:
      * @param lod The level of detail to render.
      * @param callbacks The submit callbacks.
      * @param frustum Optional view frustum for per-submesh culling on large meshes.
+     * @param view Optional camera enabling per-submesh LOD selection. When supplied together
+     *             with @p frustum and the mesh has enough submeshes to warrant per-submesh
+     *             work, distant submeshes may pick a cheaper LOD than @p lod via
+     *             @ref calculate_submesh_lod. Only affects non-skinned submeshes.
      */
     void submit(const math::mat4& world_transform,
                 const submesh_pose_mat4& submesh_transforms,
@@ -451,7 +584,84 @@ public:
                 const std::vector<pose_mat4>& skinning_transforms,
                 unsigned int lod,
                 const submit_callbacks& callbacks,
-                const math::frustum* frustum = nullptr) const;
+                const math::frustum* frustum = nullptr,
+                const camera* view = nullptr,
+                const model_submit_extras& extras = {}) const;
+
+    /**
+     * @struct submit_vertex_pulling_callbacks
+     * @brief Callbacks for submitting the model using vertex-pulling rendering.
+     *
+     * Vertex-pulling rendering procedurally generates vertices in the vertex shader
+     * from @c gl_VertexID and reads per-vertex data (positions, bone indices, bone
+     * weights, ...) directly from the vertex buffer bound as a read-only compute
+     * buffer. Before each per-submesh callback the model has already:
+     *   - Set @c u_world via @c gfx::set_world_transform() with either the per-
+     *     submesh non-skinned matrix or the per-submesh bone matrices.
+     *   - Bound the mesh's hardware vertex buffer on compute stage @c 0 and its
+     *     hardware index buffer on compute stage @c 1 (both read-only).
+     * The callback is expected to set the shader program, any additional uniforms,
+     * render state, call @c gfx::set_vertex_count(...) with the effect-specific
+     * vertex multiplier, and finally @c gfx::submit(...) on the desired view.
+     */
+    struct submit_vertex_pulling_callbacks
+    {
+        /**
+         * @struct params
+         * @brief Per-invocation information for a vertex-pulling submesh submit.
+         *
+         * Attribute offsets and vertex stride are expressed in @c sizeof(float)
+         * elements because the vertex buffer is exposed to shaders as a
+         * @c Buffer<float>. Bone indices/weights offsets are only meaningful when
+         * @c skinned is @c true; the caller should ignore them otherwise.
+         */
+        struct params
+        {
+            bool skinned{};                    ///< True during the skinned pass, false during non-skinned.
+            bool preserve_state{};             ///< Hint: mirror @c submit_callbacks::params::preserve_state.
+            uint32_t submesh_index{};          ///< Submesh index within the LOD mesh.
+            uint32_t index_start{};            ///< Starting index of the submesh in the index buffer (in indices).
+            uint32_t index_count{};            ///< Number of indices making up the submesh.
+            uint32_t vertex_stride_floats{};   ///< Vertex stride expressed in float-sized elements.
+            uint32_t position_offset_floats{}; ///< Byte offset of the position attribute converted to floats.
+            uint32_t weight_offset_floats{};   ///< Byte offset of the bone weight attribute converted to floats.
+            uint32_t indices_offset_floats{};  ///< Byte offset of the bone indices attribute converted to floats.
+        };
+
+        /// Called once per pass (once for non-skinned, once for skinned). Typically used to bind the program.
+        std::function<void(const params& info)> setup_begin;
+        /// Called once per pass after @c setup_begin. Typically used to set instance-level uniforms.
+        std::function<void(const params& info)> setup_params_per_instance;
+        /// Called once per submesh instance after u_world and the raw VB/IB have been bound.
+        std::function<void(const params& info)> setup_params_per_submesh;
+        /// Called once per pass at the end. Typically used to end the program.
+        std::function<void(const params& info)> setup_end;
+    };
+
+    /**
+     * @brief Submits the model using vertex-pulling rendering.
+     *
+     * Mirrors @ref submit but skips per-submesh material handling and bind_render_buffers
+     * calls, and instead exposes the raw vertex/index buffers as read-only compute
+     * buffers so the shader can procedurally generate vertices from @c gl_VertexID.
+     *
+     * @param world_transform The world transform of the model.
+     * @param submesh_transforms The submesh transforms (many-to-many mapping).
+     * @param skinning_transforms The per-submesh skinning matrices.
+     * @param lod The level of detail to render.
+     * @param callbacks The vertex-pulling submit callbacks.
+     * @param frustum Optional view frustum for per-submesh culling on large meshes.
+     * @param view Optional camera enabling per-submesh LOD selection. Same semantics as
+     *             @ref submit.
+     */
+    void submit_for_vertex_pulling(const math::mat4& world_transform,
+                                   const submesh_pose_mat4& submesh_transforms,
+                                   const std::vector<pose_mat4>& skinning_transforms,
+                                   unsigned int lod,
+                                   const submit_vertex_pulling_callbacks& callbacks,
+                                   const math::frustum* frustum = nullptr,
+                                   const camera* view = nullptr,
+                                   const model_submit_extras& extras = {}) const;
 
     /**
      * @brief Collects this model into a batch collector for instanced rendering.
@@ -461,40 +671,35 @@ public:
      * @param lod_index The level of detail to use.
      * @param lod_param The LOD transition parameter (for smooth LOD transitions).
      * @param frustum Optional view frustum for per-submesh culling on large meshes.
+     * @param view Optional camera enabling per-submesh LOD selection. When supplied and the
+     *             mesh has many submeshes, each submesh may be collected under a batch key
+     *             with a per-submesh LOD >= @p lod_index. The batching layer already keys on
+     *             LOD, so mixed-LOD submeshes for the same model land in the correct batches
+     *             automatically.
      */
     void submit_for_batching(batch_collector& collector,
                             const math::mat4& world_transform,
                             const submesh_pose_mat4& submesh_transforms,
                             uint32_t lod_index,
                             float lod_param = 0.0f,
-                            const math::frustum* frustum = nullptr) const;
+                            const math::frustum* frustum = nullptr,
+                            const camera* view = nullptr,
+                            const model_submit_extras& extras = {}) const;
+
 
     /**
-     * @brief Collects this model into per-cascade batch collectors with per-submesh culling.
-     *
-     * Each visible submesh is collected into every cascade whose frustum it overlaps.
-     * When @p nested_cascades is true (CSM directional lights, where cascades are nested
-     * by distance), a submesh that is classified as fully inside a nearer cascade is not
-     * collected into the farther (larger) cascades, mirroring the model-level optimization.
-     *
-     * @param collectors One batch collector per cascade/view (must contain at least @p cascade_count entries).
-     * @param cascade_count Number of cascades/views to consider.
-     * @param world_transform The world transform of the model.
-     * @param submesh_transforms The submesh transforms (many-to-many mapping).
-     * @param lod_index The level of detail to use.
-     * @param lod_param The LOD transition parameter (for smooth LOD transitions).
-     * @param frustums Array of per-cascade frustums (must contain at least @p cascade_count entries).
-     * @param nested_cascades Whether cascades are nested by distance (stop at first fully-inside cascade).
-     * @return True if at least one submesh instance was collected into any cascade.
+     * @brief Collects shadow-map geometry into per-cascade shadow batch collectors.
+     * Batches by mesh/lod/submesh/cull and alpha-cutout state instead of material pointer.
      */
-    auto submit_for_batching_cascaded(std::vector<batch_collector>& collectors,
-                                      uint8_t cascade_count,
-                                      const math::mat4& world_transform,
-                                      const submesh_pose_mat4& submesh_transforms,
-                                      uint32_t lod_index,
-                                      float lod_param,
-                                      const math::frustum* frustums,
-                                      bool nested_cascades) const -> bool;
+    auto submit_for_shadow_batching_cascaded(std::vector<shadow_batch_collector>& collectors,
+                                             uint8_t cascade_count,
+                                             const math::mat4& world_transform,
+                                             const submesh_pose_mat4& submesh_transforms,
+                                             uint32_t lod_index,
+                                             float lod_param,
+                                             const math::frustum* frustums,
+                                             bool nested_cascades,
+                                             const model_submit_extras& extras = {}) const -> bool;
 
     /**
      * @brief Gets the default material.
@@ -515,6 +720,17 @@ private:
      * @param mesh The mesh to use for resizing the materials.
      */
     void resize_materials(const asset_handle<mesh>& mesh);
+
+    /**
+     * @brief Shared core of the per-submesh LOD selection working on a world-space sphere.
+     * Applies all viability guards (single-mesh internal LODs, screen size table, override)
+     * and picks the coarsest LOD >= base_lod that still fits the projected size.
+     */
+    auto select_submesh_lod_for_sphere(const mesh& m,
+                                       uint32_t submesh_index,
+                                       uint32_t base_lod,
+                                       const math::bsphere& world_sphere,
+                                       const camera& cam) const -> uint32_t;
 
     /// Collection of all materials for this model.
     std::vector<asset_handle<material>> materials_;

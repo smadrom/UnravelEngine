@@ -17,73 +17,73 @@ REFLECT(particle_emitter_component)
 {
     // Register EmitterShape enum
 
-    entt::meta_factory<EmitterShape::Enum>{}
+    entt::meta_factory<ps_soa::emitter_shape>{}
         .type("EmitterShape"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "EmitterShape"},
             entt::attribute{"pretty_name", "Emitter Shape"},
         })
-        .data<EmitterShape::Sphere>("Sphere"_hs)
+        .data<ps_soa::emitter_shape::sphere>("Sphere"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "Sphere"},
             entt::attribute{"pretty_name", "Sphere"},
         })
-        .data<EmitterShape::Hemisphere>("Hemisphere"_hs)
+        .data<ps_soa::emitter_shape::hemisphere>("Hemisphere"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "Hemisphere"},
             entt::attribute{"pretty_name", "Hemisphere"},
         })
-        .data<EmitterShape::Circle>("Circle"_hs)
+        .data<ps_soa::emitter_shape::circle>("Circle"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "Circle"},
             entt::attribute{"pretty_name", "Circle"},
         })
-        .data<EmitterShape::Box>("Box"_hs)
+        .data<ps_soa::emitter_shape::box>("Box"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "Box"},
             entt::attribute{"pretty_name", "Box"},
         })
-        .data<EmitterShape::Rect>("Rect"_hs)
+        .data<ps_soa::emitter_shape::rect>("Rect"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "Rect"},
             entt::attribute{"pretty_name", "Rectangle"},
         });
 
 
-    entt::meta_factory<EmitterDirection::Enum>{}
+    entt::meta_factory<ps_soa::emitter_direction>{}
         .type("EmitterDirection"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "EmitterDirection"},
             entt::attribute{"pretty_name", "Emitter Direction"},
         })
-        .data<EmitterDirection::Up>("Up"_hs)
+        .data<ps_soa::emitter_direction::up>("Up"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "Up"},
             entt::attribute{"pretty_name", "Up"},
         })
-        .data<EmitterDirection::Outward>("Outward"_hs)
+        .data<ps_soa::emitter_direction::outward>("Outward"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "Outward"},
             entt::attribute{"pretty_name", "Outward"},
         })
-        .data<EmitterDirection::Inward>("Inward"_hs)
+        .data<ps_soa::emitter_direction::inward>("Inward"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "Inward"},
             entt::attribute{"pretty_name", "Inward"},
         });
 
-    entt::meta_factory<EmitterSpawnLocation::Enum>{}
+    entt::meta_factory<ps_soa::spawn_location>{}
         .type("EmitterSpawnLocation"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "EmitterSpawnLocation"},
             entt::attribute{"pretty_name", "Emitter Spawn Location"},
         })
-        .data<EmitterSpawnLocation::Inside>("Inside"_hs)
+        .data<ps_soa::spawn_location::inside>("Inside"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "Inside"},
             entt::attribute{"pretty_name", "Inside"},
         })
-        .data<EmitterSpawnLocation::Surface>("Surface"_hs)
+        .data<ps_soa::spawn_location::surface>("Surface"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "Surface"},
             entt::attribute{"pretty_name", "Surface"},
@@ -216,82 +216,116 @@ REFLECT(particle_emitter_component)
             entt::attribute{"pretty_name", "In-Out Bounce"},
         });
 
-    entt::meta_factory<SimulationSpace::Enum>{}
+    entt::meta_factory<ps_soa::simulation_space>{}
         .type("SimulationSpace"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "SimulationSpace"},
             entt::attribute{"pretty_name", "Simulation Space"},
         })
-        .data<SimulationSpace::World>("World"_hs)
+        .data<ps_soa::simulation_space::world>("World"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "World"},
             entt::attribute{"pretty_name", "World"},
         })
-        .data<SimulationSpace::Local>("Local"_hs)
+        .data<ps_soa::simulation_space::local>("Local"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "Local"},
             entt::attribute{"pretty_name", "Local"},
         });
 
-    entt::meta_factory<TextureMode::Enum>{}
+    entt::meta_factory<ps_soa::texture_mode>{}
         .type("TextureMode"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "TextureMode"},
             entt::attribute{"pretty_name", "Texture Mode"},
         })
-        .data<TextureMode::MultiChannel>("MultiChannel"_hs)
+        .data<ps_soa::texture_mode::multi_channel>("MultiChannel"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "MultiChannel"},
             entt::attribute{"pretty_name", "Multi Channel"},
         })
-        .data<TextureMode::Mask>("Mask"_hs)
+        .data<ps_soa::texture_mode::mask>("Mask"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "Mask"},
             entt::attribute{"pretty_name", "Mask"},
         });
 
-    entt::meta_factory<RenderMode::Enum>{}
+    entt::meta_factory<ps_soa::render_mode>{}
         .type("RenderMode"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "RenderMode"},
             entt::attribute{"pretty_name", "Render Mode"},
         })
-        .data<RenderMode::Billboard>("Billboard"_hs)
+        .data<ps_soa::render_mode::billboard>("Billboard"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "Billboard"},
             entt::attribute{"pretty_name", "Billboard"},
         })
-        .data<RenderMode::HorizontalBillboard>("HorizontalBillboard"_hs)
+        .data<ps_soa::render_mode::horizontal_billboard>("HorizontalBillboard"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "HorizontalBillboard"},
             entt::attribute{"pretty_name", "Horizontal Billboard"},
         })
-        .data<RenderMode::VerticalBillboard>("VerticalBillboard"_hs)
+        .data<ps_soa::render_mode::vertical_billboard>("VerticalBillboard"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "VerticalBillboard"},
             entt::attribute{"pretty_name", "Vertical Billboard"},
         });
 
-    entt::meta_factory<BlendMode::Enum>{}
+    entt::meta_factory<ps_soa::blend_mode>{}
         .type("BlendMode"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "BlendMode"},
             entt::attribute{"pretty_name", "Blend Mode"},
         })
-        .data<BlendMode::Normal>("Normal"_hs)
+        .data<ps_soa::blend_mode::normal>("Normal"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "Normal"},
             entt::attribute{"pretty_name", "Normal"},
         })
-        .data<BlendMode::Additive>("Additive"_hs)
+        .data<ps_soa::blend_mode::additive>("Additive"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "Additive"},
             entt::attribute{"pretty_name", "Additive"},
         })
-        .data<BlendMode::Multiply>("Multiply"_hs)
+        .data<ps_soa::blend_mode::multiply>("Multiply"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "Multiply"},
             entt::attribute{"pretty_name", "Multiply"},
+        });
+
+    entt::meta_factory<ps_soa::particle_sim_backend>{}
+        .type("ParticleSimBackend"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "ParticleSimBackend"},
+            entt::attribute{"pretty_name", "Particle Sim Backend"},
+        })
+        .data<ps_soa::particle_sim_backend::cpu>("CPU"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "CPU"},
+            entt::attribute{"pretty_name", "CPU"},
+        })
+        .data<ps_soa::particle_sim_backend::gpu>("GPU"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "GPU"},
+            entt::attribute{"pretty_name", "GPU"},
+        });
+
+    entt::meta_factory<particle_emitter_component::culling_mode>{}
+        .type("ParticleCullingMode"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "ParticleCullingMode"},
+            entt::attribute{"pretty_name", "Particle Culling Mode"},
+        })
+        .data<particle_emitter_component::culling_mode::always_simulate>("always_simulate"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "always_simulate"},
+            entt::attribute{"pretty_name", "Always Simulate"},
+        })
+        .data<particle_emitter_component::culling_mode::renderer_based>("renderer_based"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "renderer_based"},
+            entt::attribute{"pretty_name", "Renderer Based"},
         });
 
     entt::meta_factory<particle_emitter_component>{}
@@ -313,6 +347,14 @@ REFLECT(particle_emitter_component)
             entt::attribute{"pretty_name", "Enabled"},
             entt::attribute{"tooltip", "Controls whether the particle emitter actively spawns and updates particles. Disabled emitters stop emission but existing particles continue to animate."},
         })
+        .data<&particle_emitter_component::set_culling_mode, &particle_emitter_component::get_culling_mode>("culling_mode"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "culling_mode"},
+            entt::attribute{"pretty_name", "Culling Mode"},
+            entt::attribute{"tooltip",
+                            "Always Simulate: update even when not drawn. "
+                            "Renderer Based: freeze spawn/sim when no camera drew the emitter last frame (same as animation)."},
+        })
         .data<&particle_emitter_component::set_loop, &particle_emitter_component::is_loop>("loop"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "loop"},
@@ -324,6 +366,14 @@ REFLECT(particle_emitter_component)
             entt::attribute{"name", "simulation_space"},
             entt::attribute{"pretty_name", "Simulation Space"},
             entt::attribute{"tooltip", "Controls whether particles are simulated in world space or local space."},
+        })
+        .data<&particle_emitter_component::set_simulation_backend, &particle_emitter_component::get_simulation_backend>("simulation_backend"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "simulation_backend"},
+            entt::attribute{"pretty_name", "Simulation Backend"},
+            entt::attribute{"tooltip",
+                            "CPU: batched CPU property update and instance gather (best for many mid-size emitters). "
+                            "GPU: compute pack per emitter (best for a few very large emitters). Requires GPU pack shader."},
         })
         .data<&particle_emitter_component::set_max_particles, &particle_emitter_component::get_max_particles>("max_particles"_hs)
         .custom<entt::attributes>(entt::attributes{
@@ -653,10 +703,12 @@ REFLECT(particle_emitter_component)
 SAVE(particle_emitter_component)
 {
     try_save(ar, ser20::make_nvp("enabled", obj.is_enabled()));
+    try_save(ar, ser20::make_nvp("culling_mode", obj.get_culling_mode()));
     try_save(ar, ser20::make_nvp("shape", obj.get_shape()));
     try_save(ar, ser20::make_nvp("direction", obj.get_direction()));
     try_save(ar, ser20::make_nvp("spawn_location", obj.get_spawn_location()));
     try_save(ar, ser20::make_nvp("simulation_space", obj.get_simulation_space()));
+    try_save(ar, ser20::make_nvp("simulation_backend", obj.get_simulation_backend()));
     try_save(ar, ser20::make_nvp("max_particles", obj.get_max_particles()));
     
     
@@ -719,9 +771,15 @@ LOAD(particle_emitter_component)
     {
         obj.set_enabled(enabled);
     }
+
+    particle_emitter_component::culling_mode culling_mode{};
+    if(try_load(ar, ser20::make_nvp("culling_mode", culling_mode)))
+    {
+        obj.set_culling_mode(culling_mode);
+    }
     
-    EmitterShape::Enum shape{EmitterShape::Sphere};
-    EmitterDirection::Enum direction{EmitterDirection::Up};
+    ps_soa::emitter_shape shape{ps_soa::emitter_shape::sphere};
+    ps_soa::emitter_direction direction{ps_soa::emitter_direction::up};
     if(try_load(ar, ser20::make_nvp("shape", shape)))
     {
         obj.set_shape(shape);
@@ -731,16 +789,22 @@ LOAD(particle_emitter_component)
         obj.set_direction(direction);
     }
 
-    EmitterSpawnLocation::Enum spawn_location{EmitterSpawnLocation::Inside};
+    ps_soa::spawn_location spawn_location{ps_soa::spawn_location::inside};
     if(try_load(ar, ser20::make_nvp("spawn_location", spawn_location)))
     {
         obj.set_spawn_location(spawn_location);
     }
 
-    SimulationSpace::Enum simulation_space{SimulationSpace::World};
+    ps_soa::simulation_space simulation_space{ps_soa::simulation_space::world};
     if(try_load(ar, ser20::make_nvp("simulation_space", simulation_space)))
     {
         obj.set_simulation_space(simulation_space);
+    }
+
+    ps_soa::particle_sim_backend simulation_backend{ps_soa::particle_sim_backend::cpu};
+    if(try_load(ar, ser20::make_nvp("simulation_backend", simulation_backend)))
+    {
+        obj.set_simulation_backend(simulation_backend);
     }
     
     uint32_t max_particles{1024};
@@ -920,24 +984,24 @@ LOAD(particle_emitter_component)
         obj.set_texture(texture);
     }
     
-    TextureMode::Enum texture_mode{TextureMode::MultiChannel};
+    ps_soa::texture_mode texture_mode{ps_soa::texture_mode::multi_channel};
     if(try_load(ar, ser20::make_nvp("texture_mode", texture_mode)))
     {
         obj.set_texture_mode(texture_mode);
     }
     
-    RenderMode::Enum render_mode{RenderMode::Billboard};
+    ps_soa::render_mode render_mode{ps_soa::render_mode::billboard};
     if(try_load(ar, ser20::make_nvp("render_mode", render_mode)))
     {
         obj.set_render_mode(render_mode);
     }
-    BlendMode::Enum blend_mode{BlendMode::Normal};
+    ps_soa::blend_mode blend_mode{ps_soa::blend_mode::normal};
     if(try_load(ar, ser20::make_nvp("blend_mode", blend_mode)))
     {
         obj.set_blend_mode(blend_mode);
     }
     // Backward compatibility: also check for old "billboard_mode" name
-    RenderMode::Enum billboard_mode{RenderMode::Billboard};
+    ps_soa::render_mode billboard_mode{ps_soa::render_mode::billboard};
     if(try_load(ar, ser20::make_nvp("billboard_mode", billboard_mode)))
     {
         obj.set_render_mode(billboard_mode);

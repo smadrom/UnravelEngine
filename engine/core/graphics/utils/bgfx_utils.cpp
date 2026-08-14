@@ -223,7 +223,8 @@ static void imageReleaseCb(void* _ptr, void* _userData)
 
 static bgfx::TextureHandle loadTextureFromContainer(bimg::ImageContainer* imageContainer,
                                                     uint64_t _flags,
-                                                    bgfx::TextureInfo* _info)
+                                                    bgfx::TextureInfo* _info,
+                                                    const TexturePreCreateFn& _preCreate = nullptr)
 {
     if(NULL == imageContainer)
     {
@@ -236,17 +237,28 @@ static bgfx::TextureHandle loadTextureFromContainer(bimg::ImageContainer* imageC
         imageReleaseCb,
         imageContainer);
 
+    bgfx::TextureInfo info;
+    bgfx::calcTextureSize(
+        info,
+        uint16_t(imageContainer->m_width),
+        uint16_t(imageContainer->m_height),
+        uint16_t(imageContainer->m_depth),
+        imageContainer->m_cubeMap,
+        1 < imageContainer->m_numMips,
+        imageContainer->m_numLayers,
+        bgfx::TextureFormat::Enum(imageContainer->m_format));
+
     if(NULL != _info)
     {
-        bgfx::calcTextureSize(
-            *_info,
-            uint16_t(imageContainer->m_width),
-            uint16_t(imageContainer->m_height),
-            uint16_t(imageContainer->m_depth),
-            imageContainer->m_cubeMap,
-            1 < imageContainer->m_numMips,
-            imageContainer->m_numLayers,
-            bgfx::TextureFormat::Enum(imageContainer->m_format));
+        *_info = info;
+    }
+
+    // The image is parsed and its exact GPU footprint is known; give the caller a chance to
+    // reject the allocation before the create lands.
+    if(_preCreate && !_preCreate(info))
+    {
+        bimg::imageFree(imageContainer);
+        return BGFX_INVALID_HANDLE;
     }
 
     if(imageContainer->m_cubeMap)
@@ -483,7 +495,8 @@ bgfx::TextureHandle loadTexture(const void* _data,
                                 bgfx::TextureInfo* _info,
                                 bimg::Orientation::Enum* _orientation,
                                 const char* _name,
-                                bx::Error* _err)
+                                bx::Error* _err,
+                                const TexturePreCreateFn& _preCreate)
 {
     BX_UNUSED(_skip);
     bgfx::TextureHandle handle = BGFX_INVALID_HANDLE;
@@ -509,7 +522,7 @@ bgfx::TextureHandle loadTexture(const void* _data,
             *_orientation = imageContainer->m_orientation;
         }
 
-        handle = loadTextureFromContainer(imageContainer, _flags, _info);
+        handle = loadTextureFromContainer(imageContainer, _flags, _info, _preCreate);
 
         if(bgfx::isValid(handle) && NULL != _name)
         {
@@ -526,7 +539,8 @@ bgfx::TextureHandle loadTexture(bx::FileReaderI* _reader,
                                 uint8_t _skip,
                                 bgfx::TextureInfo* _info,
                                 bimg::Orientation::Enum* _orientation,
-                                bx::Error* _err)
+                                bx::Error* _err,
+                                const TexturePreCreateFn& _preCreate = nullptr)
 {
     BX_UNUSED(_skip);
     bgfx::TextureHandle handle = BGFX_INVALID_HANDLE;
@@ -547,7 +561,7 @@ bgfx::TextureHandle loadTexture(bx::FileReaderI* _reader,
     if(NULL != data)
     {
         const bx::StringView name(_filePath);
-        handle = loadTexture(data, size, _flags, _skip, _info, _orientation, name.getPtr());
+        handle = loadTexture(data, size, _flags, _skip, _info, _orientation, name.getPtr(), _err, _preCreate);
         unload(data);
     }
 
@@ -559,10 +573,11 @@ bgfx::TextureHandle loadTexture(const bx::FilePath& _filePath,
                                 uint8_t _skip,
                                 bgfx::TextureInfo* _info,
                                 bimg::Orientation::Enum* _orientation,
-                                bx::Error* _err)
+                                bx::Error* _err,
+                                const TexturePreCreateFn& _preCreate)
 {
     entry::FileReader reader;
-    return loadTexture(&reader, _filePath, _flags, _skip, _info, _orientation, _err);
+    return loadTexture(&reader, _filePath, _flags, _skip, _info, _orientation, _err, _preCreate);
 }
 
 bimg::ImageContainer* imageLoad(const void* data, uint32_t size, bgfx::TextureFormat::Enum _dstFormat)
@@ -771,37 +786,35 @@ bool saveToFile(bgfx::ViewId viewId, const bx::FilePath& _filePath, bgfx::FrameB
     return result;
 }
 
-bool imageSave(const char* saveAs, bimg::ImageContainer* image)
+bool imageSave(const char* saveAs, bimg::ImageContainer* image, const char* format_hint)
 {
-    if (!image)
+    if (!image || !saveAs)
     {
         return false;
     }
-    // Write the image to file based on its extension
+    // Format dispatch key: explicit hint (final destination path/ext) or save path.
+    const char* format_key = (format_hint && format_hint[0] != '\0') ? format_hint : saveAs;
     bx::FileWriter writer;
     bx::Error err;
 
     if (bx::open(&writer, saveAs, false, &err))
     {
-        if (!bx::strFindI(saveAs, "tga").isEmpty())
+        if (!bx::strFindI(format_key, "tga").isEmpty())
         {
             bimg::imageWriteTga(&writer, image->m_width, image->m_height, image->m_width * 4, image->m_data, false, false, &err);
         }
-        else if (!bx::strFindI(saveAs, "ktx").isEmpty())
+        else if (!bx::strFindI(format_key, "ktx").isEmpty())
         {
             bimg::imageWriteKtx(&writer, *image, image->m_data, image->m_size, &err);
-
         }
-        else if (!bx::strFindI(saveAs, "dds").isEmpty())
+        else if (!bx::strFindI(format_key, "dds").isEmpty())
         {
             bimg::imageWriteDds(&writer, *image, image->m_data, image->m_size, &err);
-
         }
-        else if (!bx::strFindI(saveAs, "png").isEmpty())
+        else if (!bx::strFindI(format_key, "png").isEmpty())
         {
             if (image->m_format != bimg::TextureFormat::RGBA8)
             {
-
                 auto converted = bimg::imageConvert(entry::getAllocator(), bimg::TextureFormat::RGBA8, *image);
                 if(converted)
                 {
@@ -838,9 +851,8 @@ bool imageSave(const char* saveAs, bimg::ImageContainer* image)
                                     , &err
                                     );
             }
-
         }
-        else if (!bx::strFindI(saveAs, "exr").isEmpty())
+        else if (!bx::strFindI(format_key, "exr").isEmpty())
         {
             bimg::ImageMip mip;
             bimg::imageGetRawData(*image, 0, 0, image->m_data, image->m_size, mip);
@@ -854,7 +866,7 @@ bool imageSave(const char* saveAs, bimg::ImageContainer* image)
                                 , &err
                                 );
         }
-        else if (!bx::strFindI(saveAs, "hdr").isEmpty())
+        else if (!bx::strFindI(format_key, "hdr").isEmpty())
         {
             bimg::ImageMip mip;
             bimg::imageGetRawData(*image, 0, 0, image->m_data, image->m_size, mip);
@@ -869,10 +881,8 @@ bool imageSave(const char* saveAs, bimg::ImageContainer* image)
                                 );
         }
 
-
         bx::close(&writer);
     }
 
     return err.isOk();
-
 }

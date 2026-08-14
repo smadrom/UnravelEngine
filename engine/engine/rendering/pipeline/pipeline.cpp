@@ -34,6 +34,7 @@
 #include <concurrency/concurrentqueue.h>
 
 #include <algorithm>
+#include <atomic>
 
 namespace unravel
 {
@@ -41,13 +42,13 @@ namespace rendering
 {
 namespace
 {
-auto particle_blend_bgfx_state(BlendMode::Enum mode) -> uint64_t
+auto particle_blend_bgfx_state(ps_soa::blend_mode mode) -> uint64_t
 {
     switch(mode)
     {
-    case BlendMode::Additive:
+    case ps_soa::blend_mode::additive:
         return BGFX_STATE_BLEND_ADD;
-    case BlendMode::Multiply:
+    case ps_soa::blend_mode::multiply:
         return BGFX_STATE_BLEND_MULTIPLY;
     default:
         return BGFX_STATE_BLEND_NORMAL;
@@ -82,7 +83,6 @@ auto pipeline::init(rtti::context& ctx) -> bool
         return std::make_unique<gpu_program>(vs_shader, fs_shadfer);
     };
 
-    particle_program_ = load_program("particles/vs_particle", "particles/fs_particle");
     particle_program_instanced_ = load_program("particles/instanced/vs_particle_instanced", "particles/instanced/fs_particle_instanced");
     particle_program_instanced_mask_ = load_program("particles/instanced/vs_particle_instanced", "particles/instanced/fs_particle_instanced_mask");
     world_quad_program_ = load_program("rmlui_world/vs_world_quad", "rmlui_world/fs_world_quad");
@@ -90,12 +90,29 @@ auto pipeline::init(rtti::context& ctx) -> bool
     return true;
 }
 
+namespace
+{
+// LOD levels added on top of the main-view selection when rendering shadow maps.
+std::atomic<float> shadow_lod_bias{1.0f};
+} // namespace
+
+auto pipeline::get_shadow_lod_bias() -> float
+{
+    return shadow_lod_bias.load(std::memory_order_relaxed);
+}
+
+void pipeline::set_shadow_lod_bias(float bias)
+{
+    shadow_lod_bias.store(bias, std::memory_order_relaxed);
+}
+
 void pipeline::gather_visible_models(scene& scn,
     const camera* cam, 
     visibility_flags query, 
     const layer_mask& render_mask, 
     delta_t dt,
-    const std::function<void(entt::handle entity, const lod_data& lod_data)>& lod_data_callback)
+    const std::function<void(entt::handle entity, const lod_data& lod_data)>& lod_data_callback,
+    const camera* lod_reference_cam)
 {
     
     APP_SCOPE_PERF(cam ? "Rendering/Cull   Models" : "Rendering/Gather Models");
@@ -159,18 +176,39 @@ void pipeline::gather_visible_models(scene& scn,
                 {
                     return;
                 }
-                const auto& world_transform = transform_comp.get_transform_global();
 
-                if(!model.calculate_lod_data(current_lod_data, world_transform, *cam, dt.count()))
+                // LOD and culling both measure the pose-aware world AABB (static bounds
+                // unioned with the cached per-submesh/skinned pose bounds) - one source of
+                // truth for "where the rendered geometry actually is". Refreshed by
+                // model_system::on_frame_before_render, which runs before any render path.
+                const auto& world_bounds = model_comp.get_world_bounds();
+
+                if(!model.calculate_lod_data(current_lod_data, world_bounds, *cam, dt.count()))
                 {
                     return;
                 }
 
-                const auto& local_bounds = model_comp.get_local_bounds(current_lod_data.current_lod_index);
+                // Bind-pose local bounds are never used for culling or LOD - they don't
+                // track node/bone animation.
+                is_visible = cam->get_frustum().test_aabb(world_bounds);
+            }
+            else if(lod_reference_cam)
+            {
+                // No frustum culling (e.g. shadow gathering renders casters outside the view),
+                // but select a distance-appropriate LOD from the reference camera plus the
+                // shadow bias instead of always rendering LOD 0.
+                const auto& model = model_comp.get_model();
 
-                // Test the bounding box of the mesh
-                is_visible = cam->test_obb(local_bounds, world_transform);
-                 // Alternative: is_visible = frustum->test_aabb(model_comp.get_world_bounds());
+                if(model.is_valid())
+                {
+                    const auto lod = model.compute_lod_index(model_comp.get_world_bounds(),
+                                                             *lod_reference_cam,
+                                                             get_shadow_lod_bias());
+                    current_lod_data.current_lod_index = lod;
+                    current_lod_data.target_lod_index = lod;
+                    current_lod_data.current_time = 0.0f;
+                    current_lod_data.transition_time = 0.0f;
+                }
             }
 
             if(is_visible)
@@ -530,12 +568,32 @@ void pipeline::run_particle_pass(scene& scn, const camera& camera, gfx::render_v
         auto cam_view = camera.get_view();
     
 
+        // Primary: material key (blend / texture / texture mode) so same-material emitters coalesce.
+        // Secondary: distance (far → near) within a material — does not split batches. Per-particle
+        // depth sort for Normal still runs inside ps_soa::render_emitter_batch.
         struct sort_key
         {
             particle_emitter_component* component;
+            ps_soa::blend_mode blend_mode;
+            ps_soa::texture_mode texture_mode;
+            hpp::uuid texture_uid;
             float distance;
         };
         hpp::small_vector<sort_key, 16> particle_emitters;
+
+        auto blend_draw_order = [](ps_soa::blend_mode mode) -> int
+        {
+            // Order-independent blends first; alpha (Normal) last so depth-sorted particles composite on top.
+            switch(mode)
+            {
+            case ps_soa::blend_mode::additive:
+                return 0;
+            case ps_soa::blend_mode::multiply:
+                return 1;
+            default:
+                return 2;
+            }
+        };
 
         {
             APP_SCOPE_PERF("Rendering/Particle Pass/Cull Emitters");
@@ -547,28 +605,51 @@ void pipeline::run_particle_pass(scene& scn, const camera& camera, gfx::render_v
                     {
                         return;
                     }
-    
-                    auto distance = math::distance2(bounds.get_center(), cam_pos);
-                    particle_emitters.emplace_back(sort_key{&particle_emitter_comp, distance});
-            });
-        }
-       
-        {
-            APP_SCOPE_PERF("Rendering/Particle Pass/Sort Emitters");
-            // Sort by distance first (back to front for proper alpha blending)
-            std::sort(particle_emitters.begin(), particle_emitters.end(), [](const sort_key& a, const sort_key& b)
-            {
-                return a.distance < b.distance;
-            });
 
+                    // Renderer-based culling feedback (same as model_component).
+                    particle_emitter_comp.set_last_render_frame(uint64_t(gfx::get_render_frame()));
+
+                    const auto& tex = particle_emitter_comp.get_texture();
+                    const float distance = math::distance2(bounds.get_center(), cam_pos);
+                    particle_emitters.emplace_back(sort_key{&particle_emitter_comp,
+                                                            particle_emitter_comp.get_blend_mode(),
+                                                            particle_emitter_comp.get_texture_mode(),
+                                                            tex.uid(),
+                                                            distance});
+            });
         }
 
         {
-            APP_SCOPE_PERF("Rendering/Particle Pass/Group Emitters for batch");
-            hpp::small_vector<EmitterHandle, 16> current_batch;
+            APP_SCOPE_PERF("Rendering/Particle Pass/Sort Emitters by Material");
+            std::sort(particle_emitters.begin(),
+                      particle_emitters.end(),
+                      [&](const sort_key& a, const sort_key& b)
+                      {
+                          const int ao = blend_draw_order(a.blend_mode);
+                          const int bo = blend_draw_order(b.blend_mode);
+                          if(ao != bo)
+                          {
+                              return ao < bo;
+                          }
+                          if(a.texture_uid != b.texture_uid)
+                          {
+                              return a.texture_uid < b.texture_uid;
+                          }
+                          if(a.texture_mode != b.texture_mode)
+                          {
+                              return a.texture_mode < b.texture_mode;
+                          }
+                          // Same material: back-to-front (farther first).
+                          return a.distance > b.distance;
+                      });
+        }
+
+        {
+            APP_SCOPE_PERF("Rendering/Particle Pass/Submit Emitter Batches");
+            hpp::small_vector<ps_soa::emitter_handle, 16> current_batch;
             asset_handle<gfx::texture> batch_texture;
-            TextureMode::Enum batch_texture_mode = TextureMode::MultiChannel;
-            BlendMode::Enum batch_blend_mode = BlendMode::Normal;
+            ps_soa::texture_mode batch_texture_mode = ps_soa::texture_mode::multi_channel;
+            ps_soa::blend_mode batch_blend_mode = ps_soa::blend_mode::normal;
             bool batch_open = false;
 
             auto flush_particle_batch = [&]()
@@ -579,13 +660,23 @@ void pipeline::run_particle_pass(scene& scn, const camera& camera, gfx::render_v
                     batch_open = false;
                     return;
                 }
-                const bgfx::ProgramHandle program = (batch_texture_mode == TextureMode::Mask)
+                APP_SCOPE_PERF("Rendering/Particle Pass/Flush Emitter Batch");
+                const bgfx::ProgramHandle program = (batch_texture_mode == ps_soa::texture_mode::mask)
                     ? particle_program_instanced_mask_->native_handle()
                     : particle_program_instanced_->native_handle();
                 auto texture = batch_texture.get()->native_handle();
                 const uint64_t blend_state = particle_blend_bgfx_state(batch_blend_mode);
-                stats_.drawn_particles += psRenderEmitterBatch(current_batch.data(), static_cast<uint32_t>(current_batch.size()),
-                    pass.id, program, cam_view, cam_pos, texture, blend_state);
+                // Additive / Multiply are order-independent; skip expensive per-particle depth sort.
+                const bool sort_by_depth = (batch_blend_mode == ps_soa::blend_mode::normal);
+                stats_.drawn_particles += ps_soa::render_emitter_batch(current_batch.data(),
+                    static_cast<uint32_t>(current_batch.size()),
+                    pass.id,
+                    program,
+                    cam_view,
+                    cam_pos,
+                    texture,
+                    blend_state,
+                    sort_by_depth);
                 stats_.drawn_particles_batches++;
                 current_batch.clear();
                 batch_open = false;
@@ -595,8 +686,8 @@ void pipeline::run_particle_pass(scene& scn, const camera& camera, gfx::render_v
             {
                 auto* comp = particle_emitter.component;
                 const auto& tex = comp->get_texture();
-                const TextureMode::Enum tm = comp->get_texture_mode();
-                const BlendMode::Enum bm = comp->get_blend_mode();
+                const ps_soa::texture_mode tm = particle_emitter.texture_mode;
+                const ps_soa::blend_mode bm = particle_emitter.blend_mode;
                 if(batch_open && (tex != batch_texture || tm != batch_texture_mode || bm != batch_blend_mode))
                 {
                     flush_particle_batch();
@@ -611,7 +702,7 @@ void pipeline::run_particle_pass(scene& scn, const camera& camera, gfx::render_v
                 if(comp->is_enabled())
                 {
                     auto emitter_handle = comp->get_emitter_handle();
-                    if(isValid(emitter_handle))
+                    if(ps_soa::is_valid(emitter_handle))
                     {
                         current_batch.push_back(emitter_handle);
                     }

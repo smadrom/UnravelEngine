@@ -5,6 +5,7 @@
 #include <bimg/bimg.h>
 #include <bx/file.h>
 #include <algorithm>
+#include <array>
 #include <map>
 namespace gfx
 {
@@ -22,9 +23,25 @@ struct context_data
     uint32_t frame{};
 
     uniform_handle u_world{gfx::invalid_handle};
+    texture_handle fallback_texture{gfx::invalid_handle};
+    allocation_failure_policy allocation_policy = allocation_failure_policy::skip_with_fallback;
 
 } s_context;
 
+auto create_fallback_texture() -> texture_handle
+{
+    constexpr std::uint16_t dim = 4;
+    std::array<std::uint8_t, dim * dim * 4> pixels{};
+    for(std::size_t i = 0; i < dim * dim; ++i)
+    {
+        pixels[i * 4 + 0] = 255;
+        pixels[i * 4 + 1] = 0;
+        pixels[i * 4 + 2] = 255;
+        pixels[i * 4 + 3] = 255;
+    }
+    const memory_view* mem = copy(pixels.data(), static_cast<std::uint32_t>(pixels.size()));
+    return create_texture_2d(dim, dim, false, 1, texture_format::RGBA8, BGFX_TEXTURE_NONE | BGFX_SAMPLER_NONE, mem);
+}
 
 } // namespace
 
@@ -265,11 +282,31 @@ void shutdown()
     if(s_context.initted)
     {
         eviction::shutdown();
+        if(bgfx::isValid(s_context.fallback_texture))
+        {
+            gfx::destroy(s_context.fallback_texture);
+            s_context.fallback_texture = {bgfx::kInvalidHandle};
+        }
         deinit_uniform_cache();
         bgfx::destroy(s_context.u_world);
         bgfx::shutdown();
     }
     s_context = {};
+}
+
+void set_allocation_failure_policy(allocation_failure_policy policy)
+{
+    s_context.allocation_policy = policy;
+}
+
+auto get_allocation_failure_policy() -> allocation_failure_policy
+{
+    return s_context.allocation_policy;
+}
+
+auto fallback_texture() -> texture_handle
+{
+    return s_context.fallback_texture;
 }
 
 bool init(init_type init_data)
@@ -302,6 +339,14 @@ bool init(init_type init_data)
         case eviction::init_status::failed:
             log("warning", "GPU resource eviction failed to initialize.", __FILE__, __LINE__);
             break;
+    }
+    if(s_context.initted)
+    {
+        s_context.fallback_texture = create_fallback_texture();
+        if(bgfx::isValid(s_context.fallback_texture))
+        {
+            set_name(s_context.fallback_texture, "gfx-fallback");
+        }
     }
     return s_context.initted;
 }
@@ -384,10 +429,11 @@ void end(encoder* _encoder)
     bgfx::end(_encoder);
 }
 
-uint32_t frame(bool _capture)
+uint32_t frame(uint8_t _flags)
 {
-    s_context.frame = bgfx::frame(_capture);
+    s_context.frame = bgfx::frame(_flags);
     eviction::set_frame(s_context.frame);
+    eviction::clear_queued_allocations();
     return s_context.frame;
 }
 
@@ -1009,6 +1055,11 @@ void set_vertex_buffer(uint8_t _stream,
     bgfx::setVertexBuffer(_stream, _tvb, _startVertex, _numVertices);
 }
 
+void set_vertex_count(uint32_t _numVertices)
+{
+    bgfx::setVertexCount(_numVertices);
+}
+
 void set_instance_data_buffer(const instance_data_buffer* _idb, uint32_t _start, uint32_t _num)
 {
     bgfx::setInstanceDataBuffer(_idb, _start, _num);
@@ -1144,13 +1195,16 @@ void request_screen_shot(frame_buffer_handle _handle, const char* _filePath)
     bgfx::requestScreenShot(_handle, _filePath);
 }
 
-void flush()
+void frames(int _count, int32_t _flags)
 {
-    // Execute all queued commands (including resource destroys, which bgfx processes after creates)
-    // and reclaim their GPU memory without presenting the backbuffer or issuing any draws. Two pumps
-    // drain the command ring so the destroys are guaranteed to have been serviced on return.
-    bgfx::frame(BGFX_FRAME_FLUSH);
-    bgfx::frame(BGFX_FRAME_FLUSH);
+    for(int i = 0; i < _count; ++i)
+    {
+        frame(_flags);
+
+        s_context.frame = bgfx::frame(_flags);
+        eviction::set_frame(s_context.frame);
+        eviction::clear_queued_allocations();
+    }
 }
 
 auto screen_quad(float dest_width, float dest_height, float depth, float width, float height) -> uint64_t
@@ -1544,23 +1598,78 @@ void set_world_transform(const void* _mtx, uint16_t _num)
 }
 
 
+namespace
+{
+constexpr uint64_t k_gpu_row_pitch_alignment = 256;
+/// Minimum committed image allocation on most Vulkan/D3D12 drivers (typical imageMemReq alignment).
+constexpr uint64_t k_gpu_min_image_allocation = 4096;
+
+auto align_up_u64(uint64_t value, uint64_t alignment) -> uint64_t
+{
+    if(alignment == 0)
+    {
+        return value;
+    }
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+/// Tiled/uncompressed footprint with API row-pitch rules (D3D12 uses 256-byte pitch alignment).
+auto estimate_row_pitch_layout_size(const texture_info& info) -> uint64_t
+{
+    const auto format = static_cast<bimg::TextureFormat::Enum>(info.format);
+    if(info.bitsPerPixel == 0 || bimg::isCompressed(format) || bimg::isDepth(format))
+    {
+        return info.storageSize;
+    }
+
+    const uint64_t bytes_per_pixel = (static_cast<uint64_t>(info.bitsPerPixel) + 7) / 8;
+    const uint32_t faces = static_cast<uint32_t>(info.numLayers) * (info.cubeMap ? 6u : 1u);
+
+    uint32_t width = info.width;
+    uint32_t height = info.height;
+    uint32_t depth = info.depth > 0 ? info.depth : 1u;
+
+    uint64_t total = 0;
+    for(uint32_t mip = 0; mip < info.numMips; ++mip)
+    {
+        const uint32_t mip_w = bx::max<uint32_t>(1u, width);
+        const uint32_t mip_h = bx::max<uint32_t>(1u, height);
+        const uint32_t mip_d = bx::max<uint32_t>(1u, depth);
+
+        const uint64_t row_bytes = static_cast<uint64_t>(mip_w) * bytes_per_pixel;
+        const uint64_t pitch = align_up_u64(row_bytes, k_gpu_row_pitch_alignment);
+        total += pitch * mip_h * mip_d * faces;
+
+        width = bx::max<uint32_t>(1u, width >> 1);
+        height = bx::max<uint32_t>(1u, height >> 1);
+        depth = bx::max<uint32_t>(1u, depth >> 1);
+    }
+    return total;
+}
+
+} // namespace
+
 uint64_t estimate_texture_gpu_size(const texture_info& _info, uint64_t _flags)
 {
-    // bimg's storageSize already accounts for format (incl. compressed block size), mip chain,
-    // array layers and cube faces, but not multisampling or driver allocation alignment.
-    uint64_t size = _info.storageSize;
+    // bgfx tracks textureMemoryUsed as the sum of storageSize per texture. For eviction bookkeeping
+    // we start there, then uplift uncompressed layouts to row-pitch size (256-byte alignment) which
+    // better matches committed image allocations. We do NOT apply D3D12 placement alignment (64 KiB)
+    // — bgfx uses committed resources / dedicated Vk allocations, not suballocated heap placement.
+    uint64_t size = std::max<uint64_t>(_info.storageSize, estimate_row_pitch_layout_size(_info));
 
-    // Render targets with MSAA allocate roughly sample_count x the single-sample surface. The field
-    // encodes: 2 -> x2, 3 -> x4, 4 -> x8, 5 -> x16 (1 == RT without MSAA, 0 == not a render target).
+    // MSAA render targets allocate sample_count x the single-sample surface.
     const uint64_t msaa_field = (_flags & BGFX_TEXTURE_RT_MSAA_MASK) >> BGFX_TEXTURE_RT_MSAA_SHIFT;
     if(msaa_field >= 2)
     {
         size *= (uint64_t(1) << (msaa_field - 1));
     }
 
-    // Drivers page-align allocations; round up to a conservative 64 KiB so estimates never undershoot.
-    constexpr uint64_t alignment = uint64_t(64) * 1024;
-    size = (size + alignment - 1) & ~(alignment - 1);
+    // Committed image allocations are typically rounded to at least one page (4 KiB) on device-local
+    // heaps; cap the uplift so tiny textures are not reported as 64 KiB each.
+    if(size > 0 && size < k_gpu_min_image_allocation)
+    {
+        size = k_gpu_min_image_allocation;
+    }
     return size;
 }
 

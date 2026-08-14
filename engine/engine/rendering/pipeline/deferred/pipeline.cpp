@@ -596,7 +596,7 @@ void deferred::build_shadows(scene& scn, const camera& camera, delta_t dt, visib
                 gather_visible_models(scn, nullptr, query, render_mask, dt, [&](entt::handle entity, const lod_data& lod_data)
                 {
                     dirty_models.emplace_back(shadow::shadow_visibility_data{entity, lod_data});
-                });
+                }, &camera);
                 queried = true;
             }
 
@@ -701,7 +701,7 @@ void deferred::run_pipeline_impl(const gfx::frame_buffer::ptr& output,
 
     run_g_buffer_pass(visibility_set, camera, rview, dt);
 
-    run_assao_pass(visibility_set, camera, rview, dt, params);
+    run_assao_pass(camera, rview, dt, params);
 
     run_reflection_probe_pass(scn, camera, rview, build_reflection_probes, dt);
 
@@ -907,19 +907,21 @@ void deferred::run_g_buffer_pass(const visibility_set_models_t& visibility_set,
 
         model_comp.set_last_render_frame(gfx::get_render_frame());
 
+        const auto extras = model_comp.get_submit_extras(false);
+
         // Check if this model can be batched (static mesh, no skinning)
         const bool is_skinned = !skinning_matrices.empty();
         const bool can_batch = batch_collector::is_static_mesh_batching_enabled() && !is_skinned;
 
         if (can_batch)
         {
-            // Collect this model for batching with appropriate transforms            
-            model.submit_for_batching(batch_collector_, world_transform, submesh_transforms, current_lod_index, params.x, &view_frustum);
+            // Collect this model for batching with appropriate transforms
+            model.submit_for_batching(batch_collector_, world_transform, submesh_transforms, current_lod_index, params.x, &view_frustum, &camera, extras);
             stats_.drawn_models++;
             // Handle LOD transitions for batched models
             if(math::epsilonNotEqual(current_time, 0.0f, math::epsilon<float>()))
             {
-                model.submit_for_batching(batch_collector_, world_transform, submesh_transforms, target_lod_index, params_inv.x, &view_frustum);
+                model.submit_for_batching(batch_collector_, world_transform, submesh_transforms, target_lod_index, params_inv.x, &view_frustum, &camera, extras);
                 stats_.drawn_models++;
             }
         }
@@ -932,7 +934,9 @@ void deferred::run_g_buffer_pass(const visibility_set_models_t& visibility_set,
                          skinning_matrices,
                          current_lod_index,
                          callbacks,
-                         &view_frustum);
+                         &view_frustum,
+                         &camera,
+                         extras);
             if(math::epsilonNotEqual(current_time, 0.0f, math::epsilon<float>()))
             {
                 callbacks.setup_params_per_instance = [&](const model::submit_callbacks::params& submit_params)
@@ -948,7 +952,9 @@ void deferred::run_g_buffer_pass(const visibility_set_models_t& visibility_set,
                              skinning_matrices,
                              target_lod_index,
                              callbacks,
-                             &view_frustum);
+                             &view_frustum,
+                             &camera,
+                             extras);
             }
         }
     }
@@ -1071,8 +1077,7 @@ void deferred::submit_batched_geometry(gfx::render_pass& pass, const camera& cam
     batch_collector_.clear();
 }
 
-void deferred::run_assao_pass(const visibility_set_models_t& visibility_set,
-                              const camera& camera,
+void deferred::run_assao_pass(const camera& camera,
                               gfx::render_view& rview,
                               delta_t dt,
                               const run_params& rparams)

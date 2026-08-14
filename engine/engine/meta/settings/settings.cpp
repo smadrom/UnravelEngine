@@ -8,6 +8,8 @@
 #include <engine/meta/ecs/entity.hpp>
 #include <engine/meta/input/input.hpp>
 #include <engine/meta/assets/asset_importer_meta.hpp>
+#include <engine/physics/physics_types.h>
+#include <engine/settings/boot_config.h>
 
 namespace unravel
 {
@@ -198,6 +200,88 @@ LOAD_INLINE(eviction_settings)
     try_load(ar, ser20::make_nvp("max_evictions", obj.max_evictions));
 }
 
+REFLECT_INLINE(preferred_renderer)
+{
+    entt::meta_factory<preferred_renderer>{}
+        .type("preferred_renderer"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "preferred_renderer"},
+            entt::attribute{"pretty_name", "Preferred Renderer"},
+        })
+        .data<preferred_renderer::auto_detect>("auto_detect"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "auto_detect"},
+            entt::attribute{"pretty_name", "Auto"},
+        })
+        .data<preferred_renderer::opengl>("opengl"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "opengl"},
+            entt::attribute{"pretty_name", "OpenGL"},
+        })
+        .data<preferred_renderer::vulkan>("vulkan"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "vulkan"},
+            entt::attribute{"pretty_name", "Vulkan"},
+        })
+        .data<preferred_renderer::direct3d11>("direct3d11"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "direct3d11"},
+            entt::attribute{"pretty_name", "Direct3D 11"},
+        })
+        .data<preferred_renderer::direct3d12>("direct3d12"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "direct3d12"},
+            entt::attribute{"pretty_name", "Direct3D 12"},
+        })
+        .data<preferred_renderer::metal>("metal"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "metal"},
+            entt::attribute{"pretty_name", "Metal"},
+        });
+}
+
+REFLECT_INLINE(platform_renderer_settings)
+{
+    entt::meta_factory<platform_renderer_settings>{}
+        .type("platform_renderer_settings"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "platform_renderer_settings"},
+            entt::attribute{"pretty_name", "Renderer Backend"},
+        })
+        .data<&platform_renderer_settings::windows>("windows"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "windows"},
+            entt::attribute{"pretty_name", "Windows"},
+            entt::attribute{"tooltip", "Preferred renderer when running on Windows. Requires editor restart."},
+        })
+        .data<&platform_renderer_settings::linux>("linux"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "linux"},
+            entt::attribute{"pretty_name", "Linux"},
+            entt::attribute{"tooltip", "Preferred renderer when running on Linux. Requires editor restart."},
+        })
+        .data<&platform_renderer_settings::macos>("macos"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "macos"},
+            entt::attribute{"pretty_name", "macOS"},
+            entt::attribute{"tooltip", "Preferred renderer when running on macOS. Requires editor restart."},
+        });
+}
+
+SAVE_INLINE(platform_renderer_settings)
+{
+    try_save(ar, ser20::make_nvp("windows", obj.windows));
+    try_save(ar, ser20::make_nvp("linux", obj.linux));
+    try_save(ar, ser20::make_nvp("macos", obj.macos));
+}
+
+LOAD_INLINE(platform_renderer_settings)
+{
+    try_load(ar, ser20::make_nvp("windows", obj.windows));
+    try_load(ar, ser20::make_nvp("linux", obj.linux));
+    try_load(ar, ser20::make_nvp("macos", obj.macos));
+}
+
 REFLECT_INLINE(settings::graphics_settings)
 {
     entt::meta_factory<settings::graphics_settings>{}
@@ -205,6 +289,13 @@ REFLECT_INLINE(settings::graphics_settings)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "graphics_settings"},
             entt::attribute{"pretty_name", "Graphics Settings"},
+        })
+        .data<&settings::graphics_settings::renderer>("renderer"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "renderer"},
+            entt::attribute{"pretty_name", "Renderer Backend"},
+            entt::attribute{"tooltip",
+                            "Per-platform preferred graphics backend. Applied at process start; requires restart."},
         })
         .data<&settings::graphics_settings::eviction>("eviction"_hs)
         .custom<entt::attributes>(entt::attributes{
@@ -216,12 +307,112 @@ REFLECT_INLINE(settings::graphics_settings)
 
 SAVE_INLINE(settings::graphics_settings)
 {
+    try_save(ar, ser20::make_nvp("renderer", obj.renderer));
     try_save(ar, ser20::make_nvp("eviction", obj.eviction));
 }
 
 LOAD_INLINE(settings::graphics_settings)
 {
+    try_load(ar, ser20::make_nvp("renderer", obj.renderer));
     try_load(ar, ser20::make_nvp("eviction", obj.eviction));
+}
+
+REFLECT_INLINE(settings::splash_logo_entry)
+{
+    entt::meta_factory<settings::splash_logo_entry>{}
+        .type("splash_logo_entry"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "splash_logo_entry"},
+            entt::attribute{"pretty_name", "Logo"},
+        })
+        .data<&settings::splash_logo_entry::logo>("logo"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "logo"},
+            entt::attribute{"pretty_name", "Logo"},
+            entt::attribute{"tooltip", "Texture asset displayed during the splash sequence."},
+        })
+        .data<&settings::splash_logo_entry::duration_sec>("duration_sec"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "duration_sec"},
+            entt::attribute{"pretty_name", "Duration (s)"},
+            entt::attribute{"min", 0.0f},
+            entt::attribute{"max", 30.0f},
+            entt::attribute{"step", 0.1f},
+        });
+}
+
+SAVE_INLINE(settings::splash_logo_entry)
+{
+    try_save(ar, ser20::make_nvp("logo", obj.logo));
+    try_save(ar, ser20::make_nvp("duration_sec", obj.duration_sec));
+}
+
+LOAD_INLINE(settings::splash_logo_entry)
+{
+    try_load(ar, ser20::make_nvp("logo", obj.logo));
+    try_load(ar, ser20::make_nvp("duration_sec", obj.duration_sec));
+}
+
+REFLECT_INLINE(settings::splash_settings)
+{
+    entt::meta_factory<settings::splash_settings>{}
+        .type("splash_settings"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "splash_settings"},
+            entt::attribute{"pretty_name", "Splash Screen"},
+        })
+        .data<&settings::splash_settings::enabled>("enabled"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "enabled"},
+            entt::attribute{"pretty_name", "Show Splash Screen"},
+            entt::attribute{"tooltip", "Display a splash screen when entering play mode before the game starts."},
+        })
+        .data<&settings::splash_settings::show_made_with>("show_made_with"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "show_made_with"},
+            entt::attribute{"pretty_name", "Show Made With Unravel"},
+            entt::attribute{"tooltip", "Append the engine branding logo to the splash sequence."},
+        })
+        .data<&settings::splash_settings::fade_in_sec>("fade_in_sec"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "fade_in_sec"},
+            entt::attribute{"pretty_name", "Fade In (s)"},
+            entt::attribute{"min", 0.0f},
+            entt::attribute{"max", 5.0f},
+            entt::attribute{"step", 0.05f},
+        })
+        .data<&settings::splash_settings::fade_out_sec>("fade_out_sec"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "fade_out_sec"},
+            entt::attribute{"pretty_name", "Fade Out (s)"},
+            entt::attribute{"min", 0.0f},
+            entt::attribute{"max", 5.0f},
+            entt::attribute{"step", 0.05f},
+        })
+        .data<&settings::splash_settings::logos>("logos"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "logos"},
+            entt::attribute{"pretty_name", "Logos"},
+            entt::attribute{"tooltip", "Project logos shown sequentially before play begins."},
+        });
+}
+
+SAVE_INLINE(settings::splash_settings)
+{
+    try_save(ar, ser20::make_nvp("enabled", obj.enabled));
+    try_save(ar, ser20::make_nvp("show_made_with", obj.show_made_with));
+    try_save(ar, ser20::make_nvp("fade_in_sec", obj.fade_in_sec));
+    try_save(ar, ser20::make_nvp("fade_out_sec", obj.fade_out_sec));
+    try_save(ar, ser20::make_nvp("logos", obj.logos));
+}
+
+LOAD_INLINE(settings::splash_settings)
+{
+    try_load(ar, ser20::make_nvp("enabled", obj.enabled));
+    try_load(ar, ser20::make_nvp("show_made_with", obj.show_made_with));
+    try_load(ar, ser20::make_nvp("fade_in_sec", obj.fade_in_sec));
+    try_load(ar, ser20::make_nvp("fade_out_sec", obj.fade_out_sec));
+    try_load(ar, ser20::make_nvp("logos", obj.logos));
 }
 
 REFLECT_INLINE(settings::standalone_settings)
@@ -251,37 +442,64 @@ LOAD_INLINE(settings::standalone_settings)
     try_load(ar, ser20::make_nvp("startup_scene", obj.startup_scene));
 }
 
-REFLECT_INLINE(settings::time_settings)
+REFLECT_INLINE(physics_backend_type)
 {
-    entt::meta_factory<settings::time_settings>{}
-        .type("time_settings"_hs)
+    entt::meta_factory<physics_backend_type>{}
+        .type("physics_backend_type"_hs)
         .custom<entt::attributes>(entt::attributes{
-            entt::attribute{"name", "time_settings"},
-            entt::attribute{"pretty_name", "Time Settings"},
+            entt::attribute{"name", "physics_backend_type"},
+            entt::attribute{"pretty_name", "Physics Backend"},
         })
-        .data<&settings::time_settings::fixed_timestep>("fixed_timestep"_hs)
+        .data<physics_backend_type::bullet>("bullet"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "bullet"},
+            entt::attribute{"pretty_name", "Bullet"},
+        });
+}
+
+REFLECT_INLINE(settings::physics_settings)
+{
+    entt::meta_factory<settings::physics_settings>{}
+        .type("physics_settings"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "physics_settings"},
+            entt::attribute{"pretty_name", "Physics Settings"},
+        })
+        .data<&settings::physics_settings::backend>("backend"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "backend"},
+            entt::attribute{"pretty_name", "Physics Backend"},
+            entt::attribute{"tooltip", "Physics engine adapter. Applied at process start; requires editor restart."},
+        })
+        .data<&settings::physics_settings::fixed_timestep>("fixed_timestep"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "fixed_timestep"},
             entt::attribute{"pretty_name", "Fixed Timestep"},
             entt::attribute{"step", 0.001f},
-            entt::attribute{"tooltip", "A framerate-idependent interval which dictates when physics calculations and FixedUpdate events are performed."},
+            entt::attribute{"tooltip",
+                            "A framerate-independent interval which dictates when physics calculations and "
+                            "FixedUpdate events are performed."},
         })
-        .data<&settings::time_settings::max_fixed_steps>("max_fixed_steps"_hs)
+        .data<&settings::physics_settings::max_fixed_steps>("max_fixed_steps"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "max_fixed_steps"},
             entt::attribute{"pretty_name", "Max Fixed Steps"},
-            entt::attribute{"tooltip", "A cap for framerate-idependent worst case scenario. No more than this much fixed updates per frame."},
+            entt::attribute{"tooltip",
+                            "A cap for framerate-independent worst case scenario. No more than this many fixed "
+                            "updates per frame."},
         });
 }
 
-SAVE_INLINE(settings::time_settings)
+SAVE_INLINE(settings::physics_settings)
 {
+    try_save(ar, ser20::make_nvp("backend", obj.backend));
     try_save(ar, ser20::make_nvp("fixed_timestep", obj.fixed_timestep));
     try_save(ar, ser20::make_nvp("max_fixed_steps", obj.max_fixed_steps));
 }
 
-LOAD_INLINE(settings::time_settings)
+LOAD_INLINE(settings::physics_settings)
 {
+    try_load(ar, ser20::make_nvp("backend", obj.backend));
     try_load(ar, ser20::make_nvp("fixed_timestep", obj.fixed_timestep));
     try_load(ar, ser20::make_nvp("max_fixed_steps", obj.max_fixed_steps));
 }
@@ -432,11 +650,23 @@ REFLECT(settings)
             entt::attribute{"pretty_name", "Graphics"},
             entt::attribute{"tooltip", "Missing..."},
         })
+        .data<&settings::splash>("splash"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "splash"},
+            entt::attribute{"pretty_name", "Splash Screen"},
+            entt::attribute{"tooltip", "Play mode splash screen shown before the game starts."},
+        })
         .data<&settings::standalone>("standalone"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "standalone"},
             entt::attribute{"pretty_name", "Standalone"},
             entt::attribute{"tooltip", "Missing..."},
+        })
+        .data<&settings::physics>("physics"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "physics"},
+            entt::attribute{"pretty_name", "Physics"},
+            entt::attribute{"tooltip", "Physics backend and fixed-step simulation settings."},
         })
         .data<&settings::resolution>("resolution"_hs)
         .custom<entt::attributes>(entt::attributes{
@@ -451,10 +681,11 @@ SAVE(settings)
     try_save(ar, ser20::make_nvp("app", obj.app));
     try_save(ar, ser20::make_nvp("assets", obj.assets));
     try_save(ar, ser20::make_nvp("graphics", obj.graphics));
+    try_save(ar, ser20::make_nvp("splash", obj.splash));
     try_save(ar, ser20::make_nvp("standalone", obj.standalone));
     try_save(ar, ser20::make_nvp("layer", obj.layer));
     try_save(ar, ser20::make_nvp("input", obj.input));
-    try_save(ar, ser20::make_nvp("time", obj.time));
+    try_save(ar, ser20::make_nvp("physics", obj.physics));
     try_save(ar, ser20::make_nvp("resolutions", obj.resolution));
 }
 SAVE_INSTANTIATE(settings, ser20::oarchive_associative_t);
@@ -465,10 +696,15 @@ LOAD(settings)
     try_load(ar, ser20::make_nvp("app", obj.app));
     try_load(ar, ser20::make_nvp("assets", obj.assets));
     try_load(ar, ser20::make_nvp("graphics", obj.graphics));
+    try_load(ar, ser20::make_nvp("splash", obj.splash));
     try_load(ar, ser20::make_nvp("standalone", obj.standalone));
     try_load(ar, ser20::make_nvp("layer", obj.layer));
     try_load(ar, ser20::make_nvp("input", obj.input));
-    try_load(ar, ser20::make_nvp("time", obj.time));
+    // Prefer "physics"; fall back to legacy "time" (timestep fields only).
+    if(!try_load(ar, ser20::make_nvp("physics", obj.physics)))
+    {
+        try_load(ar, ser20::make_nvp("time", obj.physics));
+    }
     try_load(ar, ser20::make_nvp("resolutions", obj.resolution));
 }
 LOAD_INSTANTIATE(settings, ser20::iarchive_associative_t);

@@ -6,6 +6,7 @@
 #include "filesystem/filesystem.h"
 #include "imgui_widgets/utils.h"
 #include <editor/editing/editing_manager.h>
+#include <editor/editing/editor_actions.h>
 #include <editor/editing/thumbnail_manager.h>
 #include <editor/assets/asset_actions.h>
 #include <editor/imgui/integration/fonts/icons/icons_material_design_icons.h>
@@ -35,11 +36,16 @@
 
 #include <engine/audio/audio_clip.h>
 #include <engine/engine.h>
+#include <engine/assets/impl/asset_reader.h>
 #include <engine/assets/impl/asset_writer.h>
 
 #include <filedialog/filedialog.h>
 #include <filesystem/watcher.h>
 #include <filesystem>
+#include <fstream>
+#include <regex>
+#include <sstream>
+#include <string_utils/utils.h>
 #include <hpp/utility.hpp>
 #include <imgui/imgui.h>
 #include <imgui/imgui_internal.h>
@@ -78,6 +84,46 @@ auto get_new_file_simple(const fs::path& path, const std::string& name, const st
     }
 
     return path / (fmt::format("{}{}", name.c_str(), i) + ext);
+}
+
+/// If the renamed file is a C# script whose class name still matches the old
+/// file stem (i.e. the user never touched the file), keep them in sync by
+/// renaming the class too. Uses word-boundary matching to avoid corrupting
+/// identifiers that merely contain the stem.
+void sync_script_class_name(const fs::path& script_path, const std::string& old_stem, const std::string& new_stem)
+{
+    // Only touch the file when both names are plain identifiers - anything
+    // else can't be a class name (and could break the regex below).
+    if(!asset_actions::is_valid_csharp_identifier(old_stem) ||
+       !asset_actions::is_valid_csharp_identifier(new_stem))
+    {
+        return;
+    }
+
+    std::ifstream input(script_path);
+    if(!input.is_open())
+    {
+        return;
+    }
+
+    std::stringstream buffer;
+    buffer << input.rdbuf();
+    auto content = buffer.str();
+    input.close();
+
+    const std::regex identifier(fmt::format("\\b{}\\b", old_stem));
+    if(!std::regex_search(content, identifier))
+    {
+        return;
+    }
+
+    content = std::regex_replace(content, identifier, new_stem);
+
+    std::ofstream output(script_path);
+    if(output.is_open())
+    {
+        output << content;
+    }
 }
 
 auto process_drag_drop_source(const gfx::texture::ptr& preview, const fs::path& absolute_path) -> bool
@@ -224,6 +270,82 @@ auto format_file_size(std::uintmax_t bytes) -> std::string
     }
     return fmt::format("{:.1f} {}", value, units[unit]);
 }
+
+namespace
+{
+
+struct asset_tooltip_style_scope
+{
+    static constexpr int k_style_var_count = 4;
+    static constexpr int k_style_color_count = 2;
+
+    asset_tooltip_style_scope()
+    {
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 12.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f, 5.0f));
+
+        ImVec4 window_bg = ImGui::GetStyleColorVec4(ImGuiCol_WindowBg);
+        window_bg.x = std::min(window_bg.x + 0.035f, 1.0f);
+        window_bg.y = std::min(window_bg.y + 0.035f, 1.0f);
+        window_bg.z = std::min(window_bg.z + 0.035f, 1.0f);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, window_bg);
+
+        ImVec4 border = ImGui::GetStyleColorVec4(ImGuiCol_Border);
+        border.w = std::min(border.w * 1.35f, 1.0f);
+        ImGui::PushStyleColor(ImGuiCol_Border, border);
+    }
+
+    ~asset_tooltip_style_scope()
+    {
+        ImGui::PopStyleColor(k_style_color_count);
+        ImGui::PopStyleVar(k_style_var_count);
+    }
+
+    asset_tooltip_style_scope(const asset_tooltip_style_scope&) = delete;
+    asset_tooltip_style_scope& operator=(const asset_tooltip_style_scope&) = delete;
+};
+
+auto draw_asset_tooltip_thumbnail(const ImGui::ContentItem& citem, ImVec2 texture_size, float thumb_side) -> void
+{
+    constexpr float thumb_rounding = 8.0f;
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, thumb_rounding);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 52));
+    if(ImGui::BeginChild("asset_tooltip_thumb",
+                         ImVec2(thumb_side, thumb_side),
+                         ImGuiChildFlags_None,
+                         ImGuiWindowFlags_NoScrollbar))
+    {
+        ImGui::ImageWithAspect(citem.texId, texture_size, ImVec2(thumb_side, thumb_side), ImVec2(0.5f, 0.5f));
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
+}
+
+auto draw_asset_tooltip_detail_row(const char* label,
+                                   float label_width,
+                                   float wrap_width,
+                                   const std::string& value) -> void
+{
+    if(value.empty())
+    {
+        return;
+    }
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextUnformatted(label);
+    ImGui::PopStyleColor();
+    ImGui::SameLine(label_width);
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrap_width);
+    ImGui::TextUnformatted(value.c_str());
+    ImGui::PopTextWrapPos();
+}
+
+} // namespace
 
 // Near-white, theme-independent caption color shared by the card type label and the tooltip type label
 // so they stay consistent and never pick up an off-palette tint.
@@ -601,6 +723,8 @@ auto draw_item(const content_browser_item& item)
     {
         ImGui::SetNextWindowViewportToCurrent();
         ImGui::SetNextWindowPos(ImGui::GetIO().MousePos, ImGuiCond_None, ImVec2(0.5f, 1.0f));
+        asset_tooltip_style_scope tooltip_style;
+
         if(ImGui::BeginTooltipEx(ImGuiTooltipFlags_None, ImGuiWindowFlags_None))
         {
             constexpr float preview_scale = 2.75f;
@@ -614,68 +738,82 @@ auto draw_item(const content_browser_item& item)
             ImGui::EndTooltip();
         }
     }
-    else if(!item.is_loading && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip) && ImGui::BeginTooltip())
+    else if(!item.is_loading && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
     {
         constexpr float thumb_side = 72.0f;
         constexpr float wrap_width = 360.0f;
-
-        // Header: thumbnail next to the name and type.
-        ImGui::ImageWithAspect(citem.texId, texture_size, ImVec2(thumb_side, thumb_side), ImVec2(0.5f, 0.0f));
-        ImGui::SameLine();
-        ImGui::BeginGroup();
+        ImGui::SetNextWindowViewportToCurrent();
+        asset_tooltip_style_scope tooltip_style;
+        if(ImGui::BeginTooltipEx(ImGuiTooltipFlags_None, ImGuiWindowFlags_None))
         {
-            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrap_width);
-            ImGui::TextUnformatted(name.c_str());
-            ImGui::PopTextWrapPos();
-            if(!file_type.empty())
+            // Header: rounded thumbnail well next to the name and type.
+            draw_asset_tooltip_thumbnail(citem, texture_size, thumb_side);
+            ImGui::SameLine();
+            ImGui::BeginGroup();
             {
-                ImGui::PushFont(file_type_font, file_type_font->LegacySize);
-                ImGui::PushStyleColor(ImGuiCol_Text, content_caption_color);
-                ImGui::TextUnformatted(file_type.c_str());
-                ImGui::PopStyleColor();
+                auto name_font = ImGui::GetFont(ImGui::Font::Bold);
+                ImGui::PushFont(name_font, name_font->LegacySize);
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrap_width - thumb_side - ImGui::GetStyle().ItemSpacing.x);
+                ImGui::TextUnformatted(name.c_str());
+                ImGui::PopTextWrapPos();
                 ImGui::PopFont();
+
+                if(!file_type.empty())
+                {
+                    ImGui::PushFont(file_type_font, file_type_font->LegacySize * 0.9f);
+                    ImGui::PushStyleColor(ImGuiCol_Text, content_caption_color);
+                    ImGui::TextUnformatted(file_type.c_str());
+                    ImGui::PopStyleColor();
+                    ImGui::PopFont();
+                }
             }
-        }
-        ImGui::EndGroup();
+            ImGui::EndGroup();
 
-        // Separator tinted with the asset's type-accent color so the tooltip echoes the card's accent bar.
-        ImGui::PushStyleColor(ImGuiCol_Separator, asset_type_accent(file_type.c_str()));
-        ImGui::Separator();
-        ImGui::PopStyleColor();
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Separator, asset_type_accent(file_type.c_str()));
+            ImGui::Separator();
+            ImGui::PopStyleColor();
+            ImGui::Spacing();
 
-        const float label_width = 70.0f;
-        auto detail_row = [&](const char* label, const std::string& value) -> void
-        {
-            if(value.empty())
+            const float label_width = 130.0f;
+
+            draw_asset_tooltip_detail_row("Name", label_width, wrap_width, filename);
+            draw_asset_tooltip_detail_row("Path", label_width, wrap_width, item.entry.protocol_path);
+
+            if(!is_directory)
             {
-                return;
+                fs::error_code ec;
+                const auto bytes = fs::file_size(absolute_path, ec);
+                if(!ec)
+                {
+                    draw_asset_tooltip_detail_row("Disk Size", label_width, wrap_width, format_file_size(bytes));
+                }
+
+                const auto compiled_path =
+                    asset_reader::resolve_compiled_asset_path(item.entry.protocol_path, file_ext);
+                if(!compiled_path.empty())
+                {
+                    ec.clear();
+                    if(fs::exists(compiled_path, ec))
+                    {
+                        const auto compiled_bytes = fs::file_size(compiled_path, ec);
+                        if(!ec)
+                        {
+                            draw_asset_tooltip_detail_row("Compiled Disk Size",
+                                                          label_width,
+                                                          wrap_width,
+                                                          format_file_size(compiled_bytes));
+                        }
+                    }
+                }
             }
-            ImGui::TextDisabled("%s", label);
-            ImGui::SameLine(label_width);
-            ImGui::PushTextWrapPos(label_width + wrap_width);
-            ImGui::TextUnformatted(value.c_str());
-            ImGui::PopTextWrapPos();
-        };
 
-        detail_row("Name", filename);
-        detail_row("Path", item.entry.protocol_path);
-
-        if(!is_directory)
-        {
-            fs::error_code ec;
-            const auto bytes = fs::file_size(absolute_path, ec);
-            if(!ec)
+            if(!is_directory)
             {
-                detail_row("Size", format_file_size(bytes));
+                draw_asset_tooltip_detail_row("UID", label_width, wrap_width, description);
             }
+            ImGui::EndTooltip();
         }
-
-        if(!is_directory)
-        {
-            detail_row("UID", description);
-        }
-
-        ImGui::EndTooltip();
     }
 
     auto input_buff = ImGui::CreateInputTextBuffer(name);
@@ -689,6 +827,13 @@ auto draw_item(const content_browser_item& item)
             if(ImGui::MenuItemIcon(ICON_MDI_FOLDER_OPEN, "Open in Explorer"))
             {
                 fs::show_in_graphical_env(absolute_path);
+            }
+
+            if(ImGui::MenuItemIcon(ICON_MDI_LINK, "Copy Path"))
+            {
+                const std::string protocol_path =
+                    fs::convert_to_protocol(absolute_path).generic_string();
+                ImGui::SetClipboardText(protocol_path.c_str());
             }
 
             const bool can_reimport_file = asset_actions::can_reimport(absolute_path);
@@ -1331,12 +1476,32 @@ void content_browser_panel::draw_as_explorer(rtti::context& ctx, const fs::path&
                 const auto& name = cache_entry.stem;
                 const auto& filename = cache_entry.filename;
                 const auto& extension = cache_entry.extension;
+                bool passed = false;
 
-                if(filter_.PassFilter(name.c_str()) || 
-                   filter_.PassFilter(ex::get_type(extension, cache_entry.entry.is_directory()).c_str()))
+                if(filter_.PassFilter(name.c_str()))
                 {
+                    passed = true;
                     filtered_entries.emplace_back(cache_entry);
                 }
+
+                if(!passed)
+                {
+                    if(filter_.PassFilter(ex::get_type(extension, cache_entry.entry.is_directory()).c_str()))
+                    {
+                        passed = true;
+                        filtered_entries.emplace_back(cache_entry);
+                    }
+                }
+                
+                if(!passed)
+                {
+                    const auto& metadata = am.get_metadata_for_path(cache_entry.entry.path()).meta;
+                    if(filter_.PassFilter(metadata.uid.to_string().c_str()))
+                    {
+                        filtered_entries.emplace_back(cache_entry);
+                    }
+                }
+                
                 
             }
 
@@ -1428,17 +1593,18 @@ void content_browser_panel::context_create_menu(rtti::context& ctx, const fs::pa
 
         if(ImGui::MenuItem("C# Script"))
         {
-            auto& am = ctx.get_cached<asset_manager>();
-
             const auto available =
                 get_new_file_simple(target_path, "NewScriptComponent", ex::get_format<script>());
 
-            fs::error_code ec;
-            auto new_script_template =
-                fs::resolve_protocol("engine:/data/scripts/template/TemplateComponent" + ex::get_format<script>());
-            fs::copy(new_script_template, available, ec);
+            // The template lives outside the compiled scripts tree (.cs.in)
+            // so it never ends up in the engine assembly. Instantiate it with
+            // the unique file stem as the class name: the file must be valid,
+            // collision-free C# from the moment it exists, because a
+            // recompile can trigger before the user finishes renaming.
+            auto new_script_template = fs::resolve_protocol("engine:/data/templates/TemplateComponent" +
+                                                            ex::get_format<script>() + ".in");
 
-            if(!ec)
+            if(asset_actions::create_script_from_template(new_script_template, available))
             {
                 pending_rename = available;
             }
@@ -1579,35 +1745,7 @@ void content_browser_panel::import(rtti::context& ctx, const fs::path& target_pa
 
 void content_browser_panel::on_import(rtti::context& ctx, const std::vector<std::string>& paths, const fs::path& target_path)
 {
-    auto& ts = ctx.get_cached<threader>();
-
-    for(auto& path : paths)
-    {
-        fs::path p = fs::path(path).make_preferred();
-        fs::path filename = p.filename();
-
-        APPLOG_INFO("Importing {0}", filename.string());
-        auto task = ts.pool->schedule("Importing " + filename.extension().string(),
-            [target_path](const fs::path& path, const fs::path& filename)
-            {
-                fs::error_code err;
-                fs::path dir = target_path / filename;
-                if(fs::is_directory(path, err))
-                {
-                    fs::copy(path, dir, fs::copy_options::recursive, err);
-                    if(err)
-                    {
-                        APPLOG_ERROR("Failed to import directory {}, error: {}", path.string(), err.message());
-                    }
-                }
-                else 
-                {
-                    asset_writer::atomic_copy_file(path, dir, err);
-                }
-            },
-            p,
-            filename);
-    }
+    editor_actions::import_files(ctx, paths, target_path, true);
 }
 
 void content_browser_panel::prompt_delete_asset(const std::string& name, const std::function<void()>& on_delete)
@@ -1649,7 +1787,7 @@ void content_browser_panel::setup_delete_handler(content_browser_item& item, con
     };
 }
 
-void content_browser_panel::setup_rename_handler(content_browser_item& item, const fs::path& absolute_path, 
+void content_browser_panel::setup_rename_handler(content_browser_item& item, const fs::path& absolute_path,
                                                 const std::string& file_ext)
 {
     item.on_rename = [absolute_path, file_ext](const std::string& new_name)
@@ -1659,6 +1797,11 @@ void content_browser_panel::setup_rename_handler(content_browser_item& item, con
         new_absolute_path /= new_name + file_ext;
         fs::error_code err;
         fs::rename(absolute_path, new_absolute_path, err);
+
+        if(!err && file_ext == ex::get_format<script>())
+        {
+            sync_script_class_name(new_absolute_path, absolute_path.stem().string(), new_name);
+        }
     };
 }
 
