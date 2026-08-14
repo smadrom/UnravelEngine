@@ -3,6 +3,8 @@
 #include "json.hpp"
 #include "mcp_system.h"
 
+#include <editor/pwlogin/pw_login_ui.h>
+
 #include <engine/defaults/defaults.h>
 #include <engine/assets/asset_manager.h>
 #include <engine/ecs/components/id_component.h>
@@ -692,6 +694,7 @@ auto make_screenshot_result(mcp_system& sys, const json& params) -> json
     const auto path = params["path"].get<std::string>();
     const int w = params.value("w", 1280);
     const int h = params.value("h", 720);
+    const bool render_ui = params.value("ui", false);
     if(path.empty())
     {
         throw std::runtime_error("screenshot: 'path' must not be empty");
@@ -701,7 +704,7 @@ auto make_screenshot_result(mcp_system& sys, const json& params) -> json
         throw std::runtime_error("screenshot: 'w' and 'h' must be positive");
     }
 
-    sys.request_screenshot(path, static_cast<uint32_t>(w), static_cast<uint32_t>(h));
+    sys.request_screenshot(path, static_cast<uint32_t>(w), static_cast<uint32_t>(h), render_ui);
     return make_screenshot_status_result(sys.get_screenshot_status());
 }
 
@@ -984,6 +987,246 @@ auto make_log_tail_result(const json& params) -> json
     result["tail"] = std::move(tail);
     return result;
 }
+
+auto make_pw_session_ui_result(rtti::context& ctx, const json& params) -> json
+{
+    if(!params.contains("active") || !params["active"].is_boolean())
+    {
+        throw std::runtime_error("pw_session_ui: 'active' (boolean) required");
+    }
+    auto& login_ui = ctx.get_cached<pw_login_ui>();
+    if(params["active"].get<bool>())
+    {
+        login_ui.activate(ctx);
+    }
+    else
+    {
+        login_ui.deactivate(ctx);
+    }
+    return {{"active", login_ui.is_active()}};
+}
+
+auto make_pw_session_status_result(mcp_system& sys) -> json
+{
+    const pw_session_snapshot snapshot = sys.get_pw_session().get_snapshot();
+    json roles = json::array();
+    for(const pw_session_role& role : snapshot.roles)
+    {
+        roles.push_back({
+            {"role_id", role.role_id},
+            {"name", role.name},
+            {"profession", role.profession},
+            {"gender", role.gender},
+            {"race", role.race},
+            {"level", role.level},
+            {"level2", role.level2},
+            {"status", role.status},
+            {"deleting", role.deleting},
+            {"worldtag", role.worldtag},
+        });
+    }
+    json equipment = json::array();
+    for(const auto& entry : snapshot.preview.equipment)
+    {
+        equipment.push_back({{"slot", entry.first}, {"itemId", entry.second}});
+    }
+    json preview = {
+        {"serial", snapshot.preview.serial},
+        {"roleId", snapshot.preview.role_id},
+        {"profession", snapshot.preview.profession},
+        {"gender", snapshot.preview.gender},
+        {"race", snapshot.preview.race},
+        {"customPresent", snapshot.preview.custom_present},
+        {"colorBody", snapshot.preview.color_body},
+        {"colorHair", snapshot.preview.color_hair},
+        {"equipment", std::move(equipment)},
+        {"error", snapshot.preview.error},
+    };
+    json world = {
+        {"seq", snapshot.world.seq},
+        {"epoch", snapshot.world.epoch},
+        {"self",
+         {
+             {"roleId", snapshot.world.self.role_id},
+             {"instanceId", snapshot.world.self.instance_id},
+             {"position",
+              {{"x", snapshot.world.self.x},
+               {"y", snapshot.world.self.y},
+               {"z", snapshot.world.self.z}}},
+             {"direction",
+              {{"x", snapshot.world.self.dir_x},
+               {"y", snapshot.world.self.dir_y},
+               {"z", snapshot.world.self.dir_z}}},
+             {"hp", snapshot.world.self.hp},
+             {"maxHp", snapshot.world.self.max_hp},
+             {"mp", snapshot.world.self.mp},
+             {"maxMp", snapshot.world.self.max_mp},
+             {"level", snapshot.world.self.level},
+             {"dead", snapshot.world.self.dead},
+             {"moving", snapshot.world.self.moving},
+             {"targetId", snapshot.world.self.target_id},
+         }},
+        {"entityCount", snapshot.world.entities.size()},
+        {"error", snapshot.world.error},
+    };
+    return {
+        {"state", pw_session_state_name(snapshot.state)},
+        {"errorCode", snapshot.error_code},
+        {"errorMessage", snapshot.error_message},
+        {"roles", std::move(roles)},
+        {"roleListRevision", snapshot.role_list_revision},
+        {"selectedRoleId", snapshot.selected_role_id},
+        {"desiredCamera", pw_session_camera_name(snapshot.desired_camera)},
+        {"mutationCapable", snapshot.mutation_capable},
+        {"childPid", snapshot.child_pid},
+        {"attestedRoleId", snapshot.attested_role_id},
+        {"attestedInstanceId", snapshot.attested_instance_id},
+        {"preview", std::move(preview)},
+        {"world", std::move(world)},
+    };
+}
+
+auto make_pw_session_world_result(mcp_system& sys) -> json
+{
+    const pw_session_snapshot snapshot = sys.get_pw_session().get_snapshot();
+    json entities = json::array();
+    for(const pw_world_entity& entity : snapshot.world.entities)
+    {
+        entities.push_back({
+            {"id", entity.id},
+            {"kind", entity.kind},
+            {"templateId", entity.template_id},
+            {"name", entity.name},
+            {"x", entity.x},
+            {"y", entity.y},
+            {"z", entity.z},
+            {"dist", entity.dist},
+            {"dead", entity.dead},
+            {"gatherable", entity.gatherable},
+        });
+    }
+    return {
+        {"state", pw_session_state_name(snapshot.state)},
+        {"seq", snapshot.world.seq},
+        {"epoch", snapshot.world.epoch},
+        {"self",
+         {
+             {"roleId", snapshot.world.self.role_id},
+             {"instanceId", snapshot.world.self.instance_id},
+             {"position",
+              {{"x", snapshot.world.self.x},
+               {"y", snapshot.world.self.y},
+               {"z", snapshot.world.self.z}}},
+             {"direction",
+              {{"x", snapshot.world.self.dir_x},
+               {"y", snapshot.world.self.dir_y},
+               {"z", snapshot.world.self.dir_z}}},
+             {"hp", snapshot.world.self.hp},
+             {"maxHp", snapshot.world.self.max_hp},
+             {"mp", snapshot.world.self.mp},
+             {"maxMp", snapshot.world.self.max_mp},
+             {"level", snapshot.world.self.level},
+             {"dead", snapshot.world.self.dead},
+             {"moving", snapshot.world.self.moving},
+             {"targetId", snapshot.world.self.target_id},
+         }},
+        {"entities", std::move(entities)},
+        {"error", snapshot.world.error},
+    };
+}
+
+auto make_pw_session_world_action_result(mcp_system& sys, const json& params) -> json
+{
+    const std::string action = params.value("action", std::string());
+    const float x = params.value("x", 0.0f);
+    const float y = params.value("y", 0.0f);
+    const float z = params.value("z", 0.0f);
+    const int32_t id = params.value("id", 0);
+    if(action.empty())
+    {
+        throw std::runtime_error("pw_session_world_action: 'action' is required");
+    }
+    if(!sys.get_pw_session().world_action(action, x, y, z, id))
+    {
+        throw std::runtime_error(
+            "pw_session_world_action: rejected (unknown action or session is not in_world)");
+    }
+    return {{"accepted", true}};
+}
+
+auto make_pw_session_connect_result(mcp_system& sys) -> json
+{
+    // Credentials come ONLY from the process environment - never from MCP
+    // arguments, so they stay out of transcripts and logs.
+    const auto env_wide = [](const char* name) -> std::wstring
+    {
+        const char* value = std::getenv(name);
+        if(value == nullptr)
+        {
+            return {};
+        }
+        std::wstring out;
+        for(const unsigned char ch : std::string(value))
+        {
+            out.push_back(static_cast<wchar_t>(ch));
+        }
+        return out;
+    };
+    const auto env_utf8 = [](const char* name) -> std::string
+    {
+        const char* value = std::getenv(name);
+        return value != nullptr ? std::string(value) : std::string();
+    };
+    pw_session_connect_params params;
+    params.executable_path = env_wide("PW_RUNTIME_CLIENT_EXE");
+    params.working_directory = env_wide("PW_RUNTIME_WORKING_DIRECTORY");
+    params.server = env_wide("PW_SERVER");
+    params.account_utf8 = env_utf8("PW_ACCOUNT");
+    params.password_utf8 = env_utf8("PW_PASSWORD");
+    if(params.executable_path.empty() || params.account_utf8.empty() ||
+       params.password_utf8.empty() || params.server.empty())
+    {
+        params.clear_secrets();
+        throw std::runtime_error(
+            "pw_session_connect: PW_RUNTIME_CLIENT_EXE, PW_SERVER, PW_ACCOUNT and PW_PASSWORD must be set in the editor environment");
+    }
+    if(!sys.get_pw_session().connect(std::move(params)))
+    {
+        throw std::runtime_error("pw_session_connect: rejected in the current session state");
+    }
+    return {{"accepted", true}};
+}
+
+auto make_pw_session_select_result(mcp_system& sys, const json& params) -> json
+{
+    if(!params.contains("role_id") || !params["role_id"].is_number_integer())
+    {
+        throw std::runtime_error("pw_session_select: 'role_id' (integer) required");
+    }
+    if(!sys.get_pw_session().select_role(params["role_id"].get<int32_t>()))
+    {
+        throw std::runtime_error("pw_session_select: rejected (state or role)");
+    }
+    return {{"accepted", true}};
+}
+
+auto make_pw_session_enter_result(mcp_system& sys) -> json
+{
+    if(!sys.get_pw_session().enter_selected_role())
+    {
+        throw std::runtime_error("pw_session_enter: rejected (no selection or wrong state)");
+    }
+    return {{"accepted", true}};
+}
+
+auto make_pw_session_disconnect_result(mcp_system& sys) -> json
+{
+    if(!sys.get_pw_session().disconnect())
+    {
+        throw std::runtime_error("pw_session_disconnect: rejected (already idle)");
+    }
+    return {{"accepted", true}};
+}
 } // namespace
 
 namespace mcp_commands
@@ -1061,6 +1304,38 @@ auto dispatch(rtti::context& ctx, const std::string& req_json, mcp_system& sys) 
         else if(method == "log_tail")
         {
             result = make_log_tail_result(params);
+        }
+        else if(method == "pw_session_ui")
+        {
+            result = make_pw_session_ui_result(ctx, params);
+        }
+        else if(method == "pw_session_status")
+        {
+            result = make_pw_session_status_result(sys);
+        }
+        else if(method == "pw_session_world")
+        {
+            result = make_pw_session_world_result(sys);
+        }
+        else if(method == "pw_session_world_action")
+        {
+            result = make_pw_session_world_action_result(sys, params);
+        }
+        else if(method == "pw_session_connect")
+        {
+            result = make_pw_session_connect_result(sys);
+        }
+        else if(method == "pw_session_select")
+        {
+            result = make_pw_session_select_result(sys, params);
+        }
+        else if(method == "pw_session_enter")
+        {
+            result = make_pw_session_enter_result(sys);
+        }
+        else if(method == "pw_session_disconnect")
+        {
+            result = make_pw_session_disconnect_result(sys);
         }
         else
         {

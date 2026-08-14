@@ -28,6 +28,7 @@ imgui_panels::imgui_panels()
     inspector_panel_ = std::make_unique<inspector_panel>(this, INSPECTOR_VIEW);
     scene_panel_ = std::make_unique<scene_panel>(this, SCENE_VIEW);
     game_panel_ = std::make_unique<game_panel>(this, GAME_VIEW);
+    pw_login_panel_ = std::make_unique<pw_login_panel>(this, PW_LOGIN_VIEW);
     profiler_timeline_panel_ = std::make_unique<profiler_timeline_panel>(this, PROFILER_VIEW);
     animation_panel_ = std::make_unique<animation_panel>(this);
     mcp_panel_ = std::make_unique<mcp_panel>(this);
@@ -54,6 +55,7 @@ void imgui_panels::init(rtti::context& ctx)
     inspector_panel_->init(ctx);
     scene_panel_->init(ctx);
     game_panel_->init(ctx);
+    pw_login_panel_->init(ctx);
     animation_panel_->init(ctx);
     mcp_panel_->init(ctx);
 
@@ -66,6 +68,7 @@ void imgui_panels::deinit(rtti::context& ctx)
     content_browser_panel_->deinit(ctx);
     scene_panel_->deinit(ctx);
     game_panel_->deinit(ctx);
+    pw_login_panel_->deinit(ctx);
     inspector_panel_->deinit(ctx);
     animation_panel_->deinit(ctx);
     mcp_panel_->deinit(ctx);
@@ -87,6 +90,7 @@ void imgui_panels::on_frame_render(rtti::context& ctx, delta_t dt)
 {
     scene_panel_->on_frame_render(ctx, dt);
     game_panel_->on_frame_render(ctx, dt);
+    pw_login_panel_->on_frame_render(ctx, dt);
 }
 
 void imgui_panels::on_frame_ui_render(rtti::context& ctx)
@@ -99,7 +103,8 @@ void imgui_panels::on_frame_ui_render(rtti::context& ctx)
         std::vector<panel_base*> panels =
         {
             scene_panel_.get(),
-            game_panel_.get()
+            game_panel_.get(),
+            pw_login_panel_.get()
         };
         for(const auto& panel : panels)
         {
@@ -151,6 +156,8 @@ void imgui_panels::on_frame_ui_render(rtti::context& ctx)
         scene_panel_->on_frame_ui_render(ctx);
 
         game_panel_->on_frame_ui_render(ctx);
+
+        pw_login_panel_->on_frame_ui_render(ctx);
 
         layout_panel_->on_frame_ui_render(ctx);
 
@@ -206,6 +213,11 @@ auto imgui_panels::get_scene_panel() -> scene_panel&
 auto imgui_panels::get_game_panel() -> game_panel&
 {
     return *game_panel_;
+}
+
+auto imgui_panels::get_pw_login_panel() -> pw_login_panel&
+{
+    return *pw_login_panel_;
 }
 
 auto imgui_panels::get_console_log_panel() -> console_log_panel&

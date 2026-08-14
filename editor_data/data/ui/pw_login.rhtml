@@ -1,0 +1,63 @@
+<html>
+<head>
+    <title>Perfect World Login</title>
+    <link type="text/rcss" href="engine:/data/ui/rml.rcss"/>
+    <link type="text/rcss" href="editor:/data/ui/pw_login.rcss"/>
+</head>
+<body id="pw-login-root">
+    <div id="pw-screen-login" class="pw-screen">
+        <div class="pw-panel">
+            <h1 class="pw-title">Perfect World</h1>
+            <div class="pw-subtitle">Sign in to continue</div>
+            <div class="pw-field">
+                <label class="pw-label" for="pw-server">Server</label>
+                <input class="pw-input" type="text" id="pw-server" maxlength="128"/>
+            </div>
+            <div class="pw-field">
+                <label class="pw-label" for="pw-account">Account</label>
+                <input class="pw-input" type="text" id="pw-account" maxlength="64"/>
+            </div>
+            <div class="pw-field">
+                <label class="pw-label" for="pw-password">Password</label>
+                <input class="pw-input" type="password" id="pw-password" maxlength="64"/>
+            </div>
+            <button class="pw-button" id="pw-connect">Connect</button>
+            <div id="pw-login-status" class="pw-status"></div>
+            <div id="pw-login-error" class="pw-error"></div>
+        </div>
+    </div>
+    <div id="pw-screen-select" class="pw-screen" style="display: none;">
+        <div class="pw-panel pw-select-panel">
+            <h1 class="pw-title">Select Character</h1>
+            <div class="pw-select-body">
+                <div id="pw-role-list" class="pw-role-list"></div>
+                <div id="pw-role-detail" class="pw-role-detail">
+                    <div id="pw-detail-name" class="pw-detail-name">-</div>
+                    <div id="pw-detail-class" class="pw-detail-line">-</div>
+                    <div id="pw-detail-level" class="pw-detail-line">-</div>
+                    <div id="pw-detail-equip" class="pw-detail-line">-</div>
+                </div>
+            </div>
+            <div class="pw-buttons">
+                <button class="pw-button" id="pw-start" disabled>Start</button>
+                <button class="pw-button pw-button-secondary" id="pw-back">Back</button>
+            </div>
+            <div id="pw-select-status" class="pw-status"></div>
+        </div>
+    </div>
+    <div id="pw-screen-inworld" class="pw-screen" style="display: none;">
+        <div class="pw-panel">
+            <h1 class="pw-title">Perfect World</h1>
+            <div id="pw-inworld-info" class="pw-status"></div>
+            <div class="pw-buttons">
+                <button class="pw-button" id="pw-move-fwd">Forward</button>
+                <button class="pw-button" id="pw-stop">Stop</button>
+                <button class="pw-button" id="pw-jump">Jump</button>
+                <button class="pw-button" id="pw-target">Target</button>
+                <button class="pw-button" id="pw-attack">Attack</button>
+            </div>
+            <button class="pw-button pw-button-secondary" id="pw-disconnect">Disconnect</button>
+        </div>
+    </div>
+</body>
+</html>

@@ -5,6 +5,7 @@
 
 #include <editor/editing/editing_manager.h>
 #include <editor/editing/editor_actions.h>
+#include <editor/pwlogin/pw_login_ui.h>
 #include <editor/shortcuts.h>
 #include <editor/system/project_manager.h>
 #include <editor/system/version_manager.h>
@@ -144,6 +145,24 @@ void header_panel::draw_menubar_child(rtti::context& ctx)
             if(ImGui::MenuItem("Close Project", nullptr))
             {
                 editor_actions::close_project(ctx);
+            }
+            ImGui::EndMenu();
+        }
+
+        if(ImGui::BeginMenu("Perfect World"))
+        {
+            auto& login_ui = ctx.get_cached<pw_login_ui>();
+            const bool login_active = login_ui.is_active();
+            if(ImGui::MenuItem(ICON_MDI_ACCOUNT_KEY " Login / Character Select", nullptr, login_active))
+            {
+                if(login_active)
+                {
+                    login_ui.deactivate(ctx);
+                }
+                else
+                {
+                    login_ui.activate(ctx);
+                }
             }
             ImGui::EndMenu();
         }

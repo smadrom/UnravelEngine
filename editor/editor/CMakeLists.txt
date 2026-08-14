@@ -19,7 +19,11 @@ target_link_libraries(${target_name} PUBLIC
     imgui 
     filedialog 
     httplib
+    pw_runtime_api
 )
+if(TARGET pw_runtime_bridge)
+  add_dependencies(${target_name} pw_runtime_bridge)
+endif()
 if(WIN32)
   set_target_properties(${target_name} PROPERTIES OUTPUT_NAME "UnravelEditor")
   add_definitions(-DEDITOR_NAME="UnravelEditor")

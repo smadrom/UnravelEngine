@@ -20,6 +20,7 @@
 #include "inspector_panel/inspector_panel.h"
 #include "layout_panel/layout_panel.h"
 #include "project_settings_panel/project_settings_panel.h"
+#include "pw_login_panel/pw_login_panel.h"
 #include "scene_panel/scene_panel.h"
 #include "profiler_panel/profiler_timeline_panel.h"
 #include "style_panel/style_panel.h"
@@ -47,6 +48,7 @@ public:
     auto get_editor_settings_panel() -> editor_settings_panel&;
     auto get_scene_panel() -> scene_panel&;
     auto get_game_panel() -> game_panel&;
+    auto get_pw_login_panel() -> pw_login_panel&;
     auto get_console_log_panel() -> console_log_panel&;
     auto get_style_panel() -> style_panel&;
     auto get_undo_redo_panel() -> undo_redo_panel&;
@@ -84,6 +86,7 @@ private:
     std::unique_ptr<inspector_panel> inspector_panel_;
     std::unique_ptr<scene_panel> scene_panel_;
     std::unique_ptr<game_panel> game_panel_;
+    std::unique_ptr<pw_login_panel> pw_login_panel_;
     std::unique_ptr<profiler_timeline_panel> profiler_timeline_panel_;
     std::unique_ptr<header_panel> header_panel_;
     std::unique_ptr<footer_panel> footer_panel_;

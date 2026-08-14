@@ -1,6 +1,8 @@
 #pragma once
 
 #include "mcp_control_server.h"
+#include "pw_runtime_client.h"
+#include "pw_session_controller.h"
 #include "terrain_height_sampler.h"
 
 #include <base/basetypes.hpp>
@@ -42,6 +44,8 @@ struct login_scene_config
 class mcp_system
 {
 public:
+    mcp_system();
+
     struct login_load_status
     {
         std::string status = "idle";
@@ -137,7 +141,7 @@ public:
     void on_frame_end(rtti::context& ctx, delta_t dt);
     auto ensure_camera(rtti::context& ctx) -> entt::handle;
     void invalidate_camera();
-    void request_screenshot(const std::string& path, uint32_t w, uint32_t h);
+    void request_screenshot(const std::string& path, uint32_t w, uint32_t h, bool render_ui = false);
     void start_login_load(const std::string& content_root, uint32_t buildings_per_frame, bool restart);
     auto get_login_load_status() const -> login_load_status;
     auto get_screenshot_status() const -> screenshot_status;
@@ -146,13 +150,21 @@ public:
     auto get_login_terrain() const -> const terrain_heightfield&;
     auto get_login_scene_config() const -> login_scene_config;
     auto get_login_content_root() const -> const std::string&;
+    auto get_pw_runtime() -> pw_runtime_client&;
+    auto get_pw_session() -> pw_session_controller&;
+    /** Copies the mcp camera pose/params onto the scene-panel viewport camera. */
+    void sync_camera_to_scene_viewport(rtti::context& ctx);
 
 private:
     void service_pending_screenshot(rtti::context& ctx);
     void service_login_loader(rtti::context& ctx);
+    void service_pw_session(rtti::context& ctx);
     void clear_pending_readback();
 
     McpControlServer server_;
+    pw_runtime_client pw_runtime_;
+    pw_session_controller pw_session_;
+    pw_session_camera applied_pw_camera_ = pw_session_camera::none;
     std::shared_ptr<int> sentinel_ = std::make_shared<int>(0);
     entt::handle mcp_cam_;
 
@@ -161,6 +173,7 @@ private:
         std::string path;
         uint32_t w = 0;
         uint32_t h = 0;
+        bool render_ui = false;
         int frames_left = 0;
         int readback_frames_left = 0;
         bool active = false;
@@ -200,6 +213,7 @@ private:
         bool terrain_created = false;
         bool water_created_flag = false;
         bool environment_created = false;
+        uint32_t character_attempts = 0;
     };
 
     login_loader login_;

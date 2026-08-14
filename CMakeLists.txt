@@ -68,6 +68,7 @@ message(STATUS "CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}")
 option(BUILD_ENGINE_SHARED "Build as a shared library." ON)
 option(BUILD_ENGINE_TESTS "Build the tests" OFF)
 option(BUILD_ENGINE_WITH_CODE_STYLE_CHECKS "Build with code style checks." OFF)
+option(UNRAVEL_BUILD_PW_RUNTIME_BRIDGE "Build the optional Perfect World headless runtime bridge." OFF)
 
 set(BUILD_ENGINE_SHARED OFF CACHE BOOL "" FORCE)
 if(BUILD_ENGINE_SHARED)
@@ -176,6 +177,7 @@ if(NOT DEFINED UNRAVEL_UNITY_BUILD)
 endif()
 
 add_subdirectory(deps)
+add_subdirectory(integrations/pw_runtime)
 #add_subdirectory(version)
 add_subdirectory(engine)
 add_subdirectory(editor)
@@ -187,7 +189,7 @@ add_custom_target(engine_data
                   ALL
                   COMMAND ${CMAKE_COMMAND} -E copy ${BGFX_DIR}/src/bgfx_shader.sh ${PROJECT_SOURCE_DIR}/engine_data/data/shaders
                   COMMAND ${CMAKE_COMMAND} -E copy ${BGFX_DIR}/src/bgfx_compute.sh ${PROJECT_SOURCE_DIR}/engine_data/data/shaders
-                  COMMAND ${CMAKE_COMMAND} -E copy_directory ${PROJECT_SOURCE_DIR}/engine_data ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/data/engine
+                  COMMAND ${CMAKE_COMMAND} -E copy_directory ${PROJECT_SOURCE_DIR}/engine_data ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/data/engine
 
                   SOURCES ${SOURCES}
                   COMMENT "Copying engine data..."
@@ -199,7 +201,7 @@ add_custom_target(engine_data
 file(GLOB_RECURSE SOURCES ${PROJECT_SOURCE_DIR}/editor_data/data/shaders/* )
 add_custom_target(editor_data
                   ALL
-                  COMMAND ${CMAKE_COMMAND} -E copy_directory ${PROJECT_SOURCE_DIR}/editor_data ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/data/editor
+                  COMMAND ${CMAKE_COMMAND} -E copy_directory ${PROJECT_SOURCE_DIR}/editor_data ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/data/editor
 
                   SOURCES
                   ${SOURCES}

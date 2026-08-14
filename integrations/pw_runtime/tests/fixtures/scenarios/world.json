@@ -1,0 +1,2093 @@
+{
+  "scenario": "world",
+  "description": "success flow plus the WP7 world stream: in_world pw.status carries self position/hp and pw.nearby returns a four-entity set (alive monster, dead monster, npc, player). Drives pw.nearby once for the contract check.",
+  "expected_terminal_error_code": null,
+  "disconnect_after_calls": null,
+  "tools_list_fixture": "../baseline-tools-list.json",
+  "tools": {
+    "pw.status": {
+      "responses": [
+        {
+          "ok": true,
+          "errorCode": "",
+          "message": "status",
+          "state": {
+            "connected": false,
+            "inWorld": false,
+            "gameState": 0,
+            "roleId": 0,
+            "roleName": "",
+            "selectedRole": {
+              "id": 0,
+              "worldtag": 0,
+              "status": 0,
+              "level": 0,
+              "position": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              }
+            },
+            "roleManagement": {
+              "state": 0,
+              "complete": false,
+              "createdRoleId": 0,
+              "targetStatuses": "",
+              "lastError": ""
+            },
+            "instanceId": 0,
+            "position": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0
+            },
+            "direction": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 1.0
+            },
+            "lastSentPosition": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0
+            },
+            "lastServerCorrection": {
+              "valid": false,
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0,
+              "ageMs": 0,
+              "count": 0
+            },
+            "moving": false,
+            "grounded": false,
+            "jumping": false,
+            "flying": false,
+            "falling": false,
+            "swimming": false,
+            "moveEnv": 0,
+            "moveEnvName": "ground",
+            "moveMode": 0,
+            "moveModeName": "stand",
+            "work": {
+              "id": 0,
+              "name": ""
+            },
+            "terrain": {
+              "available": false,
+              "height": 0.0,
+              "heightAbove": 0.0
+            },
+            "collision": {
+              "available": false,
+              "providers": 0,
+              "brushes": 0,
+              "blockedCount": 0,
+              "aheadBlocked": false,
+              "fraction": 0.0,
+              "normal": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0
+              },
+              "probeDistanceCm": 0,
+              "probes": []
+            },
+            "navigation": {
+              "state": 0,
+              "stateName": "idle",
+              "usage": 0,
+              "usageName": "none",
+              "destination": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "waypoint": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "nodesRemaining": 0,
+              "distance": 0.0
+            },
+            "targetId": 0,
+            "serviceNpcId": 0,
+            "safeLock": {
+              "active": 0,
+              "end": 0,
+              "remaining": 0,
+              "total": 0
+            },
+            "dead": false,
+            "hp": 0,
+            "maxHp": 0,
+            "mp": 0,
+            "maxMp": 0,
+            "level": 0,
+            "exp": 0,
+            "login": {
+              "phase": "offline",
+              "roleListReady": false,
+              "roleListRevision": 0,
+              "expectedRoleId": 0,
+              "expectedWorldTag": 0,
+              "lastError": ""
+            }
+          }
+        },
+        {
+          "ok": true,
+          "errorCode": "",
+          "message": "status",
+          "state": {
+            "connected": true,
+            "inWorld": false,
+            "gameState": 0,
+            "roleId": 0,
+            "roleName": "",
+            "selectedRole": {
+              "id": 0,
+              "worldtag": 0,
+              "status": 0,
+              "level": 0,
+              "position": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              }
+            },
+            "roleManagement": {
+              "state": 0,
+              "complete": false,
+              "createdRoleId": 0,
+              "targetStatuses": "",
+              "lastError": ""
+            },
+            "instanceId": 0,
+            "position": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0
+            },
+            "direction": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 1.0
+            },
+            "lastSentPosition": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0
+            },
+            "lastServerCorrection": {
+              "valid": false,
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0,
+              "ageMs": 0,
+              "count": 0
+            },
+            "moving": false,
+            "grounded": false,
+            "jumping": false,
+            "flying": false,
+            "falling": false,
+            "swimming": false,
+            "moveEnv": 0,
+            "moveEnvName": "ground",
+            "moveMode": 0,
+            "moveModeName": "stand",
+            "work": {
+              "id": 0,
+              "name": ""
+            },
+            "terrain": {
+              "available": false,
+              "height": 0.0,
+              "heightAbove": 0.0
+            },
+            "collision": {
+              "available": false,
+              "providers": 0,
+              "brushes": 0,
+              "blockedCount": 0,
+              "aheadBlocked": false,
+              "fraction": 0.0,
+              "normal": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0
+              },
+              "probeDistanceCm": 0,
+              "probes": []
+            },
+            "navigation": {
+              "state": 0,
+              "stateName": "idle",
+              "usage": 0,
+              "usageName": "none",
+              "destination": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "waypoint": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "nodesRemaining": 0,
+              "distance": 0.0
+            },
+            "targetId": 0,
+            "serviceNpcId": 0,
+            "safeLock": {
+              "active": 0,
+              "end": 0,
+              "remaining": 0,
+              "total": 0
+            },
+            "dead": false,
+            "hp": 0,
+            "maxHp": 0,
+            "mp": 0,
+            "maxMp": 0,
+            "level": 0,
+            "exp": 0,
+            "login": {
+              "phase": "authenticating",
+              "roleListReady": false,
+              "roleListRevision": 0,
+              "expectedRoleId": 0,
+              "expectedWorldTag": 0,
+              "lastError": ""
+            }
+          }
+        },
+        {
+          "ok": true,
+          "errorCode": "",
+          "message": "status",
+          "state": {
+            "connected": true,
+            "inWorld": false,
+            "gameState": 1,
+            "roleId": 0,
+            "roleName": "",
+            "selectedRole": {
+              "id": 1024,
+              "worldtag": 1,
+              "status": 0,
+              "level": 30,
+              "position": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              }
+            },
+            "roleManagement": {
+              "state": 0,
+              "complete": false,
+              "createdRoleId": 0,
+              "targetStatuses": "",
+              "lastError": ""
+            },
+            "instanceId": 0,
+            "position": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0
+            },
+            "direction": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 1.0
+            },
+            "lastSentPosition": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0
+            },
+            "lastServerCorrection": {
+              "valid": false,
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0,
+              "ageMs": 0,
+              "count": 0
+            },
+            "moving": false,
+            "grounded": false,
+            "jumping": false,
+            "flying": false,
+            "falling": false,
+            "swimming": false,
+            "moveEnv": 0,
+            "moveEnvName": "ground",
+            "moveMode": 0,
+            "moveModeName": "stand",
+            "work": {
+              "id": 0,
+              "name": ""
+            },
+            "terrain": {
+              "available": false,
+              "height": 0.0,
+              "heightAbove": 0.0
+            },
+            "collision": {
+              "available": false,
+              "providers": 0,
+              "brushes": 0,
+              "blockedCount": 0,
+              "aheadBlocked": false,
+              "fraction": 0.0,
+              "normal": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0
+              },
+              "probeDistanceCm": 0,
+              "probes": []
+            },
+            "navigation": {
+              "state": 0,
+              "stateName": "idle",
+              "usage": 0,
+              "usageName": "none",
+              "destination": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "waypoint": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "nodesRemaining": 0,
+              "distance": 0.0
+            },
+            "targetId": 0,
+            "serviceNpcId": 0,
+            "safeLock": {
+              "active": 0,
+              "end": 0,
+              "remaining": 0,
+              "total": 0
+            },
+            "dead": false,
+            "hp": 0,
+            "maxHp": 0,
+            "mp": 0,
+            "maxMp": 0,
+            "level": 0,
+            "exp": 0,
+            "login": {
+              "phase": "character_select",
+              "roleListReady": true,
+              "roleListRevision": 1,
+              "expectedRoleId": 0,
+              "expectedWorldTag": 0,
+              "lastError": ""
+            }
+          }
+        },
+        {
+          "ok": true,
+          "errorCode": "",
+          "message": "status",
+          "state": {
+            "connected": true,
+            "inWorld": false,
+            "gameState": 1,
+            "roleId": 0,
+            "roleName": "",
+            "selectedRole": {
+              "id": 1025,
+              "worldtag": 1,
+              "status": 0,
+              "level": 12,
+              "position": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              }
+            },
+            "roleManagement": {
+              "state": 0,
+              "complete": false,
+              "createdRoleId": 0,
+              "targetStatuses": "",
+              "lastError": ""
+            },
+            "instanceId": 0,
+            "position": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0
+            },
+            "direction": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 1.0
+            },
+            "lastSentPosition": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0
+            },
+            "lastServerCorrection": {
+              "valid": false,
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0,
+              "ageMs": 0,
+              "count": 0
+            },
+            "moving": false,
+            "grounded": false,
+            "jumping": false,
+            "flying": false,
+            "falling": false,
+            "swimming": false,
+            "moveEnv": 0,
+            "moveEnvName": "ground",
+            "moveMode": 0,
+            "moveModeName": "stand",
+            "work": {
+              "id": 0,
+              "name": ""
+            },
+            "terrain": {
+              "available": false,
+              "height": 0.0,
+              "heightAbove": 0.0
+            },
+            "collision": {
+              "available": false,
+              "providers": 0,
+              "brushes": 0,
+              "blockedCount": 0,
+              "aheadBlocked": false,
+              "fraction": 0.0,
+              "normal": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0
+              },
+              "probeDistanceCm": 0,
+              "probes": []
+            },
+            "navigation": {
+              "state": 0,
+              "stateName": "idle",
+              "usage": 0,
+              "usageName": "none",
+              "destination": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "waypoint": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "nodesRemaining": 0,
+              "distance": 0.0
+            },
+            "targetId": 0,
+            "serviceNpcId": 0,
+            "safeLock": {
+              "active": 0,
+              "end": 0,
+              "remaining": 0,
+              "total": 0
+            },
+            "dead": false,
+            "hp": 0,
+            "maxHp": 0,
+            "mp": 0,
+            "maxMp": 0,
+            "level": 0,
+            "exp": 0,
+            "login": {
+              "phase": "entering_world",
+              "roleListReady": true,
+              "roleListRevision": 1,
+              "expectedRoleId": 1025,
+              "expectedWorldTag": 1,
+              "lastError": ""
+            }
+          }
+        },
+        {
+          "ok": true,
+          "errorCode": "",
+          "message": "status",
+          "state": {
+            "connected": true,
+            "inWorld": true,
+            "gameState": 2,
+            "roleId": 1025,
+            "roleName": "TestMage",
+            "selectedRole": {
+              "id": 1025,
+              "worldtag": 1,
+              "status": 0,
+              "level": 12,
+              "position": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              }
+            },
+            "roleManagement": {
+              "state": 0,
+              "complete": false,
+              "createdRoleId": 0,
+              "targetStatuses": "",
+              "lastError": ""
+            },
+            "instanceId": 1,
+            "position": {
+              "x": 128.5,
+              "y": 964.25,
+              "z": 20.0
+            },
+            "direction": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 1.0
+            },
+            "lastSentPosition": {
+              "x": 128.5,
+              "y": 964.25,
+              "z": 20.0
+            },
+            "lastServerCorrection": {
+              "valid": false,
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0,
+              "ageMs": 0,
+              "count": 0
+            },
+            "moving": false,
+            "grounded": true,
+            "jumping": false,
+            "flying": false,
+            "falling": false,
+            "swimming": false,
+            "moveEnv": 0,
+            "moveEnvName": "ground",
+            "moveMode": 0,
+            "moveModeName": "stand",
+            "work": {
+              "id": 0,
+              "name": ""
+            },
+            "terrain": {
+              "available": true,
+              "height": 20.0,
+              "heightAbove": 0.0
+            },
+            "collision": {
+              "available": true,
+              "providers": 1,
+              "brushes": 0,
+              "blockedCount": 0,
+              "aheadBlocked": false,
+              "fraction": 0.0,
+              "normal": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0
+              },
+              "probeDistanceCm": 0,
+              "probes": []
+            },
+            "navigation": {
+              "state": 0,
+              "stateName": "idle",
+              "usage": 0,
+              "usageName": "none",
+              "destination": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "waypoint": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "nodesRemaining": 0,
+              "distance": 0.0
+            },
+            "targetId": 0,
+            "serviceNpcId": 0,
+            "safeLock": {
+              "active": 0,
+              "end": 0,
+              "remaining": 0,
+              "total": 0
+            },
+            "dead": false,
+            "hp": 180,
+            "maxHp": 180,
+            "mp": 240,
+            "maxMp": 240,
+            "level": 12,
+            "exp": 1500,
+            "login": {
+              "phase": "in_world",
+              "roleListReady": true,
+              "roleListRevision": 1,
+              "expectedRoleId": 0,
+              "expectedWorldTag": 0,
+              "lastError": ""
+            }
+          }
+        }
+      ]
+    },
+    "pw.role_list": {
+      "responses": [
+        {
+          "ok": true,
+          "errorCode": "",
+          "message": "role_list",
+          "state": {
+            "connected": true,
+            "inWorld": false,
+            "gameState": 1,
+            "roleId": 0,
+            "roleName": "",
+            "selectedRole": {
+              "id": 1024,
+              "worldtag": 1,
+              "status": 0,
+              "level": 30,
+              "position": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              }
+            },
+            "roleManagement": {
+              "state": 0,
+              "complete": false,
+              "createdRoleId": 0,
+              "targetStatuses": "",
+              "lastError": ""
+            },
+            "instanceId": 0,
+            "position": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0
+            },
+            "direction": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 1.0
+            },
+            "lastSentPosition": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0
+            },
+            "lastServerCorrection": {
+              "valid": false,
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0,
+              "ageMs": 0,
+              "count": 0
+            },
+            "moving": false,
+            "grounded": false,
+            "jumping": false,
+            "flying": false,
+            "falling": false,
+            "swimming": false,
+            "moveEnv": 0,
+            "moveEnvName": "ground",
+            "moveMode": 0,
+            "moveModeName": "stand",
+            "work": {
+              "id": 0,
+              "name": ""
+            },
+            "terrain": {
+              "available": false,
+              "height": 0.0,
+              "heightAbove": 0.0
+            },
+            "collision": {
+              "available": false,
+              "providers": 0,
+              "brushes": 0,
+              "blockedCount": 0,
+              "aheadBlocked": false,
+              "fraction": 0.0,
+              "normal": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0
+              },
+              "probeDistanceCm": 0,
+              "probes": []
+            },
+            "navigation": {
+              "state": 0,
+              "stateName": "idle",
+              "usage": 0,
+              "usageName": "none",
+              "destination": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "waypoint": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "nodesRemaining": 0,
+              "distance": 0.0
+            },
+            "targetId": 0,
+            "serviceNpcId": 0,
+            "safeLock": {
+              "active": 0,
+              "end": 0,
+              "remaining": 0,
+              "total": 0
+            },
+            "dead": false,
+            "hp": 0,
+            "maxHp": 0,
+            "mp": 0,
+            "maxMp": 0,
+            "level": 0,
+            "exp": 0,
+            "login": {
+              "phase": "character_select",
+              "roleListReady": true,
+              "roleListRevision": 1,
+              "expectedRoleId": 0,
+              "expectedWorldTag": 0,
+              "lastError": ""
+            }
+          },
+          "payload": {
+            "roles": [
+              {
+                "role_id": 1024,
+                "name": "TestWarrior",
+                "profession": 0,
+                "gender": 0,
+                "race": 0,
+                "level": 30,
+                "level2": 0,
+                "status": 0,
+                "deleting": false,
+                "create_time": 1700000000,
+                "delete_time": 0,
+                "worldtag": 1
+              },
+              {
+                "role_id": 1025,
+                "name": "TestMage",
+                "profession": 3,
+                "gender": 1,
+                "race": 0,
+                "level": 12,
+                "level2": 0,
+                "status": 0,
+                "deleting": false,
+                "create_time": 1700000100,
+                "delete_time": 0,
+                "worldtag": 1
+              }
+            ],
+            "slotsUsed": 2,
+            "slotsMax": 8,
+            "revision": 1
+          }
+        }
+      ]
+    },
+    "pw.role_enter": {
+      "responses": [
+        {
+          "ok": true,
+          "errorCode": "",
+          "message": "role_enter accepted; poll with the same arguments and operation_id",
+          "state": {
+            "connected": true,
+            "inWorld": false,
+            "gameState": 1,
+            "roleId": 0,
+            "roleName": "",
+            "selectedRole": {
+              "id": 1025,
+              "worldtag": 1,
+              "status": 0,
+              "level": 12,
+              "position": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              }
+            },
+            "roleManagement": {
+              "state": 0,
+              "complete": false,
+              "createdRoleId": 0,
+              "targetStatuses": "",
+              "lastError": ""
+            },
+            "instanceId": 0,
+            "position": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0
+            },
+            "direction": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 1.0
+            },
+            "lastSentPosition": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0
+            },
+            "lastServerCorrection": {
+              "valid": false,
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0,
+              "ageMs": 0,
+              "count": 0
+            },
+            "moving": false,
+            "grounded": false,
+            "jumping": false,
+            "flying": false,
+            "falling": false,
+            "swimming": false,
+            "moveEnv": 0,
+            "moveEnvName": "ground",
+            "moveMode": 0,
+            "moveModeName": "stand",
+            "work": {
+              "id": 0,
+              "name": ""
+            },
+            "terrain": {
+              "available": false,
+              "height": 0.0,
+              "heightAbove": 0.0
+            },
+            "collision": {
+              "available": false,
+              "providers": 0,
+              "brushes": 0,
+              "blockedCount": 0,
+              "aheadBlocked": false,
+              "fraction": 0.0,
+              "normal": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0
+              },
+              "probeDistanceCm": 0,
+              "probes": []
+            },
+            "navigation": {
+              "state": 0,
+              "stateName": "idle",
+              "usage": 0,
+              "usageName": "none",
+              "destination": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "waypoint": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "nodesRemaining": 0,
+              "distance": 0.0
+            },
+            "targetId": 0,
+            "serviceNpcId": 0,
+            "safeLock": {
+              "active": 0,
+              "end": 0,
+              "remaining": 0,
+              "total": 0
+            },
+            "dead": false,
+            "hp": 0,
+            "maxHp": 0,
+            "mp": 0,
+            "maxMp": 0,
+            "level": 0,
+            "exp": 0,
+            "login": {
+              "phase": "entering_world",
+              "roleListReady": true,
+              "roleListRevision": 1,
+              "expectedRoleId": 1025,
+              "expectedWorldTag": 1,
+              "lastError": ""
+            }
+          },
+          "payload": {
+            "result": "pending",
+            "packetSent": true,
+            "operationId": 7
+          }
+        },
+        {
+          "ok": true,
+          "errorCode": "",
+          "message": "role_enter complete",
+          "state": {
+            "connected": true,
+            "inWorld": true,
+            "gameState": 2,
+            "roleId": 1025,
+            "roleName": "TestMage",
+            "selectedRole": {
+              "id": 1025,
+              "worldtag": 1,
+              "status": 0,
+              "level": 12,
+              "position": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              }
+            },
+            "roleManagement": {
+              "state": 0,
+              "complete": false,
+              "createdRoleId": 0,
+              "targetStatuses": "",
+              "lastError": ""
+            },
+            "instanceId": 1,
+            "position": {
+              "x": 128.5,
+              "y": 964.25,
+              "z": 20.0
+            },
+            "direction": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 1.0
+            },
+            "lastSentPosition": {
+              "x": 128.5,
+              "y": 964.25,
+              "z": 20.0
+            },
+            "lastServerCorrection": {
+              "valid": false,
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0,
+              "ageMs": 0,
+              "count": 0
+            },
+            "moving": false,
+            "grounded": true,
+            "jumping": false,
+            "flying": false,
+            "falling": false,
+            "swimming": false,
+            "moveEnv": 0,
+            "moveEnvName": "ground",
+            "moveMode": 0,
+            "moveModeName": "stand",
+            "work": {
+              "id": 0,
+              "name": ""
+            },
+            "terrain": {
+              "available": true,
+              "height": 20.0,
+              "heightAbove": 0.0
+            },
+            "collision": {
+              "available": true,
+              "providers": 1,
+              "brushes": 0,
+              "blockedCount": 0,
+              "aheadBlocked": false,
+              "fraction": 0.0,
+              "normal": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0
+              },
+              "probeDistanceCm": 0,
+              "probes": []
+            },
+            "navigation": {
+              "state": 0,
+              "stateName": "idle",
+              "usage": 0,
+              "usageName": "none",
+              "destination": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "waypoint": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "nodesRemaining": 0,
+              "distance": 0.0
+            },
+            "targetId": 0,
+            "serviceNpcId": 0,
+            "safeLock": {
+              "active": 0,
+              "end": 0,
+              "remaining": 0,
+              "total": 0
+            },
+            "dead": false,
+            "hp": 180,
+            "maxHp": 180,
+            "mp": 240,
+            "maxMp": 240,
+            "level": 12,
+            "exp": 1500,
+            "login": {
+              "phase": "in_world",
+              "roleListReady": true,
+              "roleListRevision": 1,
+              "expectedRoleId": 0,
+              "expectedWorldTag": 0,
+              "lastError": ""
+            }
+          },
+          "payload": {
+            "result": "done",
+            "status": "entered",
+            "attestedRoleId": 1025,
+            "instanceId": 1,
+            "authoritative": true
+          }
+        }
+      ]
+    },
+    "pw.nearby": {
+      "responses": [
+        {
+          "ok": true,
+          "errorCode": "",
+          "message": "nearby",
+          "state": {
+            "connected": true,
+            "inWorld": true,
+            "gameState": 2,
+            "roleId": 1025,
+            "roleName": "TestMage",
+            "selectedRole": {
+              "id": 1025,
+              "worldtag": 1,
+              "status": 0,
+              "level": 12,
+              "position": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              }
+            },
+            "roleManagement": {
+              "state": 0,
+              "complete": false,
+              "createdRoleId": 0,
+              "targetStatuses": "",
+              "lastError": ""
+            },
+            "instanceId": 1,
+            "position": {
+              "x": 128.5,
+              "y": 964.25,
+              "z": 20.0
+            },
+            "direction": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 1.0
+            },
+            "lastSentPosition": {
+              "x": 128.5,
+              "y": 964.25,
+              "z": 20.0
+            },
+            "lastServerCorrection": {
+              "valid": false,
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0,
+              "ageMs": 0,
+              "count": 0
+            },
+            "moving": false,
+            "grounded": true,
+            "jumping": false,
+            "flying": false,
+            "falling": false,
+            "swimming": false,
+            "moveEnv": 0,
+            "moveEnvName": "ground",
+            "moveMode": 0,
+            "moveModeName": "stand",
+            "work": {
+              "id": 0,
+              "name": ""
+            },
+            "terrain": {
+              "available": true,
+              "height": 20.0,
+              "heightAbove": 0.0
+            },
+            "collision": {
+              "available": true,
+              "providers": 1,
+              "brushes": 0,
+              "blockedCount": 0,
+              "aheadBlocked": false,
+              "fraction": 0.0,
+              "normal": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0
+              },
+              "probeDistanceCm": 0,
+              "probes": []
+            },
+            "navigation": {
+              "state": 0,
+              "stateName": "idle",
+              "usage": 0,
+              "usageName": "none",
+              "destination": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "waypoint": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "nodesRemaining": 0,
+              "distance": 0.0
+            },
+            "targetId": 0,
+            "serviceNpcId": 0,
+            "safeLock": {
+              "active": 0,
+              "end": 0,
+              "remaining": 0,
+              "total": 0
+            },
+            "dead": false,
+            "hp": 180,
+            "maxHp": 180,
+            "mp": 240,
+            "maxMp": 240,
+            "level": 12,
+            "exp": 1500,
+            "login": {
+              "phase": "in_world",
+              "roleListReady": true,
+              "roleListRevision": 1,
+              "expectedRoleId": 0,
+              "expectedWorldTag": 0,
+              "lastError": ""
+            }
+          },
+          "payload": {
+            "entities": [
+              {
+                "type": "monster",
+                "id": 4001,
+                "templateId": 2101,
+                "name": "Wolf",
+                "x": 131.0,
+                "y": 960.0,
+                "z": 20.5,
+                "dist": 5.2,
+                "dead": false
+              },
+              {
+                "type": "monster",
+                "id": 4002,
+                "templateId": 2101,
+                "name": "Wolf",
+                "x": 124.0,
+                "y": 968.0,
+                "z": 19.8,
+                "dist": 6.1,
+                "dead": true
+              },
+              {
+                "type": "npc",
+                "id": 4100,
+                "templateId": 3301,
+                "name": "Blacksmith",
+                "x": 135.5,
+                "y": 966.0,
+                "z": 20.1,
+                "dist": 7.4,
+                "dead": false
+              },
+              {
+                "type": "player",
+                "id": 7201,
+                "name": "OtherHero",
+                "x": 126.0,
+                "y": 961.0,
+                "z": 20.0,
+                "dist": 3.9
+              },
+              {
+                "type": "matter",
+                "id": 9101,
+                "templateId": 5501,
+                "matterType": 2,
+                "gatherable": true,
+                "gatherDist": 3.0,
+                "x": 129.0,
+                "y": 962.0,
+                "z": 20.2,
+                "dist": 2.2
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "pw.move_to": {
+      "responses": [
+        {
+          "ok": true,
+          "errorCode": "",
+          "message": "move_to queued",
+          "state": {
+            "connected": true,
+            "inWorld": true,
+            "gameState": 2,
+            "roleId": 1025,
+            "roleName": "TestMage",
+            "selectedRole": {
+              "id": 1025,
+              "worldtag": 1,
+              "status": 0,
+              "level": 12,
+              "position": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              }
+            },
+            "roleManagement": {
+              "state": 0,
+              "complete": false,
+              "createdRoleId": 0,
+              "targetStatuses": "",
+              "lastError": ""
+            },
+            "instanceId": 1,
+            "position": {
+              "x": 128.5,
+              "y": 964.25,
+              "z": 20.0
+            },
+            "direction": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 1.0
+            },
+            "lastSentPosition": {
+              "x": 128.5,
+              "y": 964.25,
+              "z": 20.0
+            },
+            "lastServerCorrection": {
+              "valid": false,
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0,
+              "ageMs": 0,
+              "count": 0
+            },
+            "moving": false,
+            "grounded": true,
+            "jumping": false,
+            "flying": false,
+            "falling": false,
+            "swimming": false,
+            "moveEnv": 0,
+            "moveEnvName": "ground",
+            "moveMode": 0,
+            "moveModeName": "stand",
+            "work": {
+              "id": 0,
+              "name": ""
+            },
+            "terrain": {
+              "available": true,
+              "height": 20.0,
+              "heightAbove": 0.0
+            },
+            "collision": {
+              "available": true,
+              "providers": 1,
+              "brushes": 0,
+              "blockedCount": 0,
+              "aheadBlocked": false,
+              "fraction": 0.0,
+              "normal": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0
+              },
+              "probeDistanceCm": 0,
+              "probes": []
+            },
+            "navigation": {
+              "state": 0,
+              "stateName": "idle",
+              "usage": 0,
+              "usageName": "none",
+              "destination": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "waypoint": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "nodesRemaining": 0,
+              "distance": 0.0
+            },
+            "targetId": 0,
+            "serviceNpcId": 0,
+            "safeLock": {
+              "active": 0,
+              "end": 0,
+              "remaining": 0,
+              "total": 0
+            },
+            "dead": false,
+            "hp": 180,
+            "maxHp": 180,
+            "mp": 240,
+            "maxMp": 240,
+            "level": 12,
+            "exp": 1500,
+            "login": {
+              "phase": "in_world",
+              "roleListReady": true,
+              "roleListRevision": 1,
+              "expectedRoleId": 0,
+              "expectedWorldTag": 0,
+              "lastError": ""
+            }
+          }
+        }
+      ]
+    },
+    "pw.stop_move": {
+      "responses": [
+        {
+          "ok": true,
+          "errorCode": "",
+          "message": "stop_move sent",
+          "state": {
+            "connected": true,
+            "inWorld": true,
+            "gameState": 2,
+            "roleId": 1025,
+            "roleName": "TestMage",
+            "selectedRole": {
+              "id": 1025,
+              "worldtag": 1,
+              "status": 0,
+              "level": 12,
+              "position": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              }
+            },
+            "roleManagement": {
+              "state": 0,
+              "complete": false,
+              "createdRoleId": 0,
+              "targetStatuses": "",
+              "lastError": ""
+            },
+            "instanceId": 1,
+            "position": {
+              "x": 128.5,
+              "y": 964.25,
+              "z": 20.0
+            },
+            "direction": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 1.0
+            },
+            "lastSentPosition": {
+              "x": 128.5,
+              "y": 964.25,
+              "z": 20.0
+            },
+            "lastServerCorrection": {
+              "valid": false,
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0,
+              "ageMs": 0,
+              "count": 0
+            },
+            "moving": false,
+            "grounded": true,
+            "jumping": false,
+            "flying": false,
+            "falling": false,
+            "swimming": false,
+            "moveEnv": 0,
+            "moveEnvName": "ground",
+            "moveMode": 0,
+            "moveModeName": "stand",
+            "work": {
+              "id": 0,
+              "name": ""
+            },
+            "terrain": {
+              "available": true,
+              "height": 20.0,
+              "heightAbove": 0.0
+            },
+            "collision": {
+              "available": true,
+              "providers": 1,
+              "brushes": 0,
+              "blockedCount": 0,
+              "aheadBlocked": false,
+              "fraction": 0.0,
+              "normal": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0
+              },
+              "probeDistanceCm": 0,
+              "probes": []
+            },
+            "navigation": {
+              "state": 0,
+              "stateName": "idle",
+              "usage": 0,
+              "usageName": "none",
+              "destination": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "waypoint": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "nodesRemaining": 0,
+              "distance": 0.0
+            },
+            "targetId": 0,
+            "serviceNpcId": 0,
+            "safeLock": {
+              "active": 0,
+              "end": 0,
+              "remaining": 0,
+              "total": 0
+            },
+            "dead": false,
+            "hp": 180,
+            "maxHp": 180,
+            "mp": 240,
+            "maxMp": 240,
+            "level": 12,
+            "exp": 1500,
+            "login": {
+              "phase": "in_world",
+              "roleListReady": true,
+              "roleListRevision": 1,
+              "expectedRoleId": 0,
+              "expectedWorldTag": 0,
+              "lastError": ""
+            }
+          }
+        }
+      ]
+    },
+    "pw.jump": {
+      "responses": [
+        {
+          "ok": true,
+          "errorCode": "",
+          "message": "jump posted",
+          "state": {
+            "connected": true,
+            "inWorld": true,
+            "gameState": 2,
+            "roleId": 1025,
+            "roleName": "TestMage",
+            "selectedRole": {
+              "id": 1025,
+              "worldtag": 1,
+              "status": 0,
+              "level": 12,
+              "position": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              }
+            },
+            "roleManagement": {
+              "state": 0,
+              "complete": false,
+              "createdRoleId": 0,
+              "targetStatuses": "",
+              "lastError": ""
+            },
+            "instanceId": 1,
+            "position": {
+              "x": 128.5,
+              "y": 964.25,
+              "z": 20.0
+            },
+            "direction": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 1.0
+            },
+            "lastSentPosition": {
+              "x": 128.5,
+              "y": 964.25,
+              "z": 20.0
+            },
+            "lastServerCorrection": {
+              "valid": false,
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0,
+              "ageMs": 0,
+              "count": 0
+            },
+            "moving": false,
+            "grounded": true,
+            "jumping": false,
+            "flying": false,
+            "falling": false,
+            "swimming": false,
+            "moveEnv": 0,
+            "moveEnvName": "ground",
+            "moveMode": 0,
+            "moveModeName": "stand",
+            "work": {
+              "id": 0,
+              "name": ""
+            },
+            "terrain": {
+              "available": true,
+              "height": 20.0,
+              "heightAbove": 0.0
+            },
+            "collision": {
+              "available": true,
+              "providers": 1,
+              "brushes": 0,
+              "blockedCount": 0,
+              "aheadBlocked": false,
+              "fraction": 0.0,
+              "normal": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0
+              },
+              "probeDistanceCm": 0,
+              "probes": []
+            },
+            "navigation": {
+              "state": 0,
+              "stateName": "idle",
+              "usage": 0,
+              "usageName": "none",
+              "destination": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "waypoint": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "nodesRemaining": 0,
+              "distance": 0.0
+            },
+            "targetId": 0,
+            "serviceNpcId": 0,
+            "safeLock": {
+              "active": 0,
+              "end": 0,
+              "remaining": 0,
+              "total": 0
+            },
+            "dead": false,
+            "hp": 180,
+            "maxHp": 180,
+            "mp": 240,
+            "maxMp": 240,
+            "level": 12,
+            "exp": 1500,
+            "login": {
+              "phase": "in_world",
+              "roleListReady": true,
+              "roleListRevision": 1,
+              "expectedRoleId": 0,
+              "expectedWorldTag": 0,
+              "lastError": ""
+            }
+          }
+        }
+      ]
+    },
+    "pw.select_target": {
+      "responses": [
+        {
+          "ok": true,
+          "errorCode": "",
+          "message": "target selected",
+          "state": {
+            "connected": true,
+            "inWorld": true,
+            "gameState": 2,
+            "roleId": 1025,
+            "roleName": "TestMage",
+            "selectedRole": {
+              "id": 1025,
+              "worldtag": 1,
+              "status": 0,
+              "level": 12,
+              "position": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              }
+            },
+            "roleManagement": {
+              "state": 0,
+              "complete": false,
+              "createdRoleId": 0,
+              "targetStatuses": "",
+              "lastError": ""
+            },
+            "instanceId": 1,
+            "position": {
+              "x": 128.5,
+              "y": 964.25,
+              "z": 20.0
+            },
+            "direction": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 1.0
+            },
+            "lastSentPosition": {
+              "x": 128.5,
+              "y": 964.25,
+              "z": 20.0
+            },
+            "lastServerCorrection": {
+              "valid": false,
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0,
+              "ageMs": 0,
+              "count": 0
+            },
+            "moving": false,
+            "grounded": true,
+            "jumping": false,
+            "flying": false,
+            "falling": false,
+            "swimming": false,
+            "moveEnv": 0,
+            "moveEnvName": "ground",
+            "moveMode": 0,
+            "moveModeName": "stand",
+            "work": {
+              "id": 0,
+              "name": ""
+            },
+            "terrain": {
+              "available": true,
+              "height": 20.0,
+              "heightAbove": 0.0
+            },
+            "collision": {
+              "available": true,
+              "providers": 1,
+              "brushes": 0,
+              "blockedCount": 0,
+              "aheadBlocked": false,
+              "fraction": 0.0,
+              "normal": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0
+              },
+              "probeDistanceCm": 0,
+              "probes": []
+            },
+            "navigation": {
+              "state": 0,
+              "stateName": "idle",
+              "usage": 0,
+              "usageName": "none",
+              "destination": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "waypoint": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "nodesRemaining": 0,
+              "distance": 0.0
+            },
+            "targetId": 0,
+            "serviceNpcId": 0,
+            "safeLock": {
+              "active": 0,
+              "end": 0,
+              "remaining": 0,
+              "total": 0
+            },
+            "dead": false,
+            "hp": 180,
+            "maxHp": 180,
+            "mp": 240,
+            "maxMp": 240,
+            "level": 12,
+            "exp": 1500,
+            "login": {
+              "phase": "in_world",
+              "roleListReady": true,
+              "roleListRevision": 1,
+              "expectedRoleId": 0,
+              "expectedWorldTag": 0,
+              "lastError": ""
+            }
+          }
+        }
+      ]
+    },
+    "pw.normal_attack": {
+      "responses": [
+        {
+          "ok": true,
+          "errorCode": "",
+          "message": "normal_attack started",
+          "state": {
+            "connected": true,
+            "inWorld": true,
+            "gameState": 2,
+            "roleId": 1025,
+            "roleName": "TestMage",
+            "selectedRole": {
+              "id": 1025,
+              "worldtag": 1,
+              "status": 0,
+              "level": 12,
+              "position": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              }
+            },
+            "roleManagement": {
+              "state": 0,
+              "complete": false,
+              "createdRoleId": 0,
+              "targetStatuses": "",
+              "lastError": ""
+            },
+            "instanceId": 1,
+            "position": {
+              "x": 128.5,
+              "y": 964.25,
+              "z": 20.0
+            },
+            "direction": {
+              "x": 0.0,
+              "y": 0.0,
+              "z": 1.0
+            },
+            "lastSentPosition": {
+              "x": 128.5,
+              "y": 964.25,
+              "z": 20.0
+            },
+            "lastServerCorrection": {
+              "valid": false,
+              "x": 0.0,
+              "y": 0.0,
+              "z": 0.0,
+              "ageMs": 0,
+              "count": 0
+            },
+            "moving": false,
+            "grounded": true,
+            "jumping": false,
+            "flying": false,
+            "falling": false,
+            "swimming": false,
+            "moveEnv": 0,
+            "moveEnvName": "ground",
+            "moveMode": 0,
+            "moveModeName": "stand",
+            "work": {
+              "id": 0,
+              "name": ""
+            },
+            "terrain": {
+              "available": true,
+              "height": 20.0,
+              "heightAbove": 0.0
+            },
+            "collision": {
+              "available": true,
+              "providers": 1,
+              "brushes": 0,
+              "blockedCount": 0,
+              "aheadBlocked": false,
+              "fraction": 0.0,
+              "normal": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0
+              },
+              "probeDistanceCm": 0,
+              "probes": []
+            },
+            "navigation": {
+              "state": 0,
+              "stateName": "idle",
+              "usage": 0,
+              "usageName": "none",
+              "destination": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "waypoint": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "nodesRemaining": 0,
+              "distance": 0.0
+            },
+            "targetId": 0,
+            "serviceNpcId": 0,
+            "safeLock": {
+              "active": 0,
+              "end": 0,
+              "remaining": 0,
+              "total": 0
+            },
+            "dead": false,
+            "hp": 180,
+            "maxHp": 180,
+            "mp": 240,
+            "maxMp": 240,
+            "level": 12,
+            "exp": 1500,
+            "login": {
+              "phase": "in_world",
+              "roleListReady": true,
+              "roleListRevision": 1,
+              "expectedRoleId": 0,
+              "expectedWorldTag": 0,
+              "lastError": ""
+            }
+          }
+        }
+      ]
+    }
+  },
+  "drive": [
+    {
+      "method": "tools/list",
+      "expect": {
+        "tools.0.name": "pw.status",
+        "tools.30.name": "pw.role_list",
+        "tools.54.name": "pw.quest_turn_in"
+      }
+    },
+    {
+      "call": "pw.status",
+      "args": {},
+      "expect": {
+        "structuredContent.state.connected": false,
+        "structuredContent.state.inWorld": false,
+        "structuredContent.state.login.phase": "offline",
+        "structuredContent.state.login.lastError": ""
+      }
+    },
+    {
+      "call": "pw.status",
+      "args": {},
+      "expect": {
+        "structuredContent.state.connected": true,
+        "structuredContent.state.login.phase": "authenticating"
+      }
+    },
+    {
+      "call": "pw.status",
+      "args": {},
+      "expect": {
+        "structuredContent.state.login.phase": "character_select",
+        "structuredContent.state.login.roleListReady": true,
+        "structuredContent.state.login.roleListRevision": 1,
+        "structuredContent.state.selectedRole.id": 1024
+      }
+    },
+    {
+      "call": "pw.role_list",
+      "args": {},
+      "expect": {
+        "structuredContent.ok": true,
+        "isError": false,
+        "structuredContent.payload.revision": 1,
+        "structuredContent.payload.slotsUsed": 2,
+        "structuredContent.payload.slotsMax": 8,
+        "structuredContent.payload.roles.0.name": "TestWarrior",
+        "structuredContent.payload.roles.0.profession": 0,
+        "structuredContent.payload.roles.0.level": 30,
+        "structuredContent.payload.roles.1.role_id": 1025,
+        "structuredContent.payload.roles.1.name": "TestMage",
+        "structuredContent.payload.roles.1.profession": 3,
+        "structuredContent.payload.roles.1.level": 12
+      }
+    },
+    {
+      "call": "pw.role_enter",
+      "args": {
+        "role_id": 1025,
+        "role_list_revision": 1,
+        "operation_id": 7
+      },
+      "expect": {
+        "structuredContent.ok": true,
+        "isError": false,
+        "structuredContent.payload.result": "pending",
+        "structuredContent.payload.packetSent": true
+      }
+    },
+    {
+      "call": "pw.status",
+      "args": {},
+      "expect": {
+        "structuredContent.state.login.phase": "entering_world",
+        "structuredContent.state.login.expectedRoleId": 1025,
+        "structuredContent.state.login.expectedWorldTag": 1
+      }
+    },
+    {
+      "call": "pw.role_enter",
+      "args": {
+        "role_id": 1025,
+        "role_list_revision": 1,
+        "operation_id": 7
+      },
+      "expect": {
+        "structuredContent.ok": true,
+        "isError": false,
+        "structuredContent.payload.status": "entered",
+        "structuredContent.payload.attestedRoleId": 1025,
+        "structuredContent.payload.instanceId": 1,
+        "structuredContent.payload.authoritative": true
+      }
+    },
+    {
+      "call": "pw.status",
+      "args": {},
+      "expect": {
+        "structuredContent.state.inWorld": true,
+        "structuredContent.state.roleId": 1025,
+        "structuredContent.state.instanceId": 1,
+        "structuredContent.state.login.phase": "in_world",
+        "structuredContent.state.login.expectedRoleId": 0
+      }
+    },
+    {
+      "call": "pw.nearby",
+      "args": {
+        "range": 60
+      },
+      "expect": {
+        "structuredContent.ok": true,
+        "isError": false,
+        "structuredContent.payload.entities.0.type": "monster",
+        "structuredContent.payload.entities.0.id": 4001,
+        "structuredContent.payload.entities.0.dead": false,
+        "structuredContent.payload.entities.1.dead": true,
+        "structuredContent.payload.entities.2.type": "npc",
+        "structuredContent.payload.entities.2.templateId": 3301,
+        "structuredContent.payload.entities.3.type": "player",
+        "structuredContent.payload.entities.4.gatherable": true
+      }
+    },
+    {
+      "call": "pw.move_to",
+      "args": {
+        "x": 130.0,
+        "y": 962.0,
+        "z": 21.0
+      },
+      "expect": {
+        "structuredContent.ok": true,
+        "isError": false,
+        "structuredContent.message": "move_to queued"
+      }
+    }
+  ]
+}

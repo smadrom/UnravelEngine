@@ -35,6 +35,9 @@
 #include <bimg/encode.h>
 #include <bx/file.h>
 
+#include <editor/hub/hub.h>
+#include <editor/hub/panels/scene_panel/scene_panel.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -2796,10 +2799,25 @@ auto create_login_foliage(rtti::context& ctx,
 }
 }
 
+mcp_system::mcp_system()
+    : pw_session_(pw_runtime_)
+{
+}
+
 auto mcp_system::init(rtti::context& ctx) -> bool
 {
     auto& ev = ctx.get_cached<events>();
     ev.on_frame_end.connect(sentinel_, -1000, this, &mcp_system::on_frame_end);
+
+    if(pw_runtime_.init())
+    {
+        APPLOG_INFO("PW runtime plugin loaded");
+    }
+    else
+    {
+        APPLOG_INFO("PW runtime plugin is optional and was not loaded: {}", pw_runtime_.get_last_error());
+    }
+    pw_session_.start();
 
     const char* port_env = std::getenv("PW_MCP_PORT");
     if(port_env != nullptr)
@@ -2829,6 +2847,8 @@ auto mcp_system::deinit(rtti::context& ctx) -> bool
 {
     (void)ctx;
     server_.Stop();
+    pw_session_.shutdown();
+    pw_runtime_.deinit();
     clear_pending_readback();
     return true;
 }
@@ -2836,12 +2856,51 @@ auto mcp_system::deinit(rtti::context& ctx) -> bool
 void mcp_system::on_frame_end(rtti::context& ctx, delta_t dt)
 {
     (void)dt;
+    service_pw_session(ctx);
     service_login_loader(ctx);
     service_pending_screenshot(ctx);
     server_.Drain([&](const std::string& req)
     {
         return mcp_commands::dispatch(ctx, req, *this);
     });
+}
+
+void mcp_system::service_pw_session(rtti::context& ctx)
+{
+    // Applies the session controller's desired login-scene camera on the main
+    // thread. The controller's worker thread never touches the scene; it only
+    // publishes a snapshot, and this frame boundary performs the mutation.
+    const pw_session_snapshot snapshot = pw_session_.get_snapshot();
+    const pw_session_camera desired = snapshot.desired_camera;
+    if(desired == pw_session_camera::none || desired == applied_pw_camera_)
+    {
+        return;
+    }
+    const login_scene_config config = get_login_scene_config();
+    if(!config.loaded)
+    {
+        return; // preset would fail until the login scene config is parsed; retry later
+    }
+    try
+    {
+        const json request = {
+            {"seq", 0},
+            {"method", "camera_preset"},
+            {"params", {{"preset", pw_session_camera_name(desired)}}},
+        };
+        const std::string response_json = mcp_commands::dispatch(ctx, request.dump(), *this);
+        const json response = json::parse(response_json, nullptr, false);
+        if(response.is_discarded() || !response.value("ok", false))
+        {
+            return; // camera not applicable yet; retry on a later frame
+        }
+        applied_pw_camera_ = desired;
+        sync_camera_to_scene_viewport(ctx);
+    }
+    catch(const std::exception&)
+    {
+        // Camera failures must never escape the frame loop.
+    }
 }
 
 auto mcp_system::ensure_camera(rtti::context& ctx) -> entt::handle
@@ -2861,12 +2920,46 @@ void mcp_system::invalidate_camera()
     mcp_cam_ = {};
 }
 
-void mcp_system::request_screenshot(const std::string& path, uint32_t w, uint32_t h)
+auto mcp_system::get_pw_runtime() -> pw_runtime_client&
+{
+    return pw_runtime_;
+}
+
+auto mcp_system::get_pw_session() -> pw_session_controller&
+{
+    return pw_session_;
+}
+
+void mcp_system::sync_camera_to_scene_viewport(rtti::context& ctx)
+{
+    auto source = ensure_camera(ctx);
+    auto target = ctx.get_cached<hub>().get_panels().get_scene_panel().get_camera();
+    if(!source || !target ||
+       !source.all_of<transform_component, camera_component>() ||
+       !target.all_of<transform_component, camera_component>())
+    {
+        return;
+    }
+
+    const auto& source_transform = source.get<transform_component>();
+    const auto& source_camera = source.get<camera_component>();
+    auto& target_transform = target.get<transform_component>();
+    auto& target_camera = target.get<camera_component>();
+
+    target_transform.set_position_global(source_transform.get_position_global());
+    target_transform.set_rotation_global(source_transform.get_rotation_global());
+    target_camera.set_fov(source_camera.get_fov());
+    target_camera.set_near_clip(source_camera.get_near_clip());
+    target_camera.set_far_clip(source_camera.get_far_clip());
+}
+
+void mcp_system::request_screenshot(const std::string& path, uint32_t w, uint32_t h, bool render_ui)
 {
     clear_pending_readback();
     pending_.path = path;
     pending_.w = w;
     pending_.h = h;
+    pending_.render_ui = render_ui;
     pending_.frames_left = 2;
     pending_.readback_frames_left = 0;
     pending_.active = true;
@@ -3071,8 +3164,16 @@ void mcp_system::service_login_loader(rtti::context& ctx)
         {
             if(!create_login_character(ctx, login_.content_root))
             {
-                login_.status = "waiting_assets";
-                return;
+                // The preview character is decorative: bound the wait and continue
+                // without it instead of blocking the scene load forever.
+                if(login_.character_attempts < kLoginMaxAssetWaitFrames)
+                {
+                    ++login_.character_attempts;
+                    login_.status = "waiting_assets";
+                    return;
+                }
+                APPLOG_WARNING("load_login: character assets unavailable after {} frames; continuing without the preview character",
+                               kLoginMaxAssetWaitFrames);
             }
         }
 
@@ -3212,7 +3313,7 @@ void mcp_system::service_pending_screenshot(rtti::context& ctx)
         auto& rpath = ctx.get_cached<rendering_system>();
         rpath.on_frame_update(scn, kMcpFrameDt);
         rpath.on_frame_before_render(scn, kMcpFrameDt);
-        rpath.render_scene(camera, camera_comp, scn, kMcpFrameDt, false);
+        rpath.render_scene(camera, camera_comp, scn, kMcpFrameDt, pending_.render_ui);
 
         --pending_.frames_left;
         if(pending_.frames_left <= 0)

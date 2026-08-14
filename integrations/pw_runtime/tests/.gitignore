@@ -1,0 +1,5 @@
+# Runtime artifacts produced by acceptance/smoke runs
+Log.txt
+imgui.ini
+pw_fake_env_probe.json
+__pycache__/

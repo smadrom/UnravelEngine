@@ -18,6 +18,7 @@
 #include "hub/hub.h"
 #include "imgui/imgui_interface.h"
 #include "mcp/mcp_system.h"
+#include "pwlogin/pw_login_ui.h"
 #include "system/mcp_manager.h"
 #include "system/project_manager.h"
 #include "system/version_manager.h"
@@ -60,6 +61,7 @@ auto editor::create(rtti::context& ctx, cmd_line::parser& parser) -> bool
     ctx.add<editing_manager>();
     ctx.add<picking_manager>();
     ctx.add<mcp_system>();
+    ctx.add<pw_login_ui>();
     ctx.add<thumbnail_manager>();
     ctx.add<asset_watcher>();
     ctx.add<version_manager>();
@@ -186,6 +188,12 @@ auto editor::init(const cmd_line::parser& parser) -> bool
         return false;
     }
 
+    ls.begin_module("PW Login UI");
+    if(!ls.check(ctx.get_cached<pw_login_ui>().init(ctx)))
+    {
+        return false;
+    }
+
     ls.begin_module("Thumbnails");
     if(!ls.check(ctx.get_cached<thumbnail_manager>().init(ctx)))
     {
@@ -254,6 +262,11 @@ auto editor::deinit() -> bool
         return false;
     }
 
+    if(!ctx.get_cached<pw_login_ui>().deinit(ctx))
+    {
+        return false;
+    }
+
     if(!ctx.get_cached<thumbnail_manager>().deinit(ctx))
     {
         return false;
@@ -313,6 +326,7 @@ auto editor::destroy() -> bool
     ctx.remove<picking_manager>();
     ctx.remove<mcp_manager>();
     ctx.remove<mcp_system>();
+    ctx.remove<pw_login_ui>();
     ctx.remove<editing_manager>();
 
     ctx.remove<hub>();

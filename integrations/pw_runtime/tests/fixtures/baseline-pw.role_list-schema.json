@@ -1,0 +1,10 @@
+{
+  "tool": "pw.role_list",
+  "captured_from": "EC_MCPServer.cpp MCP_BuildToolsList",
+  "captured_at": "source, pre-role_enter",
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

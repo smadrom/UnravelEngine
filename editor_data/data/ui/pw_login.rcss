@@ -1,0 +1,251 @@
+/* Perfect World login / character-select overlay */
+
+#pw-login-root
+{
+    width: 100%;
+    height: 100%;
+    font-family: Inter;
+    color: #e8e8e8;
+}
+
+.pw-screen
+{
+    width: 100%;
+    height: 100%;
+    display: block;
+    background-color: #00000088;
+}
+
+.pw-panel
+{
+    width: 420dp;
+    margin: auto;
+    margin-top: 14%;
+    padding: 28dp 32dp;
+    background-color: #16181cf2;
+    border-width: 1dp;
+    border-style: solid;
+    border-color: #2e333b;
+    border-radius: 8dp;
+}
+
+.pw-select-panel
+{
+    width: 640dp;
+}
+
+.pw-title
+{
+    font-size: 26dp;
+    font-weight: bold;
+    color: #f0c674;
+    margin-bottom: 4dp;
+    text-align: center;
+}
+
+.pw-subtitle
+{
+    font-size: 13dp;
+    color: #9aa0aa;
+    text-align: center;
+    margin-bottom: 18dp;
+}
+
+.pw-field
+{
+    margin-bottom: 12dp;
+}
+
+.pw-label
+{
+    display: block;
+    font-size: 12dp;
+    color: #9aa0aa;
+    margin-bottom: 4dp;
+}
+
+.pw-input
+{
+    width: 100%;
+    box-sizing: border-box;
+    padding: 8dp 10dp;
+    font-size: 14dp;
+    color: #e8e8e8;
+    background-color: #0d0f12;
+    border-width: 1dp;
+    border-style: solid;
+    border-color: #2e333b;
+    border-radius: 4dp;
+}
+
+.pw-input:focus
+{
+    border-color: #f0c674;
+}
+
+.pw-input:disabled
+{
+    color: #666c76;
+    background-color: #14161a;
+}
+
+.pw-button
+{
+    width: 100%;
+    margin-top: 8dp;
+    padding: 9dp 0dp;
+    font-size: 15dp;
+    font-weight: bold;
+    color: #101216;
+    background-color: #f0c674;
+    border-width: 0;
+    border-radius: 4dp;
+    text-align: center;
+}
+
+.pw-button:hover
+{
+    background-color: #ffd88a;
+}
+
+.pw-button:disabled
+{
+    color: #666c76;
+    background-color: #3a3f47;
+}
+
+.pw-button-secondary
+{
+    color: #e8e8e8;
+    background-color: #2e333b;
+}
+
+.pw-button-secondary:hover
+{
+    background-color: #3d434d;
+}
+
+.pw-status
+{
+    min-height: 18dp;
+    margin-top: 12dp;
+    font-size: 12dp;
+    color: #9aa0aa;
+    text-align: center;
+}
+
+.pw-error
+{
+    margin-top: 6dp;
+    font-size: 12dp;
+    color: #e06c75;
+    text-align: center;
+}
+
+.pw-select-body
+{
+    margin-top: 10dp;
+    height: 260dp;
+}
+
+.pw-role-list
+{
+    display: inline-block;
+    width: 55%;
+    height: 100%;
+    vertical-align: top;
+    background-color: #0d0f12;
+    border-width: 1dp;
+    border-style: solid;
+    border-color: #2e333b;
+    border-radius: 4dp;
+    padding: 6dp;
+    box-sizing: border-box;
+    overflow-y: auto;
+}
+
+.pw-role-item
+{
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    padding: 8dp 10dp;
+    margin-bottom: 4dp;
+    background-color: #1a1d22;
+    border-width: 1dp;
+    border-style: solid;
+    border-color: #2e333b;
+    border-radius: 4dp;
+    text-align: left;
+}
+
+.pw-role-item:hover
+{
+    background-color: #23272e;
+}
+
+.pw-role-item.selected
+{
+    border-color: #f0c674;
+    background-color: #2a2e33;
+}
+
+.pw-role-name
+{
+    font-size: 14dp;
+    font-weight: bold;
+    color: #e8e8e8;
+}
+
+.pw-role-info
+{
+    font-size: 12dp;
+    color: #9aa0aa;
+    margin-left: 8dp;
+}
+
+.pw-role-detail
+{
+    display: inline-block;
+    width: 43%;
+    height: 100%;
+    vertical-align: top;
+    margin-left: 2%;
+    padding: 10dp;
+    box-sizing: border-box;
+    background-color: #0d0f12;
+    border-width: 1dp;
+    border-style: solid;
+    border-color: #2e333b;
+    border-radius: 4dp;
+}
+
+.pw-detail-name
+{
+    font-size: 18dp;
+    font-weight: bold;
+    margin-bottom: 8dp;
+}
+
+.pw-detail-line
+{
+    font-size: 13dp;
+    color: #9aa0aa;
+    margin-bottom: 4dp;
+}
+
+.pw-buttons
+{
+    margin-top: 14dp;
+}
+
+.pw-buttons .pw-button
+{
+    display: inline-block;
+    width: 48%;
+}
+
+.pw-buttons .pw-button + .pw-button
+{
+    margin-left: 4%;
+}

@@ -1,0 +1,9 @@
+{
+  "tool": "pw.status",
+  "captured_from": "EC_MCPServer.cpp MCP_BuildToolsList",
+  "captured_at": "source, pre-role_enter",
+  "schema": {
+    "type": "object",
+    "properties": {}
+  }
+}
