@@ -6,6 +6,8 @@
 #include <bx/file.h>
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <filesystem>
 #include <map>
 namespace gfx
 {
@@ -15,6 +17,25 @@ auto get_loggers() -> std::map<std::string, std::function<void(const std::string
 {
     static std::map<std::string, std::function<void(const std::string&, const char*, uint16_t)>> loggers;
     return loggers;
+}
+
+auto get_cache_directory() -> std::string&
+{
+    static std::string dir;
+    return dir;
+}
+
+/// One file per cache id inside the configured directory; empty path when caching is off.
+auto make_cache_path(uint64_t id) -> std::filesystem::path
+{
+    const auto& dir = get_cache_directory();
+    if(dir.empty())
+    {
+        return {};
+    }
+    char name[32]{};
+    std::snprintf(name, sizeof(name), "%016llx.bin", static_cast<unsigned long long>(id));
+    return std::filesystem::path(dir) / name;
 }
 
 struct context_data
@@ -187,18 +208,54 @@ struct gfx_callback final : public bgfx::CallbackI
 
     }
 
-    uint32_t cacheReadSize(uint64_t /*_id*/) final
+    // Binary cache for driver-compiled pipeline state. Backends that compile pipelines at
+    // first use (D3D12 especially) otherwise re-pay the full driver compilation of every
+    // heavy shader on every launch - measured as a single ~30 second frame the first time a
+    // large compute chain (GI) ran. A stale or mismatched blob is safe: the backends verify
+    // and fall back to a fresh compile, then overwrite the entry.
+    uint32_t cacheReadSize(uint64_t _id) final
     {
-        return 0;
+        const auto path = make_cache_path(_id);
+        if(path.empty())
+        {
+            return 0;
+        }
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(path, ec);
+        return ec ? 0u : uint32_t(size);
     }
 
-    bool cacheRead(uint64_t /*_id*/, void* /*_data*/, uint32_t /*_size*/) final
+    bool cacheRead(uint64_t _id, void* _data, uint32_t _size) final
     {
-        return false;
+        const auto path = make_cache_path(_id);
+        if(path.empty())
+        {
+            return false;
+        }
+        std::FILE* file = std::fopen(path.string().c_str(), "rb");
+        if(file == nullptr)
+        {
+            return false;
+        }
+        const size_t read = std::fread(_data, 1, _size, file);
+        std::fclose(file);
+        return read == _size;
     }
 
-    void cacheWrite(uint64_t /*_id*/, const void* /*_data*/, uint32_t /*_size*/) final
+    void cacheWrite(uint64_t _id, const void* _data, uint32_t _size) final
     {
+        const auto path = make_cache_path(_id);
+        if(path.empty())
+        {
+            return;
+        }
+        std::FILE* file = std::fopen(path.string().c_str(), "wb");
+        if(file == nullptr)
+        {
+            return;
+        }
+        std::fwrite(_data, 1, _size, file);
+        std::fclose(file);
     }
 
     virtual void screenShot(			  
@@ -292,6 +349,22 @@ void shutdown()
         bgfx::shutdown();
     }
     s_context = {};
+}
+
+void set_cache_directory(const std::string& directory)
+{
+    auto& dir = get_cache_directory();
+    dir = directory;
+    if(!dir.empty())
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        if(ec)
+        {
+            log("warning", "Failed to create the renderer cache directory: " + dir, __FILE__, __LINE__);
+            dir.clear();
+        }
+    }
 }
 
 void set_allocation_failure_policy(allocation_failure_policy policy)
@@ -1115,6 +1188,13 @@ void set_image(uint8_t _stage, texture_handle _handle, uint8_t _mip, access _acc
     bgfx::setImage(_stage, _handle, _mip, _access, _format);
 }
 
+void set_image_3d(uint8_t _stage, texture_handle _handle, uint8_t _mip, access _access, texture_format _format)
+{
+    // The explicit layer range is the whole point: see the header note. (0, 1) is the full
+    // range of a 3D texture on every backend, and its presence makes the GL binding layered.
+    bgfx::setImage(_stage, _handle, 0, 1, _mip, _access, _format);
+}
+
 void set_buffer(uint8_t _stage, index_buffer_handle _handle, access _access)
 {
     bgfx::setBuffer(_stage, _handle, _access);
@@ -1145,11 +1225,11 @@ void dispatch(view_id _id, program_handle _handle, uint32_t _numX, uint32_t _num
     bgfx::dispatch(_id, _handle, _numX, _numY, _numZ);
 }
 
-void dispatch(view_id _id,
-              program_handle _handle,
-              indirect_buffer_handle _indirectHandle,
-              uint16_t _start,
-              uint16_t _num)
+void dispatch_indirect(view_id _id,
+                       program_handle _handle,
+                       indirect_buffer_handle _indirectHandle,
+                       uint16_t _start,
+                       uint16_t _num)
 {
     bgfx::dispatch(_id, _handle, _indirectHandle, _start, _num);
 }

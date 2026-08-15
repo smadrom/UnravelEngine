@@ -1,5 +1,7 @@
 #include "tonemapping_component.hpp"
 
+#include "engine/meta/core/math/vector.hpp"
+
 #include <serialization/associative_archive.h>
 #include <serialization/binary_archive.h>
 
@@ -113,6 +115,97 @@ REFLECT_INLINE(tonemapping_pass::settings)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "method"},
             entt::attribute{"pretty_name", "Method"},
+        })
+        .data<&tonemapping_pass::settings::temperature>("temperature"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "temperature"},
+            entt::attribute{"pretty_name", "Temperature"},
+            entt::attribute{"min", -1.0f},
+            entt::attribute{"max", 1.0f},
+            entt::attribute{"step", 0.01f},
+            entt::attribute{"tooltip", "White balance: positive is warmer (orange), negative is cooler (blue)."},
+        })
+        .data<&tonemapping_pass::settings::tint>("tint"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "tint"},
+            entt::attribute{"pretty_name", "Tint"},
+            entt::attribute{"min", -1.0f},
+            entt::attribute{"max", 1.0f},
+            entt::attribute{"step", 0.01f},
+            entt::attribute{"tooltip", "White balance: positive is magenta, negative is green."},
+        })
+        .data<&tonemapping_pass::settings::contrast>("contrast"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "contrast"},
+            entt::attribute{"pretty_name", "Contrast"},
+            entt::attribute{"min", 0.3f},
+            entt::attribute{"max", 2.0f},
+            entt::attribute{"step", 0.01f},
+            entt::attribute{"tooltip", "Increases or decreases contrast. 1 is neutral."},
+        })
+        .data<&tonemapping_pass::settings::saturation>("saturation"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "saturation"},
+            entt::attribute{"pretty_name", "Saturation"},
+            entt::attribute{"min", 0.0f},
+            entt::attribute{"max", 2.0f},
+            entt::attribute{"step", 0.01f},
+            entt::attribute{"tooltip", "Color intensity. 0 is grayscale, 1 is neutral."},
+        })
+        .data<&tonemapping_pass::settings::lift>("lift"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "lift"},
+            entt::attribute{"pretty_name", "Lift (Shadows)"},
+            entt::attribute{"tooltip", "Shadow color. Neutral is mid-gray (0.5, 0.5, 0.5). "
+                "Brighter lifts blacks; a color tint tints the shadows."},
+        })
+        .data<&tonemapping_pass::settings::gamma>("gamma"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "gamma"},
+            entt::attribute{"pretty_name", "Gamma (Midtones)"},
+            entt::attribute{"tooltip", "Midtone color. Neutral is mid-gray (0.5, 0.5, 0.5). "
+                "Brighter raises mids; a color tint tints the midtones."},
+        })
+        .data<&tonemapping_pass::settings::gain>("gain"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "gain"},
+            entt::attribute{"pretty_name", "Gain (Highlights)"},
+            entt::attribute{"tooltip", "Highlight color. Neutral is mid-gray (0.5, 0.5, 0.5). "
+                "Brighter boosts highlights; a color tint tints the highlights."},
+        })
+        .data<&tonemapping_pass::settings::vignette_intensity>("vignette_intensity"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "vignette_intensity"},
+            entt::attribute{"pretty_name", "Vignette"},
+            entt::attribute{"min", 0.0f},
+            entt::attribute{"max", 1.0f},
+            entt::attribute{"step", 0.01f},
+            entt::attribute{"tooltip", "Darkens the image toward the edges. 0 is off."},
+        })
+        .data<&tonemapping_pass::settings::vignette_smoothness>("vignette_smoothness"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "vignette_smoothness"},
+            entt::attribute{"pretty_name", "Vignette Smoothness"},
+            entt::attribute{"min", 0.0f},
+            entt::attribute{"max", 1.0f},
+            entt::attribute{"step", 0.01f},
+            entt::attribute{"tooltip", "How gradually the vignette falls off: low = tight ring near the "
+                "corners, high = falloff starting close to the center."},
+        })
+        .data<&tonemapping_pass::settings::grain_intensity>("grain_intensity"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "grain_intensity"},
+            entt::attribute{"pretty_name", "Film Grain"},
+            entt::attribute{"min", 0.0f},
+            entt::attribute{"max", 1.0f},
+            entt::attribute{"step", 0.01f},
+            entt::attribute{"tooltip", "Film grain. 0 is off; 0.1-0.3 is a typical subtle amount."},
+        })
+        .data<&tonemapping_pass::settings::dithering>("dithering"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "dithering"},
+            entt::attribute{"pretty_name", "Dithering"},
+            entt::attribute{"tooltip", "Reduces banding in smooth gradients (skies, walls). Leave on."},
         });
 }
 
@@ -120,6 +213,17 @@ SAVE_INLINE(tonemapping_pass::settings)
 {
     try_save(ar, ser20::make_nvp("exposure", obj.exposure));
     try_save(ar, ser20::make_nvp("method", obj.method));
+    try_save(ar, ser20::make_nvp("temperature", obj.temperature));
+    try_save(ar, ser20::make_nvp("tint", obj.tint));
+    try_save(ar, ser20::make_nvp("contrast", obj.contrast));
+    try_save(ar, ser20::make_nvp("saturation", obj.saturation));
+    try_save(ar, ser20::make_nvp("lift", obj.lift));
+    try_save(ar, ser20::make_nvp("gamma", obj.gamma));
+    try_save(ar, ser20::make_nvp("gain", obj.gain));
+    try_save(ar, ser20::make_nvp("vignette_intensity", obj.vignette_intensity));
+    try_save(ar, ser20::make_nvp("vignette_smoothness", obj.vignette_smoothness));
+    try_save(ar, ser20::make_nvp("grain_intensity", obj.grain_intensity));
+    try_save(ar, ser20::make_nvp("dithering", obj.dithering));
 }
 SAVE_INSTANTIATE(tonemapping_pass::settings, ser20::oarchive_associative_t);
 SAVE_INSTANTIATE(tonemapping_pass::settings, ser20::oarchive_binary_t);
@@ -128,6 +232,17 @@ LOAD_INLINE(tonemapping_pass::settings)
 {
     try_load(ar, ser20::make_nvp("exposure", obj.exposure));
     try_load(ar, ser20::make_nvp("method", obj.method));
+    try_load(ar, ser20::make_nvp("temperature", obj.temperature));
+    try_load(ar, ser20::make_nvp("tint", obj.tint));
+    try_load(ar, ser20::make_nvp("contrast", obj.contrast));
+    try_load(ar, ser20::make_nvp("saturation", obj.saturation));
+    try_load(ar, ser20::make_nvp("lift", obj.lift));
+    try_load(ar, ser20::make_nvp("gamma", obj.gamma));
+    try_load(ar, ser20::make_nvp("gain", obj.gain));
+    try_load(ar, ser20::make_nvp("vignette_intensity", obj.vignette_intensity));
+    try_load(ar, ser20::make_nvp("vignette_smoothness", obj.vignette_smoothness));
+    try_load(ar, ser20::make_nvp("grain_intensity", obj.grain_intensity));
+    try_load(ar, ser20::make_nvp("dithering", obj.dithering));
 }
 LOAD_INSTANTIATE(tonemapping_pass::settings, ser20::iarchive_associative_t);
 LOAD_INSTANTIATE(tonemapping_pass::settings, ser20::iarchive_binary_t);

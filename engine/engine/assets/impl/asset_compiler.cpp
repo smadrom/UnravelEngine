@@ -35,12 +35,19 @@
 
 #include <engine/meta/scripting/script.hpp>
 
+#include <engine/rendering/gi/mesh_sdf_source.h>
 #include <engine/scripting/ecs/systems/script_system.h>
 #include <engine/profiler/profiler.h>
 #include <algorithm>
 #include <array>
 #include <cstdint>
+
+#include <poolstl/poolstl.hpp>
+
 #include <cmath>
+#include <numeric>
+#include <set>
+#include <thread>
 #include <fstream>
 #include <dotnetpp/dotnetpp.h>
 #include <iterator>
@@ -762,12 +769,34 @@ auto compile_texture_to_file(const fs::path& input_path,
     const auto input_info = get_input_texture_info(compile_input, quality.max_size);
     auto format = select_compressed_format(input_info.format, compile_input.extension(), quality.compression);
 
+    // Resolve the effective color space. Data-typed imports are always linear no
+    // matter the tag: normal maps are vectors, and float sources (.hdr/.exr) have
+    // no display encoding to begin with. Everything else honors the meta, with
+    // `automatic` meaning raw/linear (legacy behavior -- UI textures, icons and
+    // untagged content keep sampling exactly as before). One exception: LDR
+    // equirect imports are display-encoded by construction (authored/rendered sky
+    // panoramas feeding the skybox dome and the irradiance bake), and no other
+    // stage can tag them (the mesh importer only classifies material slots) -- so
+    // `automatic` resolves to sRGB for those. An explicit `linear` tag still wins.
+    const auto source_ext = string_utils::to_lower(compile_input.extension().string());
+    const bool source_is_float = source_ext == ".hdr" || source_ext == ".exr";
+    const bool is_normal_map = importer.type == texture_importer_meta::texture_type::normal_map;
+    const bool auto_srgb_equirect = importer.colorspace == texture_importer_meta::color_space::automatic &&
+                                    importer.type == texture_importer_meta::texture_type::equirect;
+    const bool resolved_srgb = (importer.colorspace == texture_importer_meta::color_space::srgb ||
+                                auto_srgb_equirect) &&
+                               !is_normal_map && !source_is_float;
+
     const bool needs_format_conversion = input_info.format != format;
     const bool needs_downscale = !input_info.fits_max_size;
     // Equirect must always run through texturec; a raw copy cannot produce a cubemap.
     const bool needs_equirect_projection = importer.type == texture_importer_meta::texture_type::equirect;
+    // sRGB-tagged textures must run through texturec even when a raw copy would do:
+    // only the compiled KTX2 container carries the sRGB tag the runtime loader
+    // turns into BGFX_TEXTURE_SRGB. A raw-copied PNG cannot express it.
+    const bool needs_srgb_container = resolved_srgb;
 
-    if(needs_format_conversion || needs_downscale || is_ktx2_input || needs_equirect_projection)
+    if(needs_format_conversion || needs_downscale || is_ktx2_input || needs_equirect_projection || needs_srgb_container)
     {
         if(needs_downscale && !needs_format_conversion)
         {
@@ -778,15 +807,24 @@ auto compile_texture_to_file(const fs::path& input_path,
                         texture_size_to_pixel_limit(quality.max_size));
         }
 
+        // KTX2 container: unlike legacy DDS fourcc, its data format descriptor
+        // carries the sRGB/linear transfer tag, which the runtime loader maps to
+        // BGFX_TEXTURE_SRGB (see loadTexture). texturec tags the container sRGB
+        // unless --linear is passed, so the flag below must mirror resolved_srgb.
         std::vector<std::string> args_array = {
             "-f",
             str_input,
             "-o",
             str_output,
             "--as",
-            "dds",
+            "ktx2",
         };
-        
+
+        if(!resolved_srgb)
+        {
+            args_array.emplace_back("--linear");
+        }
+
         if(try_compress)
         {
             args_array.emplace_back("-t");
@@ -919,20 +957,61 @@ auto compile_shader_to_file(const fs::path& input_path,
 
     // Vertex/fragment shaders that reference compute-style read/write buffers
     // (BUFFER_RO / BUFFER_RW / BUFFER_WO) need SSBO support, which requires a
-    // higher GLSL profile. Detect that up-front by scanning the shader source
-    // so the correct OpenGL profile is selected below.
+    // higher GLSL profile. Detect that up-front so the correct OpenGL profile is
+    // selected below.
+    //
+    // The scan follows #include directives: a shader that declares its buffers in a shared
+    // .sh header (as the GI shaders do) would otherwise look buffer-free, compile at the
+    // lower profile, and fail in the driver on OpenGL only -- a backend-specific break that
+    // no other platform reproduces.
     bool needs_compute_buffers = false;
     if(vs || fs)
     {
-        std::ifstream shader_file(str_input);
-        if(shader_file.is_open())
+        std::set<fs::path> visited;
+        std::vector<fs::path> pending{input_path};
+        while(!pending.empty() && !needs_compute_buffers)
         {
+            const fs::path current = pending.back();
+            pending.pop_back();
+            if(!visited.insert(current).second)
+            {
+                continue;
+            }
+            std::ifstream shader_file(current.string());
+            if(!shader_file.is_open())
+            {
+                continue;
+            }
             std::stringstream buffer;
             buffer << shader_file.rdbuf();
             const std::string source = buffer.str();
-            needs_compute_buffers = source.find("BUFFER_RO(") != std::string::npos
-                                 || source.find("BUFFER_RW(") != std::string::npos
-                                 || source.find("BUFFER_WO(") != std::string::npos;
+            if(source.find("BUFFER_RO(") != std::string::npos ||
+               source.find("BUFFER_RW(") != std::string::npos ||
+               source.find("BUFFER_WO(") != std::string::npos)
+            {
+                needs_compute_buffers = true;
+                break;
+            }
+            // Queue every #include "..." resolved against the including file's directory and
+            // against the shared shader include root, which is how shaderc resolves them.
+            size_t search_pos = 0;
+            while((search_pos = source.find("#include", search_pos)) != std::string::npos)
+            {
+                const size_t quote_open = source.find('"', search_pos);
+                if(quote_open == std::string::npos)
+                {
+                    break;
+                }
+                const size_t quote_close = source.find('"', quote_open + 1);
+                if(quote_close == std::string::npos)
+                {
+                    break;
+                }
+                const std::string relative = source.substr(quote_open + 1, quote_close - quote_open - 1);
+                pending.emplace_back(current.parent_path() / relative);
+                pending.emplace_back(include / relative);
+                search_pos = quote_close + 1;
+            }
         }
     }
 
@@ -1363,6 +1442,355 @@ auto compile<mesh>(asset_manager& am, const fs::path& key, const fs::path& outpu
         {
             APP_SCOPE_PERF("Generate LODs for Load Data");
             mesh::generate_lods_for_load_data(data, lod_configs);
+        }
+    }
+    // Bake the GI distance field from the final LOD0 topology. This runs after skinning and
+    // LOD generation because both can rewrite the vertex and index buffers; baking earlier
+    // would produce a field that no longer matches the geometry that ships.
+    if(importer->sdf.generate_sdf)
+    {
+        APPLOG_INFO("Baking SDF for {0}", str_input);
+        APP_SCOPE_PERF("Bake Mesh SDF");
+        mesh_sdf_bake_settings sdf_settings;
+        sdf_settings.resolution = importer->sdf.resolution;
+        sdf_settings.min_voxel_size = importer->sdf.min_voxel_size;
+        sdf_settings.max_voxel_size = importer->sdf.max_voxel_size;
+        sdf_settings.max_total_voxels = importer->sdf.max_total_voxels;
+        sdf_settings.two_sided = importer->sdf.two_sided;
+        sdf_settings.two_sided_thickness = importer->sdf.two_sided_thickness;
+        // One field PER SUBMESH, in submesh order. Submeshes are drawn at their own node
+        // transforms, so a single field covering the whole mesh could only be placed correctly
+        // for one of them; the GI registration relies on this indexing to match.
+        data.submesh_sdfs.assign(data.submeshes.size(), mesh_sdf{});
+
+        // data.lods holds the GENERATED levels only -- LOD 0 is the base topology in
+        // triangle_data -- so the valid request range is [0, lods.size()] and a mesh that
+        // generated fewer levels than asked for takes the coarsest one it has. Clamping rather
+        // than rejecting matters because the request means "cheaper": answering an unavailable
+        // level with full detail would be the most expensive possible reading of it.
+        const uint32_t lod_index = math::min<uint32_t>(importer->sdf.lod_index, uint32_t(data.lods.size()));
+        // The parallelism goes either outside this loop or inside each bake, never both: a
+        // nested poolstl range would wait on work queued behind its own pool thread and
+        // deadlock (see sdf_bake_threading).
+        //
+        // Which one wins depends on the model. With submeshes enough to fill the pool, running
+        // them in parallel and each bake serially is much better, because one small bake cannot
+        // fill the pool by itself and pays dispatch overhead per submesh. With fewer, that
+        // leaves threads idle, so the split reverses and each bake gets the whole pool -- a
+        // single-submesh prop is the common case and must not lose its parallelism.
+        const size_t worker_count = math::max<size_t>(std::thread::hardware_concurrency(), 1u);
+        const bool parallel_submeshes = data.submeshes.size() >= worker_count;
+        const auto threading =
+            parallel_submeshes ? sdf_bake_threading::serial : sdf_bake_threading::parallel;
+        std::vector<size_t> submesh_indices(data.submeshes.size());
+        std::iota(submesh_indices.begin(), submesh_indices.end(), size_t(0));
+        // Junk geometry is worth a number rather than silence: a submesh made ENTIRELY of slivers
+        // renders nothing and now bakes nothing, so without this it would simply be absent from GI
+        // with no trace of why.
+        std::atomic<uint64_t> discarded_triangles{0};
+        // Counted up front rather than inside the loop: the flag is static data, and the summary
+        // below needs the number whether or not anything else baked.
+        const size_t skinned_submesh_count = size_t(std::count_if(data.submeshes.begin(),
+                                                                  data.submeshes.end(),
+                                                                  [](const mesh::submesh& sub)
+                                                                  {
+                                                                      return sub.skinned;
+                                                                  }));
+        // One slot per submesh, each written by exactly one task, so this needs no synchronisation.
+        std::vector<sdf_component_summary> component_summaries(data.submeshes.size());
+        std::for_each(poolstl::par.par_if(parallel_submeshes),
+                      submesh_indices.begin(),
+                      submesh_indices.end(),
+                      [&](size_t i)
+                      {
+                          // Skinned submeshes are refused a field. The bake reads bind-pose
+                          // vertices and skinning rewrites the surface every frame, so the field
+                          // could only ever occlude as a rigid bind-pose statue pinned to the
+                          // entity's root transform -- wrong shape, wrong place. Deforming
+                          // geometry still receives GI through the screen-space resolve; it just
+                          // does not contribute occlusion or bounce, the same contract every
+                          // SDF/voxel GI ships with. Mirrored at runtime in
+                          // surface_cache_system::update_world for assets compiled before this.
+                          if(data.submeshes[i].skinned)
+                          {
+                              return;
+                          }
+                          sdf_source_geometry sdf_geometry;
+                          const bool extracted = extract_sdf_source_geometry(data, lod_index, i, sdf_geometry);
+                          discarded_triangles += sdf_geometry.discarded_triangles;
+                          if(!extracted)
+                          {
+                              return;
+                          }
+                          component_summaries[i] = summarize_connected_components(sdf_geometry);
+                          mesh_sdf field;
+                          if(!bake_mesh_sdf(sdf_geometry, sdf_settings, field, threading))
+                          {
+                              return;
+                          }
+                          data.submesh_sdfs[i] = std::move(field);
+                      });
+        // Totalled after the loop rather than inside it, so the reported numbers do not depend
+        // on thread interleaving and the loop needs no atomics. A bake only succeeds when it
+        // produced at least one surface brick, so that is the test for "this submesh baked".
+        size_t baked_count = 0;
+        size_t surface_bricks = 0;
+        size_t memory_bytes = 0;
+        bool any_two_sided_fallback = false;
+        // An unsigned shell cannot be thinner than the voxel that stores it, so the bake floors it
+        // at one voxel. On a large submesh that floor lands far above the authored thickness and
+        // the shell stops being a surface skin, which is the failure worth naming: see the warning
+        // below.
+        struct dilated_shell_report
+        {
+            size_t submesh_index = 0;
+            float extent = 0.0f;
+            float field_extent = 0.0f;
+            float voxel_size = 0.0f;
+            float thickness = 0.0f;
+            bool is_oversized = false;
+            uint32_t component_count = 0;
+            float largest_component_extent = 0.0f;
+            float sparsity = 0.0f;
+        };
+        std::vector<dilated_shell_report> dilated_shells;
+        // A field is padded outward from its submesh by a few voxels on every side, so it is always
+        // somewhat larger than the geometry. Several TIMES larger means the field is not sized to the
+        // submesh at all, which is a different failure from a coarse voxel and has to be told apart
+        // from it -- a compact submesh cannot legitimately produce a field spanning its whole model.
+        constexpr float oversized_field_ratio = 4.0f;
+        // A submesh spread over more than this many times its largest connected piece cannot get a
+        // voxel fine enough to resolve that piece, since the voxel is the SPREAD divided by a fixed
+        // count. Four is deliberately permissive: a couple of parts side by side is normal authoring,
+        // while the cases that break tracing measure in the hundreds or thousands.
+        constexpr float sparse_submesh_ratio = 4.0f;
+        // Submeshes the bake REFUSED for being unresolvable. They have no field, so the loop below
+        // skips them, and without their own list a refusal would look exactly like a submesh that
+        // simply has no geometry -- silence being the one outcome worse than the phantom it replaced.
+        std::vector<dilated_shell_report> refused_sparse;
+        for(size_t i = 0; i < data.submesh_sdfs.size(); ++i)
+        {
+            const auto& field = data.submesh_sdfs[i];
+            const uint32_t bricks = field.get_surface_brick_count();
+            if(bricks == 0)
+            {
+                const auto& refused = component_summaries[i];
+                if(refused.get_sparsity() > sdf_settings.max_component_spread &&
+                   sdf_settings.max_component_spread > 0.0f)
+                {
+                    refused_sparse.push_back({i,
+                                              refused.bounds_extent,
+                                              0.0f,
+                                              0.0f,
+                                              0.0f,
+                                              false,
+                                              refused.component_count,
+                                              refused.largest_component_extent,
+                                              refused.get_sparsity()});
+                }
+                continue;
+            }
+            surface_bricks += bricks;
+            memory_bytes += field.get_memory_usage();
+            any_two_sided_fallback = any_two_sided_fallback || (field.is_two_sided && !sdf_settings.two_sided);
+            const math::vec3 field_dimensions = field.bounds.get_dimensions();
+            const float field_extent =
+                math::max(field_dimensions.x, math::max(field_dimensions.y, field_dimensions.z));
+            const math::vec3 submesh_dimensions = (i < data.submeshes.size() && data.submeshes[i].bbox.is_populated())
+                                                      ? data.submeshes[i].bbox.get_dimensions()
+                                                      : field_dimensions;
+            const float submesh_extent =
+                math::max(submesh_dimensions.x, math::max(submesh_dimensions.y, submesh_dimensions.z));
+            const bool is_oversized =
+                submesh_extent > 0.0f && field_extent > submesh_extent * oversized_field_ratio;
+            const bool is_dilated =
+                field.is_two_sided && field.two_sided_thickness > sdf_settings.two_sided_thickness;
+            // Sparsity is tested independently of the other two because it produces an unusable
+            // field WITHOUT tripping either: the field is sized correctly to its submesh, so the
+            // oversized check sees nothing wrong, and a closed submesh has no shell to dilate. A
+            // scatter of small closed parts is exactly that case, and it is a common way for an
+            // artist to group geometry.
+            const auto& summary = component_summaries[i];
+            const bool is_sparse = summary.get_sparsity() > sparse_submesh_ratio;
+            if(is_dilated || is_oversized || is_sparse)
+            {
+                // The submesh's own extent, the field's extent and the voxel are reported together
+                // because they separate three failures that look identical in the viewport and have
+                // completely different fixes: a field far larger than its submesh is not sized to it
+                // at all; a submesh far larger than the geometry it draws groups scattered parts and
+                // must be split; and a submesh whose extents all agree is merely under-resolved.
+                dilated_shells.push_back({i,
+                                          submesh_extent,
+                                          field_extent,
+                                          field.voxel_size,
+                                          field.two_sided_thickness,
+                                          is_oversized,
+                                          summary.component_count,
+                                          summary.largest_component_extent,
+                                          summary.get_sparsity()});
+            }
+            ++baked_count;
+        }
+        std::sort(dilated_shells.begin(),
+                  dilated_shells.end(),
+                  [](const dilated_shell_report& lhs, const dilated_shell_report& rhs)
+                  {
+                      // Oversized fields first regardless of shell: a field not sized to its submesh
+                      // is a defect, while a thick shell is usually just a coarse setting.
+                      if(lhs.is_oversized != rhs.is_oversized)
+                      {
+                          return lhs.is_oversized;
+                      }
+                      // Then by sparsity, which is very nearly how many times too coarse the voxel
+                      // is, and therefore ranks by how unusable the field is rather than by size.
+                      if(lhs.sparsity != rhs.sparsity)
+                      {
+                          return lhs.sparsity > rhs.sparsity;
+                      }
+                      return lhs.thickness > rhs.thickness;
+                  });
+        if(!refused_sparse.empty())
+        {
+            std::sort(refused_sparse.begin(),
+                      refused_sparse.end(),
+                      [](const dilated_shell_report& lhs, const dilated_shell_report& rhs)
+                      {
+                          return lhs.sparsity > rhs.sparsity;
+                      });
+            APPLOG_WARNING("  {0}: {1} submeshes were NOT given a distance field. Their geometry "
+                           "is scattered so widely that the voxel -- which comes from the bounds, "
+                           "not from the parts -- cannot resolve the parts at all, and the field "
+                           "would have traced as a solid block the size of the spread. They do not "
+                           "occlude or bounce light. Split them by location rather than by "
+                           "material to get them back.",
+                           str_input,
+                           refused_sparse.size());
+            constexpr size_t max_reported_refusals = 5;
+            const size_t reported = math::min(refused_sparse.size(), max_reported_refusals);
+            for(size_t i = 0; i < reported; ++i)
+            {
+                const auto& entry = refused_sparse[i];
+                APPLOG_WARNING("    submesh {0}: {1} piece(s), largest {2:.2f}, spread over {3:.2f} "
+                               "({4:.0f}x)",
+                               entry.submesh_index,
+                               entry.component_count,
+                               entry.largest_component_extent,
+                               entry.extent,
+                               entry.sparsity);
+            }
+        }
+        // Logged outside the baked_count gate: a character whose submeshes are ALL skinned bakes
+        // nothing at all, and that asset is exactly the one whose absence from GI needs a reason
+        // on record -- it renders perfectly normally, so nothing else will ever say why.
+        if(skinned_submesh_count > 0)
+        {
+            APPLOG_INFO("  {0}: {1} skinned submeshes were not given a distance field. A field "
+                        "bakes the bind pose and animation rewrites the surface every frame, so "
+                        "it could only occlude as a rigid bind-pose statue. Skinned geometry "
+                        "still receives GI; it does not occlude or bounce it.",
+                        str_input,
+                        skinned_submesh_count);
+        }
+        if(baked_count > 0)
+        {
+            APPLOG_INFO("Baked SDF for {0}: {1}/{2} submeshes, {3} surface bricks, {4} KB",
+                        str_input,
+                        baked_count,
+                        data.submeshes.size(),
+                        surface_bricks,
+                        memory_bytes / 1024);
+            // Bricks, not megabytes, are what the runtime is actually short of: they are slots in
+            // a fixed atlas shared by the whole scene. Reporting the per-submesh average alongside
+            // the total makes an over-budget model diagnosable at import time rather than at the
+            // point the atlas silently starts dropping fields, and says which way to move
+            // Max Total Voxels -- bake time moves with it in the same proportion.
+            APPLOG_INFO("  {0} bricks average per submesh, baked from LOD {1}. Lower the mesh's Max "
+                        "Total Voxels if the scene overruns the SDF atlas; both the atlas footprint "
+                        "and the bake time scale with it. Raising Bake From LOD cuts the bake time "
+                        "alone.",
+                        surface_bricks / math::max<size_t>(baked_count, 1u),
+                        lod_index);
+            if(any_two_sided_fallback)
+            {
+                // Reported rather than silent: an unsigned shell has no solid interior, so the
+                // mesh occludes but does not fill. If that is wrong for this asset, the mesh
+                // needs closing rather than a different SDF setting.
+                APPLOG_INFO("  {0} has submeshes that are not closed surfaces, so their SDFs were "
+                            "baked as unsigned shells. The inside/outside test is undefined on an "
+                            "open mesh and would otherwise mark regions outside it as solid.",
+                            str_input);
+            }
+            if(discarded_triangles.load() > 0)
+            {
+                APPLOG_INFO("  {0} triangles carried no surface (zero-area slivers or non-finite "
+                            "positions) and were excluded. They draw nothing, so including them only "
+                            "widened the field bounds -- which is what sets the voxel size.",
+                            discarded_triangles.load());
+            }
+            if(!dilated_shells.empty())
+            {
+                // The phantom-geometry case, and the reason it needs its own line: everything
+                // within the shell of ANY triangle reads solid, so once the shell is thicker than
+                // the gaps in a submesh (window mullions, railings, foliage cards) those gaps fill
+                // in and the submesh traces as one solid block the size of its bounds.
+                //
+                // Naming Resolution specifically matters. The voxel is Resolution divisions of the
+                // submesh's OWN longest axis, so a large submesh gets a coarse voxel however small
+                // its detail is -- and the two caps below it only ever make the voxel COARSER, so
+                // raising Max Total Voxels on its own can never reach a finer field. It has to go
+                // up together with Resolution, or the submesh has to be split.
+                APPLOG_WARNING("  {0}: {1} unsigned submeshes have a shell floored at their voxel "
+                               "size rather than the authored {2:.3f}, so detail finer than twice "
+                               "that fills in and traces as one solid block. Raise Resolution AND "
+                               "Max Total Voxels together -- Max Total Voxels alone only coarsens. "
+                               "If a submesh's extent is far larger than the geometry it draws, it "
+                               "groups scattered parts and has to be split instead.",
+                               str_input,
+                               dilated_shells.size(),
+                               sdf_settings.two_sided_thickness);
+                // Capped: a model can dilate hundreds of submeshes, and the tail is all the same
+                // story. The worst few are what identify the block a viewer is actually looking at.
+                constexpr size_t max_reported_shells = 5;
+                const size_t reported = math::min(dilated_shells.size(), max_reported_shells);
+                for(size_t i = 0; i < reported; ++i)
+                {
+                    const auto& entry = dilated_shells[i];
+                    APPLOG_WARNING("    submesh {0}: extent {1:.2f}, field {2:.2f}, voxel {3:.3f}, "
+                                   "shell {4:.3f} | {5} piece(s), largest {6:.2f}, spread {7:.0f}x{8}",
+                                   entry.submesh_index,
+                                   entry.extent,
+                                   entry.field_extent,
+                                   entry.voxel_size,
+                                   entry.thickness,
+                                   entry.component_count,
+                                   entry.largest_component_extent,
+                                   entry.sparsity,
+                                   entry.is_oversized ? "  <-- FIELD IS NOT SIZED TO THIS SUBMESH"
+                                                      : (entry.sparsity > sparse_submesh_ratio
+                                                             ? "  <-- SCATTERED PARTS, VOXEL CANNOT RESOLVE THEM"
+                                                             : ""));
+                }
+            }
+        }
+        else if(!refused_sparse.empty())
+        {
+            // Every submesh was refused for the same specific reason, so say THAT rather than the
+            // generic advice below, which would send the reader to settings that cannot help.
+            data.submesh_sdfs.clear();
+            APPLOG_WARNING("No SDF for {0}: all {1} submeshes are too scattered to resolve. See the "
+                           "detail above; the fix is splitting them by location, not a bake setting.",
+                           str_input,
+                           refused_sparse.size());
+        }
+        else
+        {
+            // A failed bake is not a failed compile: the mesh still renders, it just does not
+            // participate in GI.
+            data.submesh_sdfs.clear();
+            APPLOG_WARNING("Could not bake an SDF for {0}. The mesh will not contribute to "
+                           "global illumination. Sub-voxel or non-closed geometry usually needs "
+                           "a higher SDF resolution or the Two Sided flag.",
+                           str_input);
         }
     }
     // Save materials and register their UIDs before writing the mesh binary

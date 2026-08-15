@@ -31,26 +31,50 @@ public:
     {
         /// Lower clamp for metered scene brightness in EV100. A LOWER value lets the
         /// system BRIGHTEN dark scenes more (eye adaptation walking into shadow).
-        /// -1 keeps brightening subtle (~1 stop), which matches this engine's authored look.
-        float min_ev = -4.0f;
+        /// -3 keeps genuinely dark interiors reading dark (how much lift actually
+        /// happens is further limited by dark_adaptation, which scales the deficit
+        /// below the neutral point): probe-GI leaks are bounded but never zero, and
+        /// deeper adaptation exposes whatever tiny residual a sealed room contains
+        /// toward mid-gray (measured on the sealed-box test: -6 turned a sub-percent
+        /// leak into a full wash). Lower this per volume only for content where deep
+        /// night adaptation is the point, accepting that it will surface GI residuals.
+        float min_ev = -3.0f;
         /// Upper clamp for metered scene brightness in EV100. A HIGHER value lets the
-        /// system DARKEN bright scenes more. This engine's lighting is authored at a
-        /// fixed reference exposure rather than calibrated to physical cd/m2, so the
-        /// default pins the bright end at the authored peak (exposure ~= 1/1.2) to keep
-        /// daylight looking like daylight. Raise it only if you want bright scenes
-        /// (e.g. staring at the sky) to tone down below the authored level.
-        float max_ev = 0.0f;
+        /// system DARKEN bright scenes more. Since the linear-color pipeline landed,
+        /// the meter is trusted to float freely: 16 covers physical daylight (EV100
+        /// 14-16) and is effectively "no clamp" for current scene luminances, so the
+        /// exposure anchors the image instead of a hand-pinned reference level.
+        float max_ev = 16.0f;
         /// Exposure bias in EV stops applied on top of the metered result (+1 = 2x brighter).
-        float compensation = 0.0f;
+        /// With this pass's K=12.5 / exp2(-EV)/1.2 formulation, an unclamped meter pins
+        /// the metered band at ~10.4% post-exposure. +3 (~83%) is the look that reaches
+        /// AgX display-white with this engine's lighting scale: the boost sits before
+        /// grading and the tone curve, which is punchier than baking the same 2 stops
+        /// into the operator. Use this slider for scene-to-scene bias around that look.
+        float compensation = 3.0f;
+        /// Fraction of a dark scene's EV deficit the eye adapts away (the single-slope
+        /// version of UE's Exposure Compensation Curve / Unity HDRP's Curve Remapping).
+        /// 1 = full adaptation: any dark scene is lifted back to the mid-gray anchor
+        /// (until Min EV stops it) and dark rooms read bright. 0 = no adaptation: dark
+        /// scenes render at their true relative darkness. The 0.1 default keeps
+        /// adaptation subtle -- a scene 5 stops under neutral is lifted only half a
+        /// stop, so darkness reads as darkness. Applies only BELOW the neutral point;
+        /// bright-scene metering is unaffected.
+        float dark_adaptation = 0.1f;
         /// Time constant in seconds for the exposure to INCREASE (scene getting darker).
         /// Larger = slower adaptation. Adaptation is performed in log2/EV space.
         float adaptation_speed_up = 3.0f;
         /// Time constant in seconds for the exposure to DECREASE (scene getting brighter).
         float adaptation_speed_down = 1.0f;
         /// Fraction of the darkest (weighted) pixels excluded from the average.
-        float low_percentile = 0.50f;
+        /// 0.80 meters only the brightest quintile (classic highlight-protecting
+        /// metering, as in UE's histogram defaults): shadows can no longer drag the
+        /// exposure up and blow out lit areas in high-contrast scenes.
+        float low_percentile = 0.80f;
         /// Upper fraction kept before excluding the brightest (weighted) pixels.
-        float high_percentile = 0.95f;
+        /// 0.98 lets sky participate in metering (so it exposes saturated, not washed)
+        /// while still rejecting sun disc / specular pinpoints.
+        float high_percentile = 0.98f;
         /// How pixels are spatially weighted when metering scene luminance.
         exposure_metering_mode metering_mode = exposure_metering_mode::center_weighted;
         /// Relative radius (in normalized device coords) of the metering region.
@@ -120,6 +144,11 @@ private:
     } average_program_;
 
     bgfx::DynamicIndexBufferHandle histogram_buffer_ = BGFX_INVALID_HANDLE;
+    /// False until the first average dispatch has consumed (and zeroed) the histogram.
+    /// The buffer's initial contents are undefined and cannot be seeded from the CPU
+    /// (bgfx forbids update() on COMPUTE_WRITE buffers), so run_average discards the
+    /// first measurement instead of adapting toward it.
+    bool histogram_bins_valid_ = false;
 };
 
 } // namespace unravel

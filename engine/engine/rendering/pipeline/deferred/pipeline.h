@@ -16,6 +16,9 @@
 
 namespace unravel
 {
+class surface_cache_system;
+class surface_cache_view;
+
 namespace rendering
 {
 
@@ -84,8 +87,7 @@ public:
                                gfx::render_view& rview,
                                delta_t dt) -> gfx::frame_buffer::ptr;
 
-    void run_ssr_pass(const camera& camera, gfx::render_view& rview, const gfx::frame_buffer::ptr& previous_frame_source,
-                       const run_params& rparams);
+    void run_ssr_pass(const camera& camera, gfx::render_view& rview, const run_params& rparams);
 
     void run_ssil_pass(const camera& camera, gfx::render_view& rview, const run_params& rparams);
 
@@ -114,6 +116,66 @@ public:
     void run_debug_visualization_pass(const camera& camera,
                                       gfx::render_view& rview,
                                       const gfx::frame_buffer::ptr& output);
+
+    /// Debug pass ids at or above this one are handled by the distance field visualiser
+    /// rather than by the G-buffer visualiser, whose shader only knows modes 0..14.
+    static constexpr int debug_pass_sdf_normals = 15;
+    static constexpr int debug_pass_sdf_step_count = 16;
+    static constexpr int debug_pass_sdf_headers = 17;
+    static constexpr int debug_pass_sdf_probe = 18;
+    static constexpr int debug_pass_sdf_entry = 19;
+    static constexpr int debug_pass_sdf_clipmap = 20;
+    static constexpr int debug_pass_sdf_direct = 21;
+    static constexpr int debug_pass_sdf_cascade_levels = 22;
+    static constexpr int debug_pass_sdf_attr_albedo = 23;
+    static constexpr int debug_pass_sdf_light_voxels = 24;
+    static constexpr int debug_pass_sdf_world_probes = 25;
+    static constexpr int debug_pass_sdf_sun_tiers = 26;
+    static constexpr int debug_pass_sdf_probe_sky = 27;
+    static constexpr int debug_pass_sdf_vis_memo = 28;
+    void run_sdf_debug_pass(const camera& camera,
+                            gfx::render_view& rview,
+                            const run_params& rparams,
+                            const gfx::frame_buffer::ptr& output);
+
+    /// Resolves the blended gi_settings for this run from the volume hooks; false = GI off.
+    auto resolve_gi_settings(const run_params& rparams, gi_settings& gi) -> bool;
+
+    /// GI world-state preparation for a camera run: surface-cache residency, the
+    /// viewer-snapped clipmap cascade and its compose (also kept alive for the SDF
+    /// debug views), then -- when a gi_component asks for GI -- voxel lighting and
+    /// world-probe tracing. No-op for probe captures and when neither GI nor the
+    /// SDF debug views need the cache.
+    void run_gi_scene_passes(scene& scn, const camera& camera, gfx::render_view& rview, const run_params& params);
+
+    /// Lights the resident surface voxels (GI v2 plan 3.2), with sun visibility
+    /// answered by the sun's CSM cascade 0 when one was rendered this frame.
+    void run_gi_light_voxel_pass(scene& scn,
+                                 const camera& camera,
+                                 gfx::render_view& rview,
+                                 surface_cache_system& surface_cache,
+                                 surface_cache_view& view_cache,
+                                 const gi_settings& gi);
+
+    /// Traces world probes against the freshly lit voxels (GI v2 plan 3.3).
+    void run_gi_world_probe_pass(const camera& camera,
+                                 gfx::render_view& rview,
+                                 surface_cache_system& surface_cache,
+                                 surface_cache_view& view_cache);
+
+    /// World-space specular tier into RBUFFER, layered UNDER SSR. No-op unless a
+    /// camera run with GI reflections enabled.
+    void run_gi_reflection_pass(const camera& camera, gfx::render_view& rview, const run_params& params);
+
+    /// Gathers the world structures into a screen-space indirect diffuse buffer.
+    /// See gi_resolve_pass.
+    /// @return true when the pass produced a result, which also means it needs PREV_DEPTH
+    ///         snapshotted this frame for its temporal accumulation.
+    /// Far-field radiance for hits beyond the cascades comes from @c PREV_SCENE_HDR
+    /// (last frame's post-TAA linear scene color -- the SSR convention, same source).
+    auto run_gi_resolve_pass(const camera& camera,
+                             gfx::render_view& rview,
+                             const run_params& rparams) -> bool;
 
     void build_reflections(scene& scn, const camera& camera, delta_t dt);
 
@@ -351,8 +413,16 @@ private:
     /// After SSIL/SSR; copies G-buffer depth into @c PREV_DEPTH for next-frame reprojection.
     void snapshot_prev_depth(gfx::render_view& rview, const usize32_t& viewport_size);
 
+    /// After TAA; copies the SCENE-REFERRED linear HDR target into @c PREV_SCENE_HDR for
+    /// next frame's SSR trace and GI far-field. Deliberately pre-bloom/tonemap/UI: the old
+    /// source (final OBUFFER) fed display-encoded values back into linear lighting, which
+    /// with free-floating auto exposure formed a brightness feedback loop in dark scenes.
+    void snapshot_prev_scene_color(gfx::render_view& rview, const gfx::frame_buffer::ptr& source);
+
     std::shared_ptr<int> sentinel_ = std::make_shared<int>(0);
     int debug_pass_{-1};
+    /// Rotation phase of the light-voxel update (GI_LIGHT_VOXEL_UPDATE_DENOM slices).
+    uint32_t light_voxel_frame_{0};
 
 };
 

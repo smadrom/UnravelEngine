@@ -31,6 +31,20 @@ struct texture_importer_meta : crtp_meta_type<texture_importer_meta, asset_impor
         equirect,
     };
 
+    /// Color space the texels are authored in. Drives both the compiled container's
+    /// sRGB tag (KTX2) and the runtime BGFX_TEXTURE_SRGB sampling flag.
+    /// - automatic: raw/linear sampling (legacy behavior). Data maps, UI textures and
+    ///   anything untagged keep working exactly as before.
+    /// - srgb: display-encoded color data (albedo, emissive). Hardware decodes to
+    ///   linear at sample time so lighting math runs in linear space.
+    /// - linear: explicitly linear data; also makes texturec filter mips linearly.
+    enum class color_space
+    {
+        automatic,
+        srgb,
+        linear,
+    };
+
     enum class compression_quality
     {
         project_default,
@@ -57,6 +71,7 @@ struct texture_importer_meta : crtp_meta_type<texture_importer_meta, asset_impor
     };
 
     texture_type type{texture_type::automatic};
+    color_space colorspace{color_space::automatic};
     bool generate_mipmaps{true};
     /// Bake OpenGL/DirectX normal Y difference into texels at compile (normal_map type only).
     bool invert_normal_y{false};
@@ -87,6 +102,35 @@ struct mesh_importer_meta : crtp_meta_type<mesh_importer_meta, asset_importer_me
         ///< Target error for LOD generation (lower = higher quality, higher = more aggressive)
         float lod_target_error{0.01f};
     } model;
+
+    ///< Signed distance field bake, consumed by the surface cache GI tracer. The field is
+    ///< rigid, so it is generated for every mesh; skinned meshes use it through per-segment
+    ///< proxies rather than as a single instance.
+    struct sdf_meta
+    {
+        ///< Generate a distance field for this mesh at compile time.
+        bool generate_sdf{true};
+        ///< Target voxel count along the longest bounds axis.
+        uint32_t resolution{64};
+        ///< Clamps on the derived voxel size, in local units.
+        float min_voxel_size{0.01f};
+        float max_voxel_size{1.0f};
+        ///< Ceiling on total grid voxels in one field. The dominant control on both bake time
+        ///< and atlas footprint, since both scale with voxel count. Lower this on models split
+        ///< into very many submeshes, where the per-field cost is multiplied by the split.
+        uint64_t max_total_voxels{262144};
+        ///< LOD the field is baked from. 0 is the full-detail topology. Higher levels cost less
+        ///< to bake -- a closest-point query scales with roughly the square root of the triangle
+        ///< count -- and the field is coarse enough that the lost detail is usually below its
+        ///< voxel size anyway. A level beyond the last one generated is clamped to the coarsest
+        ///< available, so a mesh with no generated LODs bakes from the base.
+        uint32_t lod_index{2};
+        ///< Bake an unsigned shell instead of a signed field. Required for foliage and any
+        ///< other mesh that is not a closed surface, where inside/outside is meaningless.
+        bool two_sided{false};
+        ///< Local-space half thickness given to the shell when @ref two_sided is set.
+        float two_sided_thickness{0.05f};
+    } sdf;
 
     struct rig_meta
     {

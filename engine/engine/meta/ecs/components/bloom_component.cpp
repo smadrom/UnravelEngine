@@ -1,5 +1,6 @@
 #include "bloom_component.hpp"
 #include <engine/rendering/pipeline/passes/bloom_pass.h>
+#include <engine/meta/assets/asset_handle.hpp>
 #include <serialization/associative_archive.h>
 #include <serialization/binary_archive.h>
 #include "engine/meta/core/math/vector.hpp"
@@ -20,7 +21,8 @@ REFLECT_INLINE(bloom_pass::settings)
             entt::attribute{"pretty_name", "Threshold"},
             entt::attribute{"min", 0.0f},
             entt::attribute{"step", 0.1f},
-            entt::attribute{"tooltip", "Minimum brightness (HDR luminance) for a pixel to contribute to bloom. Higher values restrict bloom to only the brightest highlights. 0 = all pixels bloom (not recommended). Typical range: 0.5 - 2.0."},
+            entt::attribute{"tooltip", "Minimum brightness that blooms. 0 blooms everything softly. "
+                "Raise it so only brighter highlights glow."},
         })
         .data<&bloom_pass::settings::soft_knee>("soft_knee"_hs)
         .custom<entt::attributes>(entt::attributes{
@@ -29,7 +31,7 @@ REFLECT_INLINE(bloom_pass::settings)
             entt::attribute{"min", 0.0f},
             entt::attribute{"max", 1.0f},
             entt::attribute{"step", 0.05f},
-            entt::attribute{"tooltip", "Controls the transition width around the threshold. 0 = hard cutoff (sharp bloom boundary, can cause flickering), 1 = maximum smoothing (gradual fade-in, reduces specular flicker). Keep at 1.0 unless you specifically want a harder cutoff."},
+            entt::attribute{"tooltip", "How hard the threshold cutoff is. 0 is a sharp edge, 1 is a smooth fade. Keep at 1 unless you want a harder cutoff."},
         })
         .data<&bloom_pass::settings::clamp>("clamp"_hs)
         .custom<entt::attributes>(entt::attributes{
@@ -37,15 +39,24 @@ REFLECT_INLINE(bloom_pass::settings)
             entt::attribute{"pretty_name", "Clamp"},
             entt::attribute{"min", 0.0f},
             entt::attribute{"step", 1.0f},
-            entt::attribute{"tooltip", "Soft compression limit for pixel brightness before bloom processing. Uses Reinhard-style compression to smoothly attenuate extreme values. Prevents firefly artifacts from very bright sub-pixel highlights (e.g. sun reflections, emissives). 0 = disabled. Typical range: 5 - 50."},
+            entt::attribute{"tooltip", "Caps extremely bright pixels so tiny highlights do not explode into fireflies. 0 is off."},
         })
         .data<&bloom_pass::settings::intensity>("intensity"_hs)
         .custom<entt::attributes>(entt::attributes{
             entt::attribute{"name", "intensity"},
             entt::attribute{"pretty_name", "Intensity"},
             entt::attribute{"min", 0.0f},
-            entt::attribute{"step", 0.1f},
-            entt::attribute{"tooltip", "Global multiplier for the entire bloom effect. Scales all per-mip contributions uniformly. 0 = no bloom, 1 = standard, >1 = exaggerated glow. This is the main knob for overall bloom strength."},
+            entt::attribute{"step", 0.01f},
+            entt::attribute{"tooltip", "Bloom strength. Higher is a stronger glow."},
+        })
+        .data<&bloom_pass::settings::scatter>("scatter"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "scatter"},
+            entt::attribute{"pretty_name", "Scatter"},
+            entt::attribute{"min", 0.05f},
+            entt::attribute{"max", 1.0f},
+            entt::attribute{"step", 0.01f},
+            entt::attribute{"tooltip", "How far the glow spreads. Low is a tight halo, high is a wide soft veil."},
         })
         .data<&bloom_pass::settings::mip_count>("mip_count"_hs)
         .custom<entt::attributes>(entt::attributes{
@@ -53,7 +64,7 @@ REFLECT_INLINE(bloom_pass::settings)
             entt::attribute{"pretty_name", "Mip Count"},
             entt::attribute{"min", 2},
             entt::attribute{"max", 10},
-            entt::attribute{"tooltip", "Number of downsample levels in the bloom pyramid. More mips = wider bloom spread but more GPU cost. 5-7 is typical. Each additional mip doubles the maximum bloom radius."},
+            entt::attribute{"tooltip", "How many blur sizes to mix. More levels spread bloom farther, at a higher GPU cost."},
         })
         .data<&bloom_pass::settings::mip0_tint>("mip0_tint"_hs)
         .custom<entt::attributes>(entt::attributes{
@@ -103,7 +114,18 @@ REFLECT_INLINE(bloom_pass::settings)
             entt::attribute{"pretty_name", "Dirt Intensity"},
             entt::attribute{"min", 0.0f},
             entt::attribute{"step", 0.1f},
-            entt::attribute{"tooltip", "Strength of the lens dirt mask effect. Modulates bloom through a screen-space dirt texture to simulate smudges and scratches on the camera lens. 0 = disabled. Requires a dirt mask texture to be assigned (future feature)."},
+            entt::attribute{"group", "Lens Dirt"},
+            entt::attribute{"tooltip", "Strength of the lens dirt mask effect. Modulates bloom through the "
+                "assigned screen-space dirt texture to simulate smudges and scratches on the lens. "
+                "0 = disabled. Typical range 0.5 - 3 with a dark mask."},
+        })
+        .data<&bloom_pass::settings::dirt_texture>("dirt_texture"_hs)
+        .custom<entt::attributes>(entt::attributes{
+            entt::attribute{"name", "dirt_texture"},
+            entt::attribute{"pretty_name", "Dirt Texture"},
+            entt::attribute{"group", "Lens Dirt"},
+            entt::attribute{"tooltip", "Screen-space smudge/scratch mask for the lens dirt effect. Bright "
+                "areas of the mask catch bloom; unassigned = no dirt."},
         });
 }
 
@@ -113,6 +135,7 @@ SAVE_INLINE(bloom_pass::settings)
     try_save(ar, ser20::make_nvp("soft_knee", obj.soft_knee));
     try_save(ar, ser20::make_nvp("clamp", obj.clamp));
     try_save(ar, ser20::make_nvp("intensity", obj.intensity));
+    try_save(ar, ser20::make_nvp("scatter", obj.scatter));
     try_save(ar, ser20::make_nvp("mip_count", obj.mip_count));
     try_save(ar, ser20::make_nvp("mip0_tint", obj.mip0_tint));
     try_save(ar, ser20::make_nvp("mip1_tint", obj.mip1_tint));
@@ -121,6 +144,7 @@ SAVE_INLINE(bloom_pass::settings)
     try_save(ar, ser20::make_nvp("mip4_tint", obj.mip4_tint));
     try_save(ar, ser20::make_nvp("mip5_tint", obj.mip5_tint));
     try_save(ar, ser20::make_nvp("dirt_intensity", obj.dirt_intensity));
+    try_save(ar, ser20::make_nvp("dirt_texture", obj.dirt_texture));
 }
 SAVE_INSTANTIATE(bloom_pass::settings, ser20::oarchive_associative_t);
 SAVE_INSTANTIATE(bloom_pass::settings, ser20::oarchive_binary_t);
@@ -131,6 +155,7 @@ LOAD_INLINE(bloom_pass::settings)
     try_load(ar, ser20::make_nvp("soft_knee", obj.soft_knee));
     try_load(ar, ser20::make_nvp("clamp", obj.clamp));
     try_load(ar, ser20::make_nvp("intensity", obj.intensity));
+    try_load(ar, ser20::make_nvp("scatter", obj.scatter));
     try_load(ar, ser20::make_nvp("mip_count", obj.mip_count));
     try_load(ar, ser20::make_nvp("mip0_tint", obj.mip0_tint));
     try_load(ar, ser20::make_nvp("mip1_tint", obj.mip1_tint));
@@ -139,6 +164,7 @@ LOAD_INLINE(bloom_pass::settings)
     try_load(ar, ser20::make_nvp("mip4_tint", obj.mip4_tint));
     try_load(ar, ser20::make_nvp("mip5_tint", obj.mip5_tint));
     try_load(ar, ser20::make_nvp("dirt_intensity", obj.dirt_intensity));
+    try_load(ar, ser20::make_nvp("dirt_texture", obj.dirt_texture));
 }
 LOAD_INSTANTIATE(bloom_pass::settings, ser20::iarchive_associative_t);
 LOAD_INSTANTIATE(bloom_pass::settings, ser20::iarchive_binary_t);

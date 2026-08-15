@@ -18,6 +18,7 @@
 #include <engine/rendering/ecs/components/taa_component.h>
 #include <engine/rendering/ecs/components/tonemapping_component.h>
 #include <engine/rendering/ecs/components/ssr_component.h>
+#include <engine/rendering/ecs/components/gi_component.h>
 #include <engine/rendering/ecs/components/ssil_component.h>
 #include <engine/rendering/pipeline/volume_resolver.h>
 #include <engine/rendering/ecs/components/particle_emitter_component.h>
@@ -72,6 +73,12 @@ auto pipeline::init(rtti::context& ctx) -> bool
     ssr_pass_.init(ctx);
     hiz_pass_.init(ctx);
     ssil_pass_.init(ctx);
+    gi_clipmap_compose_pass_.init(ctx);
+    gi_light_voxel_pass_.init(ctx);
+    gi_world_probe_pass_.init(ctx);
+    gi_resolve_pass_.init(ctx);
+    gi_reflection_pass_.init(ctx);
+    sdf_debug_pass_.init(ctx);
 
     auto& am = ctx.get_cached<asset_manager>();
 
@@ -339,6 +346,17 @@ auto pipeline::create_run_params(entt::handle camera_ent) const -> rendering::pi
         };
     }
 
+    if(auto gi_comp = camera_ent.try_get<gi_component>(); gi_comp && gi_comp->enabled)
+    {
+        params.fill_gi_params = [camera_ent](gi_settings& gi)
+        {
+            if(auto gi_comp = camera_ent.try_get<gi_component>())
+            {
+                gi = gi_comp->settings;
+            }
+        };
+    }
+
     return params;
 }
 
@@ -351,7 +369,8 @@ auto pipeline::create_run_params(entt::handle camera_ent, scene* scn, const came
     }
     auto resolved = resolve_post_process_volumes(*scn, cam->get_position(), camera_ent);
     const bool has_any_volume = resolved.has_auto_exposure || resolved.has_bloom || resolved.has_tonemapping ||
-                                resolved.has_fxaa || resolved.has_taa || resolved.has_ssr || resolved.has_assao || resolved.has_ssil;
+                                resolved.has_fxaa || resolved.has_taa || resolved.has_ssr || resolved.has_assao || resolved.has_ssil ||
+                                resolved.has_gi;
     if(!has_any_volume)
     {
         return params;
@@ -405,6 +424,14 @@ auto pipeline::create_run_params(entt::handle camera_ent, scene* scn, const came
     {
         ssil_pass::ssil_settings s = resolved.ssil;
         params.fill_ssil_params = [s](ssil_pass::run_params& p) { p.settings = s; };
+    }
+    if(resolved.has_gi)
+    {
+        gi_settings s = resolved.gi;
+        params.fill_gi_params = [s](gi_settings& gi)
+        {
+            gi = s;
+        };
     }
     if(params.fill_taa_params)
     {

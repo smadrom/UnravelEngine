@@ -1,11 +1,45 @@
 #include "tonemapping_pass.h"
 #include <engine/assets/asset_manager.h>
 #include <engine/rendering/default_textures.h>
+#include <graphics/graphics.h>
 #include <graphics/render_pass.h>
 #include <graphics/texture.h>
+#include <math/math.h>
+#include <algorithm>
 
 namespace unravel
 {
+
+namespace
+{
+
+// CIE xy chromaticity to CAT02 LMS cone response (Y = 1).
+auto cie_xy_to_lms(float x, float y) -> math::vec3
+{
+    const float Y = 1.0f;
+    const float X = Y * x / y;
+    const float Z = Y * (1.0f - x - y) / y;
+    return {0.7328f * X + 0.4296f * Y - 0.1624f * Z,
+            -0.7036f * X + 1.6975f * Y + 0.0061f * Z,
+            0.0030f * X + 0.0136f * Y + 0.9834f * Z};
+}
+
+// Von Kries white balance: temperature/tint in [-1, 1] move the assumed white
+// point along the Planckian locus (and orthogonally for tint); the returned LMS
+// scale re-adapts to D65. Same construction as Unity's ColorBalanceToLMSCoeffs.
+auto compute_white_balance_lms(float temperature, float tint) -> math::vec3
+{
+    const float t1 = temperature * 10.0f / 6.0f;
+    const float t2 = tint * 10.0f / 6.0f;
+    const float x = 0.31271f - t1 * (t1 < 0.0f ? 0.1f : 0.05f);
+    const float standard_y = 2.87f * x - 3.0f * x * x - 0.27509507f;
+    const float y = standard_y + t2 * 0.05f;
+    const math::vec3 w1 = cie_xy_to_lms(0.31271f, 0.32902f); // D65
+    const math::vec3 w2 = cie_xy_to_lms(x, y);
+    return {w1.x / w2.x, w1.y / w2.y, w1.z / w2.z};
+}
+
+} // namespace
 
 auto tonemapping_pass::init(rtti::context& ctx) -> bool
 {
@@ -14,8 +48,8 @@ auto tonemapping_pass::init(rtti::context& ctx) -> bool
     auto vs_clip_quad_ex = am.get_asset<gfx::shader>("engine:/data/shaders/vs_clip_quad.sc");
     auto fs_atmospherics = am.get_asset<gfx::shader>("engine:/data/shaders/tonemapping/fs_tonemapping.sc");
 
-    tonemapping_program_.program = std::make_unique<gpu_program>(vs_clip_quad_ex, fs_atmospherics);
     tonemapping_program_.cache_uniforms();
+    tonemapping_program_.program = std::make_unique<gpu_program>(vs_clip_quad_ex, fs_atmospherics);
 
     return true;
 }
@@ -29,9 +63,6 @@ auto tonemapping_pass::create_or_update_output_fb(gfx::render_view& rview,
         return output;
     }
     auto input_sz = input->get_size();
-    // This is presumably your engine’s method to get the bgfx::TextureFormat.
-    // If your engine uses something else, adapt accordingly.
-
     auto& output_tex = rview.tex_get_or_emplace("TONEMAPPING_OUTPUT");
     if(gfx::needs_recreate(output_tex, input_sz))
     {
@@ -55,60 +86,6 @@ auto tonemapping_pass::create_or_update_output_fb(gfx::render_view& rview,
 
 auto tonemapping_pass::run(gfx::render_view& rview, const run_params& params) -> gfx::frame_buffer::ptr
 {
-    // {
-    //     {
-    //         // Calculate luminance.
-    //         setOffsets2x2Lum(u_offset, 128, 128);
-    //         bgfx::setTexture(0, s_texColor, m_fbtextures[0]);
-    //         bgfx::setState(BGFX_STATE_WRITE_RGB|BGFX_STATE_WRITE_A);
-    //         screenSpaceQuad(m_caps->originBottomLeft);
-    //         bgfx::submit(hdrLuminance, m_lumProgram);
-
-    //                // Downscale luminance 0.
-    //         setOffsets4x4Lum(u_offset, 128, 128);
-    //         bgfx::setTexture(0, s_texColor, bgfx::getTexture(m_lum[0]) );
-    //         bgfx::setState(BGFX_STATE_WRITE_RGB|BGFX_STATE_WRITE_A);
-    //         screenSpaceQuad(m_caps->originBottomLeft);
-    //         bgfx::submit(hdrLumScale0, m_lumAvgProgram);
-
-    //                // Downscale luminance 1.
-    //         setOffsets4x4Lum(u_offset, 64, 64);
-    //         bgfx::setTexture(0, s_texColor, bgfx::getTexture(m_lum[1]) );
-    //         bgfx::setState(BGFX_STATE_WRITE_RGB|BGFX_STATE_WRITE_A);
-    //         screenSpaceQuad(m_caps->originBottomLeft);
-    //         bgfx::submit(hdrLumScale1, m_lumAvgProgram);
-
-    //                // Downscale luminance 2.
-    //         setOffsets4x4Lum(u_offset, 16, 16);
-    //         bgfx::setTexture(0, s_texColor, bgfx::getTexture(m_lum[2]) );
-    //         bgfx::setState(BGFX_STATE_WRITE_RGB|BGFX_STATE_WRITE_A);
-    //         screenSpaceQuad(m_caps->originBottomLeft);
-    //         bgfx::submit(hdrLumScale2, m_lumAvgProgram);
-
-    //                // Downscale luminance 3.
-    //         setOffsets4x4Lum(u_offset, 4, 4);
-    //         bgfx::setTexture(0, s_texColor, bgfx::getTexture(m_lum[3]) );
-    //         bgfx::setState(BGFX_STATE_WRITE_RGB|BGFX_STATE_WRITE_A);
-    //         screenSpaceQuad(m_caps->originBottomLeft);
-    //         bgfx::submit(hdrLumScale3, m_lumAvgProgram);
-
-    //                // m_bright pass m_threshold is tonemap[3].
-    //         setOffsets4x4Lum(u_offset, m_width/2, m_height/2);
-    //         bgfx::setTexture(0, s_texColor, m_fbtextures[0]);
-    //         bgfx::setTexture(1, s_texLum, bgfx::getTexture(m_lum[4]) );
-    //         bgfx::setState(BGFX_STATE_WRITE_RGB|BGFX_STATE_WRITE_A);
-    //         bgfx::setUniform(u_tonemap, tonemap);
-    //         screenSpaceQuad(m_caps->originBottomLeft);
-    //         bgfx::submit(hdrBrightness, m_brightProgram);
-
-    //                // m_blur m_bright pass vertically.
-    //         bgfx::setTexture(0, s_texColor, bgfx::getTexture(m_bright) );
-    //         bgfx::setState(BGFX_STATE_WRITE_RGB|BGFX_STATE_WRITE_A);
-    //         bgfx::setUniform(u_tonemap, tonemap);
-    //         screenSpaceQuad(m_caps->originBottomLeft);
-    //         bgfx::submit(hdrVBlur, m_blurProgram);
-    //     }
-    // }
     const auto& input = params.input;
     auto output = create_or_update_output_fb(rview, params.input, params.output);
 
@@ -119,8 +96,44 @@ auto tonemapping_pass::run(gfx::render_view& rview, const run_params& params) ->
 
     tonemapping_program_.program->begin();
 
-    float tonemap[4] = {params.config.exposure, static_cast<float>(params.config.method), 0.0, 0.0f};
+    const bool apply_output_noise = !params.defer_output_noise;
+    float tonemap[4] = {params.config.exposure,
+                        static_cast<float>(params.config.method),
+                        (apply_output_noise && params.config.dithering) ? 1.0f : 0.0f,
+                        1.0f};
     gfx::set_uniform(tonemapping_program_.u_tonemapping, tonemap);
+
+    // z = grain amount (slider scaled so 0.1-0.3 is a filmic range and 1.0 is heavy
+    // stylized grain), w = animation seed. Deferred to FXAA when that pass follows.
+    const float grain_amount = apply_output_noise ? params.config.grain_intensity * 0.25f : 0.0f;
+    float grading[4] = {params.config.contrast,
+                        params.config.saturation,
+                        grain_amount,
+                        static_cast<float>(gfx::get_render_frame() % 1024u)};
+    gfx::set_uniform(tonemapping_program_.u_grading, grading);
+
+    const auto wb_lms = compute_white_balance_lms(params.config.temperature, params.config.tint);
+    float wb[4] = {wb_lms.x, wb_lms.y, wb_lms.z, 0.0f};
+    gfx::set_uniform(tonemapping_program_.u_wb_lms, wb);
+
+    float vignette[4] = {params.config.vignette_intensity, params.config.vignette_smoothness, 0.0f, 0.0f};
+    gfx::set_uniform(tonemapping_program_.u_vignette, vignette);
+
+    // Lift/gamma/gain map from their neutral-gray (0.5) authoring space:
+    // lift: +-0.15 additive at black; gain: 0..2x at white; gamma: per-channel
+    // exponent uploaded pre-inverted so the shader does a single pow.
+    const auto& lift_c = params.config.lift.value;
+    const auto& gamma_c = params.config.gamma.value;
+    const auto& gain_c = params.config.gain.value;
+    float lift[4] = {(lift_c.x - 0.5f) * 0.3f, (lift_c.y - 0.5f) * 0.3f, (lift_c.z - 0.5f) * 0.3f, 0.0f};
+    float gamma_inv[4] = {1.0f / std::max(gamma_c.x * 2.0f, 0.05f),
+                          1.0f / std::max(gamma_c.y * 2.0f, 0.05f),
+                          1.0f / std::max(gamma_c.z * 2.0f, 0.05f),
+                          0.0f};
+    float gain[4] = {gain_c.x * 2.0f, gain_c.y * 2.0f, gain_c.z * 2.0f, 0.0f};
+    gfx::set_uniform(tonemapping_program_.u_lift, lift);
+    gfx::set_uniform(tonemapping_program_.u_gamma_inv, gamma_inv);
+    gfx::set_uniform(tonemapping_program_.u_gain, gain);
 
     gfx::set_texture(tonemapping_program_.s_input, 0, input->get_texture());
     gfx::set_texture(tonemapping_program_.s_exposure, 1, params.exposure_texture ? params.exposure_texture : default_textures::get().white_texture());

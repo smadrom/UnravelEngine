@@ -20,6 +20,8 @@ namespace stl = tinystl;
 
 #include "bgfx_utils.h"
 
+#include "../graphics.h"
+
 #include <bimg/bimg.h>
 #include <bimg/decode.h>
 
@@ -221,6 +223,58 @@ static void imageReleaseCb(void* _ptr, void* _userData)
     bimg::imageFree(imageContainer);
 }
 
+// Containers written by the asset compiler (KTX2; also KTX and DX10-header DDS)
+// carry an sRGB transfer tag. Decoded source images (PNG/JPG/...) do not reliably
+// express intent, so their parse result is never trusted for this.
+static bool containerCarriesSrgbTag(const bimg::ImageContainer* imageContainer)
+{
+    return imageContainer->m_srgb &&
+           (imageContainer->m_parser == bimg::ImageParser::Ktx2 ||
+            imageContainer->m_parser == bimg::ImageParser::Ktx ||
+            imageContainer->m_parser == bimg::ImageParser::Dds);
+}
+
+static uint64_t applyContainerSrgbFlag(const bimg::ImageContainer* imageContainer, uint64_t _flags)
+{
+    if(!containerCarriesSrgbTag(imageContainer))
+    {
+        return _flags;
+    }
+
+    // Only sample through an sRGB view when this backend actually exposes one for
+    // the format and texture dimension; otherwise fall back to raw sampling rather
+    // than failing texture creation.
+    const bgfx::Caps* caps = bgfx::getCaps();
+    const uint32_t formatCaps = caps->formats[bgfx::TextureFormat::Enum(imageContainer->m_format)];
+    uint32_t srgbCap = BGFX_CAPS_FORMAT_TEXTURE_2D_SRGB;
+    if(imageContainer->m_cubeMap)
+    {
+        srgbCap = BGFX_CAPS_FORMAT_TEXTURE_CUBE_SRGB;
+    }
+    else if(1 < imageContainer->m_depth)
+    {
+        srgbCap = BGFX_CAPS_FORMAT_TEXTURE_3D_SRGB;
+    }
+
+    if(0 != (formatCaps & srgbCap))
+    {
+        return _flags | BGFX_TEXTURE_SRGB;
+    }
+
+    // The texture is tagged sRGB but this backend has no sRGB view for the
+    // format/dimension: it will sample GAMMA-ENCODED texels as if linear (whole
+    // scene lights too bright). There is no shader-side fallback decode, so at
+    // least make the cause diagnosable instead of failing silently.
+    gfx::log("warning",
+             std::string("sRGB-tagged texture sampled RAW: no sRGB view for format ") +
+                 bimg::getName(bimg::TextureFormat::Enum(imageContainer->m_format)) +
+                 " on this backend; colors from this texture will be too bright.",
+             __FILE__,
+             uint16_t(__LINE__));
+
+    return _flags;
+}
+
 static bgfx::TextureHandle loadTextureFromContainer(bimg::ImageContainer* imageContainer,
                                                     uint64_t _flags,
                                                     bgfx::TextureInfo* _info,
@@ -230,6 +284,8 @@ static bgfx::TextureHandle loadTextureFromContainer(bimg::ImageContainer* imageC
     {
         return BGFX_INVALID_HANDLE;
     }
+
+    _flags = applyContainerSrgbFlag(imageContainer, _flags);
 
     const bgfx::Memory* mem = bgfx::makeRef(
         imageContainer->m_data,

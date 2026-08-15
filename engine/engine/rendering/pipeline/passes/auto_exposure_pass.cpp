@@ -20,14 +20,21 @@ auto auto_exposure_pass::init(rtti::context& ctx) -> bool
         return false;
     }
 
-    histogram_program_.program = std::make_shared<gpu_program>(cs_histogram);
     histogram_program_.cache_uniforms();
+    histogram_program_.program = std::make_shared<gpu_program>(cs_histogram);
 
-    average_program_.program = std::make_shared<gpu_program>(cs_average);
     average_program_.cache_uniforms();
+    average_program_.program = std::make_shared<gpu_program>(cs_average);
 
+    // NOTE: the buffer's initial contents are undefined and CANNOT be seeded from the
+    // CPU -- bgfx forbids update() on COMPUTE_WRITE buffers (the same constraint the GI
+    // surface-list buffers document). The very first histogram dispatch therefore
+    // accumulates into garbage; run_average() discards that first measurement via
+    // histogram_bins_valid_ (the pass itself zeroes the bins after reading, so every
+    // later frame is clean).
     histogram_buffer_ = bgfx::createDynamicIndexBuffer(histogram_bins,
                                                        BGFX_BUFFER_COMPUTE_READ_WRITE | BGFX_BUFFER_INDEX32);
+    histogram_bins_valid_ = false;
 
     return histogram_program_.program->is_valid() &&
            average_program_.program->is_valid() &&
@@ -70,8 +77,8 @@ void auto_exposure_pass::ensure_resources(gfx::render_view& rview)
         // Seed the texel to 1.0 so any reader sampling AUTO_EXPOSURE before the very first
         // run_average() (e.g. tonemapping on frame 0) sees a sane multiplier instead of
         // whatever was in freshly-allocated storage. The AUTO_EXPOSURE_SNAP flag below
-        // makes run_average force-converge to the measured value on its first dispatch,
-        // so the seed only matters for that single-frame window.
+        // makes run_average force-converge to the measured value on its first dispatch
+        // with a clean histogram, so the seed only matters for that short window.
         const float             initial_exposure = 1.0f;
         const gfx::memory_view* initial_pixel    = gfx::copy(&initial_exposure, sizeof(initial_exposure));
         gfx::update_texture_2d(exposure_tex->native_handle(), 0, 0, 0, 0, 1, 1, initial_pixel);
@@ -141,12 +148,23 @@ void auto_exposure_pass::run_average(gfx::render_view& rview, const settings& co
     float params0[4] = {min_log_lum, log_range, config.low_percentile, config.high_percentile};
     gfx::set_uniform(average_program_.u_average_params0, params0);
 
-    float params1[4] = {config.min_ev, config.max_ev, config.compensation, 0.0f};
+    float params1[4] = {config.min_ev, config.max_ev, config.compensation, config.dark_adaptation};
     gfx::set_uniform(average_program_.u_average_params1, params1);
 
     float effective_dt = dt;
     auto& snap = rview.data_get_or_emplace("AUTO_EXPOSURE_SNAP", 0u);
-    if(snap != 0u)
+    if(!histogram_bins_valid_)
+    {
+        // First dispatch since the buffer was created: its initial contents are
+        // undefined and CANNOT be seeded from the CPU -- bgfx asserts on update()
+        // for COMPUTE_WRITE buffers (the GI surface-list buffers document the same
+        // constraint). This pass zeroes the bins after reading them, so every later
+        // frame is clean; discard this one measurement (dt = 0 holds the current
+        // exposure) and leave any pending snap for the next, clean dispatch.
+        histogram_bins_valid_ = true;
+        effective_dt = 0.0f;
+    }
+    else if(snap != 0u)
     {
         effective_dt = 100.0f;
         snap = 0u;

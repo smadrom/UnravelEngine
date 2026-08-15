@@ -15,6 +15,8 @@
 #include <engine/rendering/ecs/components/tonemapping_component.h>
 #include <engine/rendering/default_textures.h>
 #include <engine/engine.h>
+#include <engine/rendering/gi/surface_cache_system.h>
+#include <engine/rendering/gi/surface_cache_view.h>
 #include <engine/rendering/camera.h>
 #include <engine/rendering/material.h>
 #include <engine/rendering/mesh.h>
@@ -54,8 +56,17 @@ auto get_default_depth_format() -> gfx::texture_format
     return gfx::texture_format::D32F;
 }
 
-// Cubemap face captures keep HDR buffer setup from create_run_params, but write the
-// linear lighting result directly to the cubemap face before post-processing.
+// Returns whether the intermediate G/L/R buffers should be RGBA16F. Tonemapping
+// implies HDR, and probe captures force it explicitly (they strip the post stack
+// but still light in HDR for the cubemap).
+auto wants_hdr_buffers(const pipeline::run_params& params) -> bool
+{
+    return static_cast<bool>(params.fill_hdr_params) || params.force_hdr_buffers;
+}
+
+// Cubemap face captures strip post-processing and write the linear HDR lighting
+// result directly to the cubemap face. Clearing fill_hdr_params also used to drop
+// the G/L buffers to RGBA8 (LDR-clamped IBL); force_hdr_buffers keeps them float.
 void strip_post_effects_for_reflection_probe_capture(pipeline::run_params& params)
 {
     params.fill_assao_params = {};
@@ -66,6 +77,7 @@ void strip_post_effects_for_reflection_probe_capture(pipeline::run_params& param
     params.fill_ssr_params = {};
     params.fill_ssil_params = {};
     params.fill_hdr_params = {};
+    params.force_hdr_buffers = true;
 }
 
 void clear_reflection_probe_face(const gfx::frame_buffer::ptr& fbo)
@@ -150,7 +162,7 @@ auto create_or_resize_g_buffer(gfx::render_view& rview,
     auto& fbo = rview.fbo_get_or_emplace("GBUFFER");
     if(gfx::needs_recreate(fbo, viewport_size))
     {
-        auto format = params.fill_hdr_params ? get_default_hdr_format() : get_default_format();
+        auto format = wants_hdr_buffers(params) ? get_default_hdr_format() : get_default_format();
 
         auto tex0 = std::make_shared<gfx::texture>(viewport_size.width,
                                                    viewport_size.height,
@@ -197,7 +209,7 @@ auto create_or_resize_l_buffer(gfx::render_view& rview,
     auto& fbo = rview.fbo_get_or_emplace("LBUFFER");
     if(gfx::needs_recreate(fbo, viewport_size))
     {
-        auto format = params.fill_hdr_params ? get_default_hdr_format() : get_default_format();
+        auto format = wants_hdr_buffers(params) ? get_default_hdr_format() : get_default_format();
 
         auto tex = std::make_shared<gfx::texture>(viewport_size.width,
                                                   viewport_size.height,
@@ -232,7 +244,7 @@ auto create_or_resize_r_buffer(gfx::render_view& rview,
     auto& fbo = rview.fbo_get_or_emplace("RBUFFER");
     if(gfx::needs_recreate(fbo, viewport_size))
     {
-        auto format = params.fill_hdr_params ? get_default_hdr_format() : get_default_format();
+        auto format = wants_hdr_buffers(params) ? get_default_hdr_format() : get_default_format();
 
         auto tex = std::make_shared<gfx::texture>(viewport_size.width,
                                                   viewport_size.height,
@@ -386,9 +398,11 @@ void deferred::submit_pbr_material(geom_program& program, const pbr_material& ma
     const auto ao_tex = ao.get();
     const auto emissive_tex = emissive.get();
 
-    const auto& base_color = mat.get_base_color();
-    const auto& subsurface_color = mat.get_subsurface_color();
-    const auto& emissive_color = mat.get_emissive_color();
+    // Picker colors are authored sRGB-encoded; lighting math runs in linear, so
+    // decode at upload (textures get the same treatment via BGFX_TEXTURE_SRGB).
+    const auto base_color = mat.get_base_color().to_linear();
+    const auto subsurface_color = mat.get_subsurface_color().to_linear();
+    const auto emissive_color = mat.get_emissive_color().to_linear();
     const float emissive_intensity = mat.get_emissive_intensity();
     const auto& surface_data = mat.get_surface_data();
     const auto& tiling = mat.get_tiling();
@@ -683,6 +697,10 @@ void deferred::run_pipeline_impl(const gfx::frame_buffer::ptr& output,
         build_shadows(scn, camera, dt, visibility_query::not_specified, render_mask);
     }
 
+    // GI world-state preparation: surface-cache residency, clipmap compose, voxel
+    // lighting and world probes (details and gating rationale at the definition).
+    run_gi_scene_passes(scn, camera, rview, params);
+
     const auto& viewport_size = camera.get_viewport_size();
     create_or_resize_d_buffer(rview, viewport_size, params);
     create_or_resize_g_buffer(rview, viewport_size, params);
@@ -707,12 +725,30 @@ void deferred::run_pipeline_impl(const gfx::frame_buffer::ptr& output,
 
     const bool hiz_active = run_hiz_pass(camera, rview, params, viewport_size, dt);
 
-    // SSR samples the previous visible output before this frame overwrites it, so traced
-    // reflections use the same resolved scene color that was presented last frame.
-    run_ssr_pass(camera, rview, output, params);
+    // GI reflections layer UNDER SSR: the world-space specular tier draws over the authored
+    // probes in RBUFFER, then SSR composites the sharp on-screen result on top - screen space
+    // belongs to SSR alone. Runs after Hi-Z (positions reconstruct from the pyramid).
+    run_gi_reflection_pass(camera, rview, params);
+
+    // SSR samples last frame's PREV_SCENE_HDR snapshot (post-TAA, scene-referred linear).
+    // It must NOT sample the final OBUFFER: that image is tonemapped, sRGB-encoded and has
+    // UI composited on it -- display-referred values injected into linear lighting, which
+    // auto exposure then meters and re-amplifies (runaway brightening in dark scenes).
+    run_ssr_pass(camera, rview, params);
 
     // Direct lighting starts the current frame LBUFFER after SSR has consumed its history source.
     target = run_direct_lighting_pass(scn, camera, rview, build_shadowmaps, dt);
+
+    // Surface cache: register visible surfaces and light every resident entry. Runs after
+    // direct lighting so the light buffer for this frame is populated, and before the indirect
+    // pass, which is what will eventually consume the cache.
+    bool gi_resolve_active = false;
+    if(is_camera_run)
+    {
+        // Far-field fallback reads PREV_SCENE_HDR (last frame's post-TAA linear scene
+        // color) - the same history SSR consumed above.
+        gi_resolve_active = run_gi_resolve_pass(camera, rview, params);
+    }
 
     // SSIL pass
     run_ssil_pass(camera, rview, params);
@@ -742,6 +778,21 @@ void deferred::run_pipeline_impl(const gfx::frame_buffer::ptr& output,
 
     target = run_taa_pass(camera, rview, target, output, params);
 
+    // Scene-referred history for next frame's SSR trace and GI far-field. Taken after TAA
+    // (temporally stable) and before bloom/tonemap/UI (still linear HDR, no display encode,
+    // no interface pixels). Only kept while a consumer exists.
+    const bool wants_scene_history =
+        is_camera_run &&
+        ((reflection_screen_stack_enabled(params) && params.fill_ssr_params) || params.fill_gi_params);
+    if(wants_scene_history)
+    {
+        snapshot_prev_scene_color(rview, target);
+    }
+    else
+    {
+        rview.tex_remove("PREV_SCENE_HDR");
+    }
+
     run_auto_exposure_pass(rview, target, params, dt);
 
     target = run_bloom_pass(rview, target, params);
@@ -754,21 +805,72 @@ void deferred::run_pipeline_impl(const gfx::frame_buffer::ptr& output,
     {
         run_ui_pass(scn, camera, rview, output);
 
-        if(debug_pass_ >= 0)
+        if(debug_pass_ >= debug_pass_sdf_normals)
+        {
+            run_sdf_debug_pass(camera, rview, params, output);
+        }
+        else if(debug_pass_ >= 0)
         {
             run_debug_visualization_pass(camera, rview, output);
         }
     }
 
     // After all passes that sample PREV_DEPTH (must follow Hi-Z / SSIL path).
-    if(hiz_active)
+    //
+    // The GI resolve is a second, independent consumer: its temporal accumulation validates
+    // reprojected history against this depth, and treats a missing one as "no history" -- so
+    // leaving the snapshot gated purely on the Hi-Z stack made GI accumulation silently depend on
+    // an unrelated feature being enabled, and never converge when it was not.
+    // TAA is a third consumer: its disocclusion test compares the reprojected
+    // expected depth against this snapshot (a null snapshot degrades the test to a
+    // same-frame approximation on frame 0 only).
+    const bool taa_active = static_cast<bool>(params.fill_taa_params);
+    if(hiz_active || gi_resolve_active || taa_active)
     {
         snapshot_prev_depth(rview, viewport_size);
+    }
+    else
+    {
+        // Sole owner of this resource's lifetime, so it is released here rather than by whichever
+        // consumer happens to run first and notice it does not need it.
+        rview.tex_remove("PREV_DEPTH");
     }
 
     // Clear batch collector for this frame
     batch_collector_.clear();
 
+}
+
+void deferred::snapshot_prev_scene_color(gfx::render_view& rview, const gfx::frame_buffer::ptr& source)
+{
+    if(!source)
+    {
+        return;
+    }
+    auto src_tex = source->get_texture();
+    if(!src_tex)
+    {
+        return;
+    }
+    // Match the source format exactly: bgfx blit requires identical formats, and the
+    // source can be RGBA16F (HDR pipeline) or RGBA8 (LDR fallback).
+    const auto format = static_cast<gfx::texture_format>(src_tex->info.format);
+    const auto size = src_tex->get_size();
+    auto& prev = rview.tex_get_or_emplace("PREV_SCENE_HDR");
+    if(gfx::needs_recreate(prev, size, format))
+    {
+        prev.reset();
+        prev = std::make_shared<gfx::texture>(size.width,
+                                              size.height,
+                                              false,
+                                              1,
+                                              format,
+                                              BGFX_TEXTURE_BLIT_DST | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
+    }
+    gfx::render_pass blit_pass("History/Prev Scene Color Blit Pass");
+    gfx::blit(blit_pass.id,
+              prev->native_handle(), 0, 0,
+              src_tex->native_handle(), 0, 0);
 }
 
 void deferred::snapshot_prev_depth(gfx::render_view& rview, const usize32_t& viewport_size)
@@ -1119,7 +1221,7 @@ auto deferred::run_irradiance_pass(scene& scn, gfx::render_view& rview) -> defer
         {
             float intensity = 0.0f;
             float sun_weight = 1.0f;
-            float exposition = 0.1f;
+            float exposition = perez_luminance_to_engine;
             float sky_brightness = 1.0f;
             math::vec3 color = {1.0f, 1.0f, 1.0f};
             math::vec3 tint = {1.0f, 1.0f, 1.0f};
@@ -1145,6 +1247,7 @@ auto deferred::run_irradiance_pass(scene& scn, gfx::render_view& rview) -> defer
                 math::vec3 light_dir = world_transform.z_unit_axis();
                 math::vec3 irradiance_color = {1.0f, 1.0f, 1.0f};
                 bool use_perez = false;
+                irradiance_perez_params candidate_perez;
                 bool is_skybox = (skylight.get_mode() == skylight_component::sky_mode::skybox);
                 // Two independent axes:
                 //  - wants_sky: does the sky/environment color contribute, or is the ambient a flat tint?
@@ -1161,7 +1264,7 @@ auto deferred::run_irradiance_pass(scene& scn, gfx::render_view& rview) -> defer
                     float x = math::clamp(sun_elevation / 0.35f, 0.0f, 1.0f);
                     sun_weight = x * x * (3.0f - 2.0f * x);
                 }
-                float exposition = 0.1f;
+                float exposition = perez_luminance_to_engine;
 
                 if(!wants_sky)
                 {
@@ -1170,33 +1273,29 @@ auto deferred::run_irradiance_pass(scene& scn, gfx::render_view& rview) -> defer
                     sun_weight = 1.0f;
                     exposition = 1.0f;
                 }
-                else if(!is_skybox && directional)
-                {
-                    use_perez = true;
-                    compute_irradiance_perez_params(light_dir, skylight.get_turbidity(), dominant.perez);
-                    compute_perez_luminance(light_dir, dominant.perez.sky_luminance_rgb, dominant.perez.sun_luminance_rgb);
-                    irradiance_color = glm::mix(dominant.perez.sky_luminance_rgb, dominant.perez.sun_luminance_rgb, sun_weight);
-                    exposition = dominant.perez.exposition;
-                }
                 else if(!is_skybox)
                 {
-                    // Flat ambient but the sky still contributes: collapse the Perez sky to one color.
-                    // Perez integral (sky + circumsolar + sun disc) yields ~4-5x zenith luminance.
-                    // mix(sky, sun, sun_weight * 0.25) empirically matches the directional result at same intensity.
-                    math::vec3 sky_luminance_rgb;
-                    math::vec3 sun_luminance_rgb;
-                    compute_perez_luminance(light_dir, sky_luminance_rgb, sun_luminance_rgb);
-                    irradiance_color = glm::mix(sky_luminance_rgb, sun_luminance_rgb, sun_weight * 0.25f);
-                    float sun_altitude = -light_dir.y;
-                    float altitude_factor = bx::lerp(0.6f, 1.0f, bx::clamp(bx::abs(sun_altitude), 0.0f, 1.0f));
-                    exposition = 0.1f * altitude_factor;
+                    // Sky contributes: one full Perez projection either way. `directional` only
+                    // decides whether the SH bake keeps all bands (mode 1) or truncates to the
+                    // L0 average (mode 5) -- the flat ambient is the SAME integral by
+                    // construction. This replaced an empirical CPU-side collapse
+                    // (mix(sky, sun, sun_weight * 0.25), a hand-calibrated match) with math.
+                    // Computed into a candidate-local struct: writing into dominant.perez here
+                    // let any later-iterated skylight stomp the true dominant's Perez params.
+                    use_perez = true;
+                    compute_irradiance_perez_params(light_dir, skylight.get_turbidity(), candidate_perez);
+                    irradiance_color = glm::mix(candidate_perez.sky_luminance_rgb, candidate_perez.sun_luminance_rgb, sun_weight);
+                    // The shared Perez -> engine conversion (perez_luminance.h); the sky dome
+                    // pass uses this same value, so ambient and dome cannot drift apart.
+                    exposition = candidate_perez.exposition;
                 }
                 // skybox + wants_sky: irradiance_color stays white; the cubemap supplies the color in-shader.
 
                 float sky_brightness = skylight.get_sky_brightness();
                 exposition *= sky_brightness;
 
-                const auto& tint = skylight.get_irradiance_tint();
+                // Tint is a picker (sRGB) color; the Perez luminances it scales are linear.
+                const auto tint = skylight.get_irradiance_tint().to_linear();
                 math::vec3 tint_vec = {tint.value.r, tint.value.g, tint.value.b};
                 irradiance_color.x *= tint_vec.x;
                 irradiance_color.y *= tint_vec.y;
@@ -1209,6 +1308,7 @@ auto deferred::run_irradiance_pass(scene& scn, gfx::render_view& rview) -> defer
                     dominant.tint = tint_vec;
                     dominant.light_dir = light_dir;
                     dominant.use_perez = use_perez;
+                    dominant.perez = candidate_perez;
                     dominant.is_skybox = is_skybox;
                     dominant.use_sky = wants_sky;
                     dominant.directional = directional;
@@ -1243,14 +1343,16 @@ auto deferred::run_irradiance_pass(scene& scn, gfx::render_view& rview) -> defer
         const bool use_cubemap = dominant.is_skybox && dominant.use_sky && cubemap_tex && cubemap_tex->info.cubeMap;
 
         // Perez sky modes use physical luminance (exposition-scaled); cubemaps are typically
-        // pre-baked in display range. Boost intensity for sky-derived non-cubemap modes so shadow
-        // fill matches cubemap at the same user-facing intensity. The flat tint-only ambient is
-        // already in display range, so it gets no boost.
-        constexpr float ambient_intensity_boost = 2.0f;
+        // pre-baked in display range. The parity constant (perez_luminance.h) keeps the two
+        // source types comparable at the same user-facing intensity slider. The flat
+        // tint-only ambient is already in display range, so it gets no boost -- and that
+        // includes the skybox-without-cubemap fallback (use_sky set but the texture missing
+        // or still loading), which also renders the flat mode: gating on use_sky boosted
+        // that fallback 2x and made the ambient pop when the cubemap finished loading.
         if(use_cubemap)
             ambient_vec[3] *= dominant.sky_brightness;
-        else if(dominant.use_sky)
-            ambient_vec[3] *= ambient_intensity_boost;
+        else if(dominant.use_perez)
+            ambient_vec[3] *= sky_ambient_cubemap_parity;
 
         gfx::set_uniform(irradiance_compute_program_.u_irradiance_tint_intensity, ambient_vec);
 
@@ -1261,7 +1363,9 @@ auto deferred::run_irradiance_pass(scene& scn, gfx::render_view& rview) -> defer
 
         if(dominant.intensity > 0.0f && dominant.use_perez)
         {
-            mode = 1;
+            // mode 1 = full directional SH, mode 5 = flat (the SAME Perez integration
+            // truncated to L0), mirroring the cubemap pair below.
+            mode = dominant.directional ? 1 : 5;
             gfx::set_uniform(irradiance_compute_program_.u_sun_direction, dominant.perez.sun_direction);
             gfx::set_uniform(irradiance_compute_program_.u_sun_luminance, dominant.perez.sun_luminance_rgb);
             gfx::set_uniform(irradiance_compute_program_.u_sky_luminance_xyz, dominant.perez.sky_luminance_xyz);
@@ -1321,7 +1425,7 @@ auto deferred::run_irradiance_pass(scene& scn, gfx::render_view& rview) -> defer
                     irradiance_color = glm::mix(sky_luminance_rgb, sun_luminance_rgb, sun_weight);
                     irradiance_intensity *= sun_weight;
                 }
-                const auto& tint = skylight.get_irradiance_tint();
+                const auto tint = skylight.get_irradiance_tint().to_linear();
                 irradiance_color.x *= tint.value.r;
                 irradiance_color.y *= tint.value.g;
                 irradiance_color.z *= tint.value.b;
@@ -1440,9 +1544,11 @@ auto deferred::run_direct_lighting_pass(scene& scn,
 
             gfx::set_uniform(lprogram.u_contact_shadow, contact_shadow_uniform);
 
-            float light_color_intensity[4] = {light.color.value.r,
-                                              light.color.value.g,
-                                              light.color.value.b,
+            // Light colors are picker (sRGB) values; shading needs linear.
+            const auto light_color_linear = light.color.to_linear();
+            float light_color_intensity[4] = {light_color_linear.value.r,
+                                              light_color_linear.value.g,
+                                              light_color_linear.value.b,
                                               light.intensity};
 
             gfx::set_uniform(lprogram.u_light_color_intensity, light_color_intensity);
@@ -1516,11 +1622,21 @@ auto deferred::run_indirect_lighting_pass(scene& scn,
     i++;
     gfx::set_texture(iprogram.s_irradiance, 7, irradiance_result.irradiance_tex ? irradiance_result.irradiance_tex : default_textures::get().black_texture());
     
-    const auto& ssil_tex = rview.tex_safe_get("SSIL");
-    // Transparent (alpha 0) fallback when SSIL is disabled/absent so the shader's
+    // Surface cache GI and SSIL produce the SAME quantity in the same units -- a hemispherical
+    // indirect diffuse estimate plus the weight with which it replaces the environment probe --
+    // so they feed one consumer slot and only one of them is used. The cache wins when present:
+    // it sees geometry off screen and behind the camera, which SSIL cannot at any sample count.
+    auto indirect_diffuse_tex = rview.tex_safe_get("GI_RESOLVE");
+    if(!indirect_diffuse_tex)
+    {
+        indirect_diffuse_tex = rview.tex_safe_get("SSIL");
+    }
+    // Transparent (alpha 0) fallback when both are disabled/absent so the shader's
     // mix(irradiance, ssil.rgb, ssil.a) collapses to the pure SH probe. The opaque-black
     // default (alpha 1) would instead force mix() to 0 and wipe out the ambient.
-    gfx::set_texture(iprogram.s_ssil, 8, ssil_tex ? ssil_tex : default_textures::get().transparent_texture());
+    gfx::set_texture(iprogram.s_ssil,
+                     8,
+                     indirect_diffuse_tex ? indirect_diffuse_tex : default_textures::get().transparent_texture());
     
 
     auto topology = gfx::clip_quad(1.0f);
@@ -1771,7 +1887,6 @@ auto deferred::run_atmospherics_pass(gfx::frame_buffer::ptr input,
 
 void deferred::run_ssr_pass(const camera& camera,
                             gfx::render_view& rview,
-                            const gfx::frame_buffer::ptr& previous_frame_source,
                             const run_params& rparams)
 {
     if(!reflection_screen_stack_enabled(rparams) || !rparams.fill_ssr_params)
@@ -1785,8 +1900,12 @@ void deferred::run_ssr_pass(const camera& camera,
     ssr_params.output = rview.fbo_get("RBUFFER");
     ssr_params.g_buffer = rview.fbo_get("GBUFFER");
 
-    ssr_params.previous_frame =
-        previous_frame_source ? previous_frame_source->get_texture() : rview.fbo_get("LBUFFER")->get_texture();
+    // Last frame's post-TAA linear scene color. Before the first snapshot exists the
+    // fallback is BLACK, not LBUFFER: on frame 0 the LBUFFER was just created and has
+    // not been written yet (its first clear happens in the direct lighting pass, which
+    // runs AFTER SSR), so it would trace one frame of undefined GPU memory as radiance.
+    auto prev_scene = rview.tex_safe_get("PREV_SCENE_HDR");
+    ssr_params.previous_frame = prev_scene ? prev_scene : default_textures::get().black_texture();
 
     ssr_params.cam = &camera;
 
@@ -1888,6 +2007,9 @@ auto deferred::run_taa_pass(const camera& camera,
     p.output = nullptr;
     p.cam = &camera;
     p.g_buffer = gbuffer;
+    // Still the PREVIOUS frame's depth here (the snapshot happens at end of frame);
+    // used for disocclusion rejection. Null on the first frame.
+    p.prev_depth = rview.tex_safe_get("PREV_DEPTH");
     rparams.fill_taa_params(p);
     return taa_pass_.run(rview, p);
 }
@@ -1910,6 +2032,14 @@ auto deferred::run_fxaa_pass(gfx::render_view& rview,
     params.output = output;
 
     rparams.fill_fxaa_params(params);
+
+    if(rparams.fill_hdr_params)
+    {
+        tonemapping_pass::run_params hdr;
+        rparams.fill_hdr_params(hdr);
+        params.grain_intensity = hdr.config.grain_intensity;
+        params.dithering = hdr.config.dithering;
+    }
 
     return fxaa_pass_.run(rview, params);
 }
@@ -1967,10 +2097,12 @@ auto deferred::run_tonemapping_pass(gfx::render_view& rview,
     tonemapping_pass::run_params params;
     params.input = input;
 
-    if(!rparams.fill_fxaa_params || rparams.fill_taa_params)
+    const bool fxaa_follows = static_cast<bool>(rparams.fill_fxaa_params) && !rparams.fill_taa_params;
+    if(!fxaa_follows)
     {
         params.output = output;
     }
+    params.defer_output_noise = fxaa_follows;
 
     rparams.fill_hdr_params(params);
 
@@ -1980,6 +2112,304 @@ auto deferred::run_tonemapping_pass(gfx::render_view& rview,
     }
 
     return tonemapping_pass_.run(rview, params);
+}
+
+namespace
+{
+// The sun's CSM was rendered earlier this frame (build_shadows), so its cascade 0 can
+// answer sun visibility for the voxels it covers - the raster's own mesh-exact shadows,
+// which the traced field cannot reproduce through openings the bake fattened.
+// The index walks the SAME view in the SAME order the GPU light buffer was filled from
+// (surface_cache.update_world, this frame), so the shader can match the map to exactly
+// the light it was rendered for.
+void find_sun_shadowmap(scene& scn, gi_light_voxel_pass::run_params& light_params)
+{
+    int light_index = 0;
+    scn.registry->view<transform_component, light_component, active_component>().each(
+        [&](auto light_entity, auto&& light_transform, auto&& light_comp, auto&& active)
+        {
+            const auto& l = light_comp.get_light();
+            if(light_params.sun_light_index < 0 && l.type == light_type::directional && l.casts_shadows)
+            {
+                const auto& generator = light_comp.get_shadowmap_generator();
+                if(bgfx::isValid(generator.get_rt_texture(0)))
+                {
+                    light_params.sun_shadows = &generator;
+                    light_params.sun_light_index = light_index;
+                }
+            }
+            ++light_index;
+        });
+}
+} // namespace
+
+void deferred::run_gi_scene_passes(scene& scn, const camera& camera, gfx::render_view& rview, const run_params& params)
+{
+    // Surface cache residency is world state shared by every camera, so it is refreshed once
+    // per camera-driven frame and skipped entirely for reflection probe captures, which would
+    // otherwise rebuild the same instance list six more times per probe.
+    //
+    // Gated on GI actually being asked for. This is not a token early-out: the update rebuilds the
+    // instance list for every model in the scene, flushes atlas uploads and composes a cascade
+    // level, which measured 2.75 ms of CPU on Bistro. Paying that for a camera with no
+    // gi_component would make the feature cost most of its price while switched off.
+    //
+    // Also kept alive for the SDF debug views, which inspect this very state: requiring a
+    // gi_component before they show anything would mean the tooling for diagnosing GI is only
+    // available once GI already works.
+    const bool is_camera_run = params.run_type == pipeline_run_type::camera;
+    const bool wants_sdf_debug = debug_pass_ >= debug_pass_sdf_normals;
+    if(!is_camera_run || (!params.fill_gi_params && !wants_sdf_debug))
+    {
+        return;
+    }
+    auto& ctx = engine::context();
+    auto& surface_cache = ctx.get_cached<surface_cache_system>();
+    // World half: identical for every camera, so it self-limits to once per frame.
+    surface_cache.update_world(scn);
+    // Camera half: the cascade is snapped around THIS viewer, so it belongs to the render
+    // view. Two cameras sharing one cascade re-snapped it to each other's position every
+    // frame and it never settled.
+    auto& view_cache = rview.data().get_or_emplace<surface_cache_view>(surface_cache_view::view_key);
+    // Composing the voxels on the GPU is conditional on the compute program having loaded.
+    // Asked once here and threaded through, so the cascade and the dispatch cannot disagree
+    // about who owns the voxels -- if both believed they did, the dispatch would overwrite
+    // the CPU's work every frame; if neither did, the cascade would never be composed at all.
+    // Authored per volume, but GPU composition is additionally gated on the compute program
+    // having loaded: a scene that asks for it on a backend that cannot provide it must still
+    // compose, on the CPU, rather than leave the cascade permanently empty.
+    gi_settings gi;
+    resolve_gi_settings(params, gi);
+    auto clipmap_settings = gi.clipmap;
+    clipmap_settings.compose_on_gpu = clipmap_settings.compose_on_gpu && gi_clipmap_compose_pass_.is_valid();
+    view_cache.update(surface_cache.get_clipmap_instances(), camera.get_position(), clipmap_settings);
+    // Runs whenever the programs exist, not only when the GPU composes: the pass also
+    // seeds the compute-writable cell buffers and drains the texture-mean captures, and
+    // the CPU composer needs both. The dirty-mask handoff keeps the composers exclusive
+    // -- on the CPU path the upload above already consumed and cleared the dirty levels,
+    // so the pass finds nothing to compose and does only that upkeep.
+    if(gi_clipmap_compose_pass_.is_valid())
+    {
+        gi_clipmap_compose_pass::run_params compose_params;
+        compose_params.surface_cache = &surface_cache;
+        compose_params.view_cache = &view_cache;
+        gi_clipmap_compose_pass_.run(rview, compose_params);
+    }
+    // Light the surface voxels while the cascade and its attributes are current, then trace
+    // the world probes against them. Gated on GI actually being requested - the
+    // sdf-debug-only path keeps the cascade alive but has no lights to spend.
+    if(params.fill_gi_params)
+    {
+        run_gi_light_voxel_pass(scn, camera, rview, surface_cache, view_cache, gi);
+        run_gi_world_probe_pass(camera, rview, surface_cache, view_cache);
+        // One frame counter for both passes; each consumer keys its own rotation off it.
+        ++light_voxel_frame_;
+    }
+}
+
+void deferred::run_gi_light_voxel_pass(scene& scn,
+                                       const camera& camera,
+                                       gfx::render_view& rview,
+                                       surface_cache_system& surface_cache,
+                                       surface_cache_view& view_cache,
+                                       const gi_settings& gi)
+{
+    gi_light_voxel_pass::run_params light_params;
+    light_params.surface_cache = &surface_cache;
+    light_params.view_cache = &view_cache;
+    light_params.frame = light_voxel_frame_;
+    light_params.camera_position = camera.get_position();
+    light_params.probe_visibility_variance_gate = gi.resolve.probe_visibility_variance_gate;
+    // The sun-tier and vis-memo views are WRITER-side diagnostics: the compute
+    // pass stamps categorical colors into the light volume and the debug pass
+    // merely displays them.
+    light_params.sun_tier_debug = debug_pass_ == debug_pass_sdf_sun_tiers;
+    light_params.vis_memo_debug = debug_pass_ == debug_pass_sdf_vis_memo;
+    find_sun_shadowmap(scn, light_params);
+    gi_light_voxel_pass_.run(rview, light_params);
+}
+
+void deferred::run_gi_world_probe_pass(const camera& camera,
+                                       gfx::render_view& rview,
+                                       surface_cache_system& surface_cache,
+                                       surface_cache_view& view_cache)
+{
+    // World probes trace against the freshly lit voxels (GI v2 plan 3.3).
+    gi_world_probe_pass::run_params probe_params;
+    probe_params.surface_cache = &surface_cache;
+    probe_params.view_cache = &view_cache;
+    probe_params.camera_position = camera.get_position();
+    probe_params.irradiance_sh = rview.tex_safe_get("IRRADIANCE_SH");
+    probe_params.frame = light_voxel_frame_;
+    probe_params.light_hash = surface_cache.get_light_buffer().get_content_hash();
+    gi_world_probe_pass_.run(rview, probe_params);
+}
+
+void deferred::run_gi_reflection_pass(const camera& camera, gfx::render_view& rview, const run_params& params)
+{
+    if(params.run_type != pipeline_run_type::camera)
+    {
+        return;
+    }
+    gi_settings gi_reflection_settings;
+    if(!resolve_gi_settings(params, gi_reflection_settings) || !gi_reflection_settings.resolve.enable_reflections)
+    {
+        return;
+    }
+    gi_reflection_pass::run_params grp;
+    grp.g_buffer = rview.fbo_safe_get("GBUFFER");
+    grp.output = rview.fbo_safe_get("RBUFFER");
+    grp.hiz = rview.tex_safe_get("HIZBUFFER");
+    grp.irradiance_sh = rview.tex_safe_get("IRRADIANCE_SH");
+    // This pass runs before the frame's GI resolve, so the stored texture still holds
+    // LAST frame's denoised result - the rough-specular source (one frame of lag, the
+    // same convention as prev_color).
+    grp.gi_diffuse = rview.tex_safe_get("GI_RESOLVE");
+    grp.temporal_frames = gi_reflection_settings.resolve.reflection_temporal_frames;
+    grp.resolution = gi_reflection_settings.resolve.resolution;
+    grp.cam = &camera;
+    grp.surface_cache = &engine::context().get_cached<surface_cache_system>();
+    grp.view_cache = rview.data().try_get<surface_cache_view>(surface_cache_view::view_key);
+    gi_reflection_pass_.run(rview, grp);
+}
+
+auto deferred::resolve_gi_settings(const run_params& rparams, gi_settings& gi) -> bool
+{
+    // Off unless a gi_component asks for it, the same contract every other pass here follows. The
+    // settings left in `gi` are meaningless when this returns false.
+    if(!rparams.fill_gi_params)
+    {
+        return false;
+    }
+    rparams.fill_gi_params(gi);
+    return true;
+}
+
+auto deferred::run_gi_resolve_pass(const camera& camera,
+                                   gfx::render_view& rview,
+                                   const run_params& rparams) -> bool
+{
+    auto& ctx = engine::context();
+    gfx::texture::ptr result;
+    gi_settings gi;
+    const bool enabled = resolve_gi_settings(rparams, gi);
+    const auto& resolve_settings = gi.resolve;
+    if(enabled)
+    {
+        gi_resolve_pass::run_params params;
+        params.settings = resolve_settings;
+        params.g_buffer = rview.fbo_safe_get("GBUFFER");
+        // Still the PREVIOUS frame's depth at this point: the snapshot happens later in the
+        // frame, which is exactly what temporal reprojection needs to validate history.
+        params.prev_depth = rview.tex_safe_get("PREV_DEPTH");
+        // Last frame's environment SH (the irradiance pass runs later in the frame), for the
+        // ray-miss sky measurement -- same sourcing as the SSIL pass. Null on the first frame.
+        params.irradiance_sh = rview.tex_safe_get("IRRADIANCE_SH");
+        // This frame's Hi-Z pyramid (built earlier in the frame) for the screen-trace tier.
+        params.hiz = rview.tex_safe_get("HIZBUFFER");
+        // Last frame's post-TAA linear scene color for the far-field fallback; null
+        // (first frame, probe captures) degrades those hits to the sky SH.
+        params.prev_color = rview.tex_safe_get("PREV_SCENE_HDR");
+        params.cam = &camera;
+        params.surface_cache = &ctx.get_cached<surface_cache_system>();
+        params.view_cache = rview.data().try_get<surface_cache_view>(surface_cache_view::view_key);
+        result = gi_resolve_pass_.run(rview, params);
+    }
+    if(result)
+    {
+        // The accumulated result ping-pongs between two targets, so it is published under a
+        // stable name for the indirect consumer rather than being looked up by its own.
+        rview.tex_get_or_emplace("GI_RESOLVE") = result;
+    }
+    if(!result)
+    {
+        // The consumer picks GI_RESOLVE over SSIL purely by presence, so a buffer left behind
+        // from when the pass last ran would keep overriding SSIL with a frozen image -- and
+        // would look like GI that simply stopped updating rather than like a disabled feature.
+        rview.tex_remove("GI_RESOLVE");
+        rview.fbo_remove("GI_RESOLVE");
+    }
+    return result != nullptr;
+}
+
+void deferred::run_sdf_debug_pass(const camera& camera,
+                                  gfx::render_view& rview,
+                                  const run_params& rparams,
+                                  const gfx::frame_buffer::ptr& output)
+{
+    auto& ctx = engine::context();
+
+    auto& surface_cache = ctx.get_cached<surface_cache_system>();
+    sdf_debug_pass::run_params params;
+    params.output = output;
+    params.cam = &camera;
+    params.surface_cache = &surface_cache;
+    params.view_cache = rview.data().try_get<surface_cache_view>(surface_cache_view::view_key);
+    // The world-probe debug views must read the cages exactly as the lit path does, so the
+    // authored variance gate rides along; the constant default covers the no-gi_component
+    // case (these views stay usable while GI itself is off).
+    gi_settings gi;
+    if(resolve_gi_settings(rparams, gi))
+    {
+        params.settings.probe_visibility_variance_gate = gi.resolve.probe_visibility_variance_gate;
+    }
+    params.settings.mode = sdf_debug_pass::debug_mode::normals;
+    if(debug_pass_ == debug_pass_sdf_step_count)
+    {
+        params.settings.mode = sdf_debug_pass::debug_mode::step_count;
+    }
+    else if(debug_pass_ == debug_pass_sdf_headers)
+    {
+        params.settings.mode = sdf_debug_pass::debug_mode::headers;
+    }
+    else if(debug_pass_ == debug_pass_sdf_probe)
+    {
+        params.settings.mode = sdf_debug_pass::debug_mode::probe;
+    }
+    else if(debug_pass_ == debug_pass_sdf_entry)
+    {
+        params.settings.mode = sdf_debug_pass::debug_mode::entry;
+    }
+    else if(debug_pass_ == debug_pass_sdf_clipmap)
+    {
+        params.settings.mode = sdf_debug_pass::debug_mode::clipmap;
+    }
+    else if(debug_pass_ == debug_pass_sdf_direct)
+    {
+        params.settings.mode = sdf_debug_pass::debug_mode::direct;
+    }
+    else if(debug_pass_ == debug_pass_sdf_cascade_levels)
+    {
+        params.settings.mode = sdf_debug_pass::debug_mode::cascade_levels;
+    }
+    else if(debug_pass_ == debug_pass_sdf_attr_albedo)
+    {
+        params.settings.mode = sdf_debug_pass::debug_mode::attr_albedo;
+    }
+    else if(debug_pass_ == debug_pass_sdf_light_voxels)
+    {
+        params.settings.mode = sdf_debug_pass::debug_mode::light_voxels;
+    }
+    else if(debug_pass_ == debug_pass_sdf_world_probes)
+    {
+        params.settings.mode = sdf_debug_pass::debug_mode::world_probes;
+    }
+    else if(debug_pass_ == debug_pass_sdf_sun_tiers)
+    {
+        params.settings.mode = sdf_debug_pass::debug_mode::sun_tiers;
+    }
+    else if(debug_pass_ == debug_pass_sdf_probe_sky)
+    {
+        params.settings.mode = sdf_debug_pass::debug_mode::probe_sky;
+    }
+    else if(debug_pass_ == debug_pass_sdf_vis_memo)
+    {
+        // The vis-memo variant stamps its categorical colors into the light volume; the
+        // sun-tiers display mode is exactly the nearest-fetch categorical reader of that
+        // volume, so it shows them verbatim - no second display path needed.
+        params.settings.mode = sdf_debug_pass::debug_mode::sun_tiers;
+    }
+    sdf_debug_pass_.run(rview, params);
 }
 
 void deferred::run_debug_visualization_pass(const camera& camera,
@@ -2014,10 +2444,18 @@ void deferred::run_debug_visualization_pass(const camera& camera,
     ++i;
     gfx::set_texture(debug_visualization_program_.s_tex[i], i, irradiance_tex);
     ++i;
-    const auto& ssil_tex = rview.tex_safe_get("SSIL");
-    if(ssil_tex)
+    // Whichever buffer is actually feeding the indirect consumer, so this view shows what is
+    // being used rather than what used to be. Without this the surface cache result has no
+    // isolated view at all, and its noise cannot be told apart from noise arriving from the
+    // cache upstream of it.
+    auto indirect_diffuse_tex = rview.tex_safe_get("GI_RESOLVE");
+    if(!indirect_diffuse_tex)
     {
-        gfx::set_texture(debug_visualization_program_.s_tex[i], i, ssil_tex);
+        indirect_diffuse_tex = rview.tex_safe_get("SSIL");
+    }
+    if(indirect_diffuse_tex)
+    {
+        gfx::set_texture(debug_visualization_program_.s_tex[i], i, indirect_diffuse_tex);
     }
 
     irect32_t rect(0, 0, irect32_t::value_type(output_size.width), irect32_t::value_type(output_size.height));
@@ -2038,13 +2476,25 @@ auto deferred::run_hiz_pass(const camera& camera,
                               delta_t dt) -> bool
 {
     (void)dt;
+    // The GI gather's screen-trace tier marches this same pyramid, so GI being enabled is a
+    // producer condition of its own - without it the tier silently degrades to pure SDF
+    // tracing whenever the reflection stack happens to be off.
+    gi_settings gi_probe;
+    const bool gi_wants_hiz = params.run_type == pipeline_run_type::camera &&
+                              resolve_gi_settings(params, gi_probe) &&
+                              gi_probe.resolve.enable_screen_trace;
     const bool want_hiz =
-        reflection_screen_stack_enabled(params) && (params.fill_ssr_params || params.fill_ssil_params);
+        (reflection_screen_stack_enabled(params) && (params.fill_ssr_params || params.fill_ssil_params)) ||
+        gi_wants_hiz;
 
     if(!want_hiz)
     {
         rview.tex_remove("HIZBUFFER");
-        rview.tex_remove("PREV_DEPTH");
+        // PREV_DEPTH deliberately survives. It is a SHARED history resource with more than one
+        // consumer -- the GI resolve validates reprojected history against it -- and this pass
+        // runs before them, so dropping it here destroyed the next consumer's input before it
+        // ever ran. Its lifetime belongs to the one place that decides whether to produce it,
+        // at the end of the frame.
         return false;
     }
 
@@ -2089,35 +2539,52 @@ auto deferred::init(rtti::context& ctx) -> bool
         return std::make_unique<gpu_program>(vs_shader, fs_shadfer);
     };
 
-    geom_program_.program = load_program("deferred_geom/vs_deferred_geom", "deferred_geom/fs_deferred_geom");
     geom_program_.cache_uniforms();
+    geom_program_.program = load_program("deferred_geom/vs_deferred_geom", "deferred_geom/fs_deferred_geom");
 
-    geom_program_skinned_.program = load_program("deferred_geom/vs_deferred_geom_skinned", "deferred_geom/fs_deferred_geom");
     geom_program_skinned_.cache_uniforms();
+    geom_program_skinned_.program = load_program("deferred_geom/vs_deferred_geom_skinned", "deferred_geom/fs_deferred_geom");
 
-    geom_program_instanced_.program = load_program("deferred_geom/vs_deferred_geom_instanced", "deferred_geom/fs_deferred_geom");
     geom_program_instanced_.cache_uniforms();
+    geom_program_instanced_.program = load_program("deferred_geom/vs_deferred_geom_instanced", "deferred_geom/fs_deferred_geom");
 
-    sphere_ref_probe_program_.program = load_program("vs_clip_quad_ex", "reflection_probe/fs_sphere_reflection_probe");
     sphere_ref_probe_program_.cache_uniforms();
+    sphere_ref_probe_program_.program = load_program("vs_clip_quad_ex", "reflection_probe/fs_sphere_reflection_probe");
 
-    box_ref_probe_program_.program = load_program("vs_clip_quad_ex", "reflection_probe/fs_box_reflection_probe");
     box_ref_probe_program_.cache_uniforms();
+    box_ref_probe_program_.program = load_program("vs_clip_quad_ex", "reflection_probe/fs_box_reflection_probe");
 
-    indirect_lighting_program_.program = load_program("vs_clip_quad", "fs_deferred_indirect_light");
     indirect_lighting_program_.cache_uniforms();
+    indirect_lighting_program_.program = load_program("vs_clip_quad", "fs_deferred_indirect_light");
 
     auto cs_irradiance = am.get_asset<gfx::shader>("engine:/data/shaders/irradiance/cs_irradiance_sh.sc");
     if(cs_irradiance)
     {
-        irradiance_compute_program_.program = std::make_unique<gpu_program>(cs_irradiance);
         irradiance_compute_program_.cache_uniforms();
+        irradiance_compute_program_.program = std::make_unique<gpu_program>(cs_irradiance);
     }
 
-    debug_visualization_program_.program = load_program("vs_clip_quad", "gbuffer/fs_gbuffer_visualize");
     debug_visualization_program_.cache_uniforms();
+    debug_visualization_program_.program = load_program("vs_clip_quad", "gbuffer/fs_gbuffer_visualize");
 
     // Color lighting.
+
+    // Uniforms before programs (the cache_uniform order contract): every slot shares the
+    // same uniform set, so registering one of each array is enough for all of them.
+    for(auto& byLightType : color_lighting_no_shadow_)
+    {
+        byLightType.cache_uniforms();
+    }
+    for(auto& byLightType : color_lighting_)
+    {
+        for(auto& byDepthType : byLightType)
+        {
+            for(auto& bySmImpl : byDepthType)
+            {
+                bySmImpl.cache_uniforms();
+            }
+        }
+    }
 
     // clang-format off
     color_lighting_no_shadow_[uint8_t(light_type::spot)].program = load_program("vs_clip_quad", "fs_deferred_spot_light");
@@ -2159,27 +2626,6 @@ auto deferred::init(rtti::context& ctx) -> bool
     color_lighting_[uint8_t(light_type::directional)][uint8_t(sm_depth::linear)][uint8_t(sm_impl::vsm) ].program = load_program("vs_clip_quad", "fs_deferred_directional_light_vsm_linear");
     color_lighting_[uint8_t(light_type::directional)][uint8_t(sm_depth::linear)][uint8_t(sm_impl::esm) ].program = load_program("vs_clip_quad", "fs_deferred_directional_light_esm_linear");
     // clang-format on
-
-    for(auto& byLightType : color_lighting_no_shadow_)
-    {
-        if(byLightType.program)
-        {
-            byLightType.cache_uniforms();
-        }
-    }
-    for(auto& byLightType : color_lighting_)
-    {
-        for(auto& byDepthType : byLightType)
-        {
-            for(auto& bySmImpl : byDepthType)
-            {
-                if(bySmImpl.program)
-                {
-                    bySmImpl.cache_uniforms();
-                }
-            }
-        }
-    }
 
     ibl_brdf_lut_ = am.get_asset<gfx::texture>("engine:/data/textures/ibl_brdf_lut.png");
 

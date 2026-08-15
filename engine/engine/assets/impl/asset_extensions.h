@@ -197,7 +197,57 @@ inline auto get_format_version<unravel::mesh>() -> uint64_t
     // 8: per-submesh stable_id, per-bone bind-space bounds, per-LOD submesh bbox recompute.
     // 9: mesh bounds are bind-pose only (import-time animation sampling removed; runtime
     //    pose bounds handle animation-driven expansion).
-    return 10;
+    // 11: baked sparse signed distance field for GI tracing.
+    // 13: One SDF per SUBMESH instead of one per mesh. Submeshes are drawn at their own node
+    //     transforms, so a single whole-mesh field cannot be placed correctly for a model whose
+    //     submeshes differ -- it duplicated the entire model once per transform.
+    // 12: SDF adjacency computed on position-welded topology, open surfaces fall back to an
+    //     unsigned shell.
+    // 14: A submesh's SDF covers that submesh alone. It was selected by data group, which is the
+    //     MATERIAL index, so every submesh sharing a material baked that whole group -- each one
+    //     carrying its siblings' geometry at its own transform.
+    // 15: fields are bounded by a TOTAL voxel budget, not only by a per-axis resolution cap. The
+    //     per-axis cap alone permitted 16.7M voxels in one field, so a model split into many
+    //     submeshes overran the atlas several times over and the bake cost hours of voxel work.
+    // 16: fields bake from LOD 2 by default rather than the base topology. A DEFAULT counts as a
+    //     bake-algorithm change for every asset that never overrode it -- their .meta files carry
+    //     no value to compare, so nothing else would notice the switch and they would keep the
+    //     field baked from full detail.
+    // 17: unsigned SHELL fields classify bricks in the field's own space. The stored voxels are
+    //     `unsigned - thickness`, but brick classification and the empty-brick distance used the
+    //     raw unsigned value, so every empty entry over-reported by exactly the thickness -- an
+    //     over-estimate, which is the one direction a conservative field may never err in, and a
+    //     trace stepped that far too much and passed through the shell. It also stops the interior
+    //     of a thick shell being stored as surface bricks, so a scene of open meshes uses far less
+    //     atlas.
+    // 18: triangles carrying no surface -- zero-area slivers and non-finite positions -- no longer
+    //     reach the bake or the bounds. The renderer discards them, so such a submesh looks empty in
+    //     the viewport, but their corners still sized the field: measured extents of 7,000 to 10,000
+    //     units on a scene whose buildings are tens across, giving voxels of 40+ units. Since an
+    //     unsigned shell is floored at one voxel, those fields traced as solid blocks swallowing
+    //     whole streets, sourced from geometry nobody could see.
+    // 19: a submesh whose geometry is scattered over more than 32x its largest connected piece is
+    //     REFUSED a field rather than given an unusable one. The voxel comes from the bounds, so
+    //     parts spread far apart each fall below one voxel and what the bake produced was a blob the
+    //     size of the spread, tracing as solid geometry that is not there. Refusing costs the GI
+    //     contribution of parts too small to have contributed usefully; the field cost a
+    //     neighbourhood. The sliver threshold also moved from 1e-6 to 1e-3 in the same pass.
+    // 20: the closedness test now requires every welded edge to be shared by EXACTLY two faces,
+    //     and triangles whose corners weld together no longer contribute topology. Double-sided
+    //     sheet geometry (the engine's own plane primitive is two coincident, oppositely wound
+    //     sheets) previously counted as closed, its cancelling pseudonormals made every voxel's
+    //     sign floating-point noise, and the field baked as random brick-quantised walls and
+    //     stairs. Such geometry now takes the unsigned-shell path. UV-sphere pole slivers also
+    //     stop poisoning the pole pseudonormals.
+    // 21: skinned submeshes are refused a field. The bake reads bind-pose vertices and skinning
+    //     rewrites the surface every frame, so the field could only ever occlude as a rigid
+    //     bind-pose statue pinned to the entity's root transform. The runtime walk also refuses
+    //     stale fields, so this bump is what reclaims the disk and atlas space they held.
+    //
+    // NOTE: the compiled asset is a function of the BAKE ALGORITHM, not only of the source
+    // mesh. Any change to mesh_sdf_baker that alters its output needs a bump here, or existing
+    // projects silently keep the field produced by the previous code.
+    return 21;
 }
 
 template<>

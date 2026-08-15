@@ -249,6 +249,20 @@ void game_panel::draw_menubar(rtti::context& ctx)
             ImGui::RadioButton("Subsurface Color", &visualize_passes_, 10);
             ImGui::RadioButton("Depth", &visualize_passes_, 11);
             ImGui::RadioButton("SSIL", &visualize_passes_, 12);
+            ImGui::RadioButton("SDF (Normals)", &visualize_passes_, 15);
+            ImGui::RadioButton("SDF (Step Count)", &visualize_passes_, 16);
+            ImGui::RadioButton("SDF (Headers)", &visualize_passes_, 17);
+            ImGui::RadioButton("SDF (Probe)", &visualize_passes_, 18);
+            ImGui::RadioButton("SDF (Entry)", &visualize_passes_, 19);
+            ImGui::RadioButton("SDF (Clipmap)", &visualize_passes_, 20);
+            ImGui::RadioButton("SDF (Direct Light)", &visualize_passes_, 21);
+            ImGui::RadioButton("SDF (Cascade Levels)", &visualize_passes_, 22);
+            ImGui::RadioButton("SDF (Attr Albedo)", &visualize_passes_, 23);
+            ImGui::RadioButton("SDF (Light Voxels)", &visualize_passes_, 24);
+            ImGui::RadioButton("SDF (World Probes)", &visualize_passes_, 25);
+            ImGui::RadioButton("SDF (Sun Tiers)", &visualize_passes_, 26);
+            ImGui::RadioButton("SDF (Probe Sky)", &visualize_passes_, 27);
+            ImGui::RadioButton("SDF (Vis Memo)", &visualize_passes_, 28);
             ImGui::EndMenu();
         }
         ImGui::SetItemTooltipEx("%s", "Visualize Render Passes");

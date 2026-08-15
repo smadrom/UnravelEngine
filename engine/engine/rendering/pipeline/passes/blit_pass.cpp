@@ -19,8 +19,8 @@ auto blit_pass::init(rtti::context& ctx) -> bool
     auto fs_blit = am.get_asset<gfx::shader>("engine:/data/shaders/fs_blit.sc");
 
     // 3) Create our GPU program
-    blit_program_.program = std::make_unique<gpu_program>(vs_fullscreen, fs_blit);
     blit_program_.cache_uniforms();
+    blit_program_.program = std::make_unique<gpu_program>(vs_fullscreen, fs_blit);
 
     return true;
 }
@@ -82,7 +82,12 @@ auto blit_pass::run(gfx::render_view& rview, const run_params& params) -> gfx::f
     auto topology = gfx::clip_quad(1.0f);
 
     // 6) Configure render state: write RGB + A, no depth, no blending.
-    gfx::set_state(topology | BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A);
+    uint64_t state = topology | BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A;
+    if(params.alpha_blend)
+    {
+        state |= BGFX_STATE_BLEND_ALPHA;
+    }
+    gfx::set_state(state);
 
     // 7) Submit to the current view (render_pass::bind will have set the view ID)
     gfx::submit(pass.id, blit_program_.program->native_handle());

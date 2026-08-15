@@ -518,7 +518,9 @@ void update_particle_basic(particle_soa& particles,
                            const emitter_sim_constants& constants)
 {
     const float life = particles.life[index];
-    math::color sampled_color = desc.appearance.color_gradient.sample(life);
+    // Gradient keys are picker (sRGB) colors; particles render into the LINEAR HDR
+    // scene buffer, so decode before the HDR intensity multiplies linear radiance.
+    math::color sampled_color = desc.appearance.color_gradient.sample(life).to_linear();
     sampled_color.value.a *= constants.opacity;
     sampled_color.value.r *= constants.color_intensity;
     sampled_color.value.g *= constants.color_intensity;
@@ -555,14 +557,16 @@ void update_particle_full(particle_soa& particles,
                                                   tt_pos);
         particles.cached_speed[index] = particle_speed;
     }
-    math::color sampled_color = desc.appearance.color_gradient.sample(life);
+    // Gradient keys are picker (sRGB) colors; decode to linear before combining
+    // (matches the GPU path, whose LUTs are linearized at bake).
+    math::color sampled_color = desc.appearance.color_gradient.sample(life).to_linear();
     if(has_feature(constants.features, emitter_feature::color_by_speed))
     {
         const float speed_factor = math::clamp(
             (particle_speed - constants.color_by_speed_velocity_range.min) * constants.inv_color_by_speed_velocity_span,
             0.0f,
             1.0f);
-        const math::color speed_color = desc.appearance.color_by_speed_gradient.sample(speed_factor);
+        const math::color speed_color = desc.appearance.color_by_speed_gradient.sample(speed_factor).to_linear();
         sampled_color.value *= speed_color.value;
     }
     sampled_color.value.a *= constants.opacity;
@@ -757,7 +761,9 @@ struct emitter
         for(uint32_t i = 0; i < k_gpu_lut_size; ++i)
         {
             const float t = float(i) / float(k_gpu_lut_size - 1);
-            const math::color c = gradient.sample(t);
+            // Decode picker (sRGB) gradient samples to linear at bake time, so the
+            // GPU sim consumes linear radiance (mirrors to_linear() in the CPU path).
+            const math::color c = gradient.sample(t).to_linear();
             out_lut[i] = math::vec4(c.value.r, c.value.g, c.value.b, c.value.a);
         }
     }
@@ -1664,6 +1670,20 @@ struct particle_system_soa
             g_gpu_sim_available = false;
             return;
         }
+        // Uniforms before programs: the GL renderer wires program uniforms from the registry
+        // at link time (GLSL >= 400 blobs carry no reflection), so these must exist before
+        // any program below is created. See uniforms_cache::cache_uniform for the contract.
+        g_u_pack0 = bgfx::createUniform("u_pack0", bgfx::UniformType::Vec4);
+        g_u_pack1 = bgfx::createUniform("u_pack1", bgfx::UniformType::Vec4);
+        g_u_pack2 = bgfx::createUniform("u_pack2", bgfx::UniformType::Vec4);
+        g_u_pack3 = bgfx::createUniform("u_pack3", bgfx::UniformType::Vec4);
+        g_u_pack4 = bgfx::createUniform("u_pack4", bgfx::UniformType::Vec4);
+        g_u_pack5 = bgfx::createUniform("u_pack5", bgfx::UniformType::Vec4);
+        g_u_local_to_world = bgfx::createUniform("u_localToWorld", bgfx::UniformType::Mat4);
+        g_u_emitter_quat = bgfx::createUniform("u_emitterQuat", bgfx::UniformType::Vec4);
+        g_u_spawn0 = bgfx::createUniform("u_spawn0", bgfx::UniformType::Vec4);
+        g_u_sort0 = bgfx::createUniform("u_sort0", bgfx::UniformType::Vec4);
+        g_u_sort1 = bgfx::createUniform("u_sort1", bgfx::UniformType::Vec4);
         g_compact_pack_program = std::make_shared<gpu_program>(cs_compact);
         if(!g_compact_pack_program || !g_compact_pack_program->is_valid())
         {
@@ -1706,17 +1726,6 @@ struct particle_system_soa
             g_sort_gather_program.reset();
             APPLOG_WARNING("Particles: GPU depth-sort program set incomplete; Normal blend unsorted on GPU path");
         }
-        g_u_pack0 = bgfx::createUniform("u_pack0", bgfx::UniformType::Vec4);
-        g_u_pack1 = bgfx::createUniform("u_pack1", bgfx::UniformType::Vec4);
-        g_u_pack2 = bgfx::createUniform("u_pack2", bgfx::UniformType::Vec4);
-        g_u_pack3 = bgfx::createUniform("u_pack3", bgfx::UniformType::Vec4);
-        g_u_pack4 = bgfx::createUniform("u_pack4", bgfx::UniformType::Vec4);
-        g_u_pack5 = bgfx::createUniform("u_pack5", bgfx::UniformType::Vec4);
-        g_u_local_to_world = bgfx::createUniform("u_localToWorld", bgfx::UniformType::Mat4);
-        g_u_emitter_quat = bgfx::createUniform("u_emitterQuat", bgfx::UniformType::Vec4);
-        g_u_spawn0 = bgfx::createUniform("u_spawn0", bgfx::UniformType::Vec4);
-        g_u_sort0 = bgfx::createUniform("u_sort0", bgfx::UniformType::Vec4);
-        g_u_sort1 = bgfx::createUniform("u_sort1", bgfx::UniformType::Vec4);
         ensure_gpu_layouts();
         g_gpu_sim_available = true;
         APPLOG_INFO("Particles: GPU resident sim available (per-emitter Simulation Backend)");

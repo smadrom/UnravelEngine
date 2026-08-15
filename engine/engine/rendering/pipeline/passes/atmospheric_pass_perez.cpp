@@ -216,11 +216,11 @@ auto atmospheric_pass_perez::init(rtti::context& ctx) -> bool
     auto fs_sky = am.get_asset<gfx::shader>("engine:/data/shaders/atmospherics/fs_sky.sc");
     auto fs_cloud = am.get_asset<gfx::shader>("engine:/data/shaders/atmospherics/fs_cloud.sc");
 
-    atmospheric_program_.program = std::make_unique<gpu_program>(vs_sky, fs_sky);
     atmospheric_program_.cache_uniforms();
+    atmospheric_program_.program = std::make_unique<gpu_program>(vs_sky, fs_sky);
 
-    cloud_program_.program = std::make_unique<gpu_program>(vs_sky, fs_cloud);
     cloud_program_.cache_uniforms();
+    cloud_program_.program = std::make_unique<gpu_program>(vs_sky, fs_cloud);
 
     int vertical_count = 32;
     int horizontal_count = 32;
@@ -445,6 +445,13 @@ void atmospheric_pass_perez::run(gfx::frame_buffer::ptr input,
     gfx::discard();
 }
 
+auto compute_perez_exposition(float sun_altitude) -> float
+{
+    const float altitude_factor =
+        bx::lerp(perez_horizon_dim, 1.0f, bx::clamp(bx::abs(sun_altitude), 0.0f, 1.0f));
+    return perez_luminance_to_engine * altitude_factor;
+}
+
 void compute_perez_luminance(const math::vec3& light_direction,
                              math::vec3& out_sky_luminance_rgb,
                              math::vec3& out_sun_luminance_rgb)
@@ -482,10 +489,10 @@ void compute_irradiance_perez_params(const math::vec3& light_direction,
 
     out.sun_direction = sun_dir;
 
-    float sun_altitude = sun_dir.y;
-    // At zenith use 1.0, at horizon use 0.6 (was 0.35) for more vibrant sunsets
-    float altitude_factor = bx::lerp(0.6f, 1.0f, bx::clamp(bx::abs(sun_altitude), 0.0f, 1.0f));
-    out.exposition = 0.1f * altitude_factor;
+    // The one shared Perez -> engine conversion (see perez_luminance.h): the sky dome,
+    // the irradiance bake and the flat ambient all inherit this value, so their ratios
+    // cannot drift apart.
+    out.exposition = compute_perez_exposition(sun_dir.y);
 
     ANONYMOUS::compute_perez_coeff(turbidity, &out.perez_coeff[0][0]);
 }
