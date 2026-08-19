@@ -979,11 +979,13 @@ auto pw_session_controller::connect(pw_session_connect_params params) -> bool
     std::lock_guard<std::mutex> lock(implementation_->mutex);
     if(!implementation_->worker_running)
     {
+        params.clear_secrets();
         return false;
     }
     if(implementation_->snapshot.state != pw_session_state::idle &&
        implementation_->snapshot.state != pw_session_state::error)
     {
+        params.clear_secrets();
         return false;
     }
     implementation_->connect_deadline_ms = params.connect_deadline_ms;

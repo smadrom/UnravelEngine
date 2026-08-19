@@ -9,10 +9,10 @@ transcript, and sweeps for credential leaks.
 Configuration is environment-only (no secrets in this file or in the report):
   PW_ACCOUNT / PW_PASSWORD      - test account credentials (required)
   PW_SERVER                     - host:port of the test server (required)
-  PW_RUNTIME_CLIENT_EXE         - headless client exe (default: pw152_source x64 bin)
+  PW_RUNTIME_CLIENT_EXE         - headless client exe (required)
   PW_RUNTIME_WORKING_DIRECTORY  - element root matching the server data (required)
   UNRAVEL_EDITOR_EXE            - default build/bin/RelWithDebInfo/UnravelEditor.exe
-  UNRAVEL_PW_PROJECT            - default C:/Temp/UnravelPW
+  UNRAVEL_PW_PROJECT            - Unravel project containing PW content (required)
   UNRAVEL_MCP_PORT              - default 17890
   PW_ACCEPTANCE_OUT             - output dir for transcript/screenshots/SUMMARY
   PW_ACCEPTANCE_ACCOUNT_EMPTY   - account expected to have zero roles (empty-roles run)
@@ -34,14 +34,12 @@ REPO_ROOT = os.path.abspath(os.path.join(TESTS_DIR, "..", "..", ".."))
 
 EDITOR_EXE = os.environ.get(
     "UNRAVEL_EDITOR_EXE", os.path.join(REPO_ROOT, "build", "bin", "RelWithDebInfo", "UnravelEditor.exe"))
-PROJECT_DIR = os.environ.get("UNRAVEL_PW_PROJECT", r"C:\Temp\UnravelPW")
+PROJECT_DIR = os.environ.get("UNRAVEL_PW_PROJECT", "")
 MCP_PORT = int(os.environ.get("UNRAVEL_MCP_PORT", "17890"))
 OUT_DIR = os.environ.get(
     "PW_ACCEPTANCE_OUT",
     os.path.join(REPO_ROOT, "artifacts", "pw-acceptance-" + datetime.date.today().isoformat()))
-CLIENT_EXE = os.environ.get(
-    "PW_RUNTIME_CLIENT_EXE",
-    r"C:\Users\pc\Documents\Work\pw152_source\client_side\x64\bin\PWHeadlessMCPClient.exe")
+CLIENT_EXE = os.environ.get("PW_RUNTIME_CLIENT_EXE", "")
 
 SECRET_VALUES = []  # filled from env; swept out of every artifact
 
@@ -405,13 +403,19 @@ def run_world(mcp):
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "all"
     if mode != "preview-offline":
-        for required in ("PW_ACCOUNT", "PW_PASSWORD", "PW_SERVER", "PW_RUNTIME_WORKING_DIRECTORY"):
+        for required in ("PW_ACCOUNT", "PW_PASSWORD", "PW_SERVER",
+                         "PW_RUNTIME_CLIENT_EXE", "PW_RUNTIME_WORKING_DIRECTORY",
+                         "UNRAVEL_PW_PROJECT"):
             if not os.environ.get(required):
                 print("missing env: {}".format(required))
                 return 1
         SECRET_VALUES.append(os.environ["PW_PASSWORD"])
     else:
         # Offline fake-sidecar run: no live server, dummy non-secret credentials.
+        for required in ("UNRAVEL_PW_PROJECT",):
+            if not os.environ.get(required):
+                print("missing env: {}".format(required))
+                return 1
         os.environ.setdefault("PW_SERVER", "fake.local:29000")
     os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -433,7 +437,8 @@ def main():
                 return
         # A hard-terminated editor leaves its headless client orphaned and still
         # logged in; a same-account relogin then races the stale server session.
-        subprocess.run(["taskkill", "/IM", os.path.basename(CLIENT_EXE), "/F"],
+        effective_client_exe = client_exe or CLIENT_EXE
+        subprocess.run(["taskkill", "/IM", os.path.basename(effective_client_exe), "/F"],
                        capture_output=True)
         proc = launch_editor(account, password, client_exe, workdir)
         try:
