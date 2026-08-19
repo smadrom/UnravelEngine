@@ -209,6 +209,10 @@ add_custom_target(editor_data
                   VERBATIM
 )
 
+# Editor and player executables require the copied data next to them at runtime.
+add_dependencies(editor engine_data editor_data)
+add_dependencies(game engine_data editor_data)
+
 
 
 if(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
