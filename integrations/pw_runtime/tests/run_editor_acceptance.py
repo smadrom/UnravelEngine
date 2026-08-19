@@ -175,9 +175,9 @@ def wait_map_load(mcp, slug, timeout_s):
     raise RuntimeError("map {} load timed out; last={}".format(slug, last))
 
 
-def screenshot(mcp, name):
+def screenshot(mcp, name, ui=True):
     path = os.path.join(OUT_DIR, name)
-    mcp.call_result("screenshot", {"path": path, "w": 1600, "h": 900, "ui": True})
+    mcp.call_result("screenshot", {"path": path, "w": 1600, "h": 900, "ui": ui})
     deadline = time.time() + 60
     while time.time() < deadline:
         status = mcp.call_result("screenshot_status")
@@ -554,13 +554,16 @@ def run_worldmap_offline(mcp):
         "target": [focus["x"], focus["y"], focus["z"]],
     })
     time.sleep(2)
-    screenshot(mcp, "worldmap-offline-01-spawn.png")
+    # ui=False: the active PW login document's screen-space composite currently
+    # blacks out the whole frame (post-merge regression); worldmap evidence is
+    # the world itself, not the login overlay.
+    screenshot(mcp, "worldmap-offline-01-spawn.png", ui=False)
     mcp.call_result("camera_set", {
         "pos": [211.0, 420.0, -200.0],
         "target": [211.0, 40.0, 200.0],
     })
     time.sleep(2)
-    screenshot(mcp, "worldmap-offline-02-overview.png")
+    screenshot(mcp, "worldmap-offline-02-overview.png", ui=False)
     return {
         "map": status.get("map"),
         "manifest": manifest,
@@ -654,7 +657,7 @@ def run_worldmap(mcp):
     if not status.get("terrain"):
         raise RuntimeError("instance map load completed without terrain")
 
-    mcp.call_result("pw_session_world_action", {"action": "stop"})
+    mcp.call_result("pw_session_world_action", {"action": "stop_move"})
     time.sleep(2)
     world = wait_world_self(mcp, role_id, WORLD_MAP_INSTANCE_ID, 60)
     self0 = world["self"]["position"]
@@ -662,7 +665,7 @@ def run_worldmap(mcp):
         raise RuntimeError("world self position is incomplete: {}".format(self0))
     sample0 = probe_terrain_position(mcp, self0, "world self")
     time.sleep(3)
-    screenshot(mcp, "worldmap-01-in-world.png")
+    screenshot(mcp, "worldmap-01-in-world.png", ui=False)
 
     direction = world["self"].get("direction", {})
     direction_x = direction.get("x", 0.0)
@@ -685,7 +688,7 @@ def run_worldmap(mcp):
     pos1 = world2["self"]["position"]
     sample1 = probe_terrain_position(mcp, pos1, "moved world self")
     time.sleep(2)
-    screenshot(mcp, "worldmap-02-moved.png")
+    screenshot(mcp, "worldmap-02-moved.png", ui=False)
 
     mcp.call_result("pw_session_disconnect")
     wait_session_state(mcp, "idle", 30)
@@ -776,10 +779,10 @@ def main():
                 proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 proc.kill()
-            if client_exe:
-                # The overridden child (e.g. the fake sidecar) outlives a
+            if effective_client_exe:
+                # The client (overridden sidecar or real) outlives a
                 # hard-terminated editor just like the real client does.
-                subprocess.run(["taskkill", "/IM", os.path.basename(client_exe), "/F"],
+                subprocess.run(["taskkill", "/IM", os.path.basename(effective_client_exe), "/F"],
                                capture_output=True)
             # Wait until the control port is really closed before the next run.
             deadline = time.time() + 30
