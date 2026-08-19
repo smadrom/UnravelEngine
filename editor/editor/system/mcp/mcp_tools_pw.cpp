@@ -153,20 +153,20 @@ void register_pw_tools(mcp_tool_registry& registry)
 {
     registry.add(make_pw_tool(
         "pw_login_load",
-        "Load the Perfect World login scene incrementally from converted project content.",
-        R"({"type":"object","properties":{"content_root":{"type":"string"},"chunk_size":{"type":"integer","minimum":1},"restart":{"type":"boolean"}}})",
+        "Load a converted Perfect World map incrementally; map defaults to login.",
+        R"({"type":"object","properties":{"content_root":{"type":"string"},"map":{"type":"string","pattern":"^[a-z0-9_]+$"},"chunk_size":{"type":"integer","minimum":1},"restart":{"type":"boolean"}}})",
         "load_login",
         true));
 
     registry.add(make_pw_tool(
         "pw_login_status",
-        "Return progress and diagnostics for the Perfect World login-scene loader.",
+        "Return progress and diagnostics for the active Perfect World map loader.",
         R"({"type":"object","properties":{}})",
         "login_status"));
 
     registry.add(make_pw_tool(
         "pw_terrain_probe",
-        "Sample the loaded Perfect World login terrain heightfield at one or more world positions.",
+        "Sample the loaded Perfect World terrain heightfield at one or more world positions.",
         R"({"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"},"z":{"type":"number"},"pos":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"points":{"type":"array"}}})",
         "terrain_probe"));
 

@@ -749,6 +749,10 @@ auto make_login_status_result(const mcp_system::login_load_status& status) -> js
     json result;
     result["status"] = status.status;
     result["content_root"] = status.content_root;
+    result["map"] = status.map;
+    result["attempted_content_root"] = status.attempted_content_root;
+    result["attempted_map"] = status.attempted_map;
+    result["start_error"] = status.start_error;
     result["done"] = status.done;
     result["total"] = status.total;
     result["created"] = status.created;
@@ -781,9 +785,9 @@ auto make_login_status_result(const mcp_system::login_load_status& status) -> js
     return result;
 }
 
-auto make_load_login_result(mcp_system& sys, const json& params) -> json
+auto make_load_login_result(rtti::context& ctx, mcp_system& sys, const json& params) -> json
 {
-    std::string content_root = "app:/data/login";
+    std::string content_root;
     if(params.contains("content_root") && params["content_root"].is_string())
     {
         content_root = params["content_root"].get<std::string>();
@@ -793,6 +797,11 @@ auto make_load_login_result(mcp_system& sys, const json& params) -> json
         content_root = params["content-root"].get<std::string>();
     }
 
+    std::string map_slug = "login";
+    if(params.contains("map") && params["map"].is_string())
+    {
+        map_slug = params["map"].get<std::string>();
+    }
     const int chunk_size = params.value("chunk_size", 3);
     if(chunk_size <= 0)
     {
@@ -800,8 +809,13 @@ auto make_load_login_result(mcp_system& sys, const json& params) -> json
     }
 
     const bool restart = params.value("restart", false);
-    sys.start_login_load(content_root, static_cast<uint32_t>(chunk_size), restart);
-    return make_login_status_result(sys.get_login_load_status());
+    sys.start_map_load(ctx, content_root, map_slug, static_cast<uint32_t>(chunk_size), restart);
+    const auto status = sys.get_login_load_status();
+    if(!status.start_error.empty())
+    {
+        throw std::runtime_error(status.start_error);
+    }
+    return make_login_status_result(status);
 }
 
 auto make_terrain_probe_result(mcp_system& sys, const json& params) -> json
@@ -1291,7 +1305,7 @@ auto dispatch(rtti::context& ctx, const std::string& req_json, mcp_system& sys) 
         }
         else if(method == "load_login")
         {
-            result = make_load_login_result(sys, params);
+            result = make_load_login_result(ctx, sys, params);
         }
         else if(method == "login_status")
         {

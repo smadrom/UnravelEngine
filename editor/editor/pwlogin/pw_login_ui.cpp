@@ -219,9 +219,9 @@ void pw_login_ui::activate(rtti::context& ctx)
     mode_active_ = true;
     auto& mcp = ctx.get_cached<mcp_system>();
     mcp.ensure_camera(ctx);
-    if(!mcp.has_login_terrain() && mcp.get_login_load_status().status == "idle")
+    if(!mcp.has_login_terrain())
     {
-        mcp.start_login_load("app:/data/login", 3, false);
+        mcp.start_login_load(ctx, "app:/data/login", 3, true);
     }
     auto& panel = ctx.get_cached<hub>().get_panels().get_pw_login_panel();
     panel.focus();
@@ -849,12 +849,17 @@ void pw_login_ui::service_world_view(rtti::context& ctx)
     const pw_session_snapshot snapshot = mcp.get_pw_session().get_snapshot();
     if(snapshot.state != pw_session_state::in_world || snapshot.world.seq == 0)
     {
+        const bool exited_world = snapshot.state != pw_session_state::in_world && world_epoch_ != 0;
         if(world_epoch_ != 0 || !world_markers_.empty() || world_self_marker_)
         {
             clear_world_markers();
         }
         world_epoch_ = 0;
         applied_world_seq_ = 0;
+        if(exited_world && !mcp.has_login_terrain())
+        {
+            mcp.start_login_load(ctx, "app:/data/login", 3, true);
+        }
         return;
     }
     if(snapshot.world.epoch != world_epoch_)

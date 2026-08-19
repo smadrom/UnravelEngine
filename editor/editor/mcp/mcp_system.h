@@ -13,6 +13,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -50,7 +51,11 @@ public:
     {
         std::string status = "idle";
         std::string content_root;
+        std::string map;
         std::string error;
+        std::string attempted_content_root;
+        std::string attempted_map;
+        std::string start_error;
         uint32_t done = 0;
         uint32_t total = 0;
         uint32_t created = 0;
@@ -136,13 +141,37 @@ public:
         uint32_t visible_cells = 0;
     };
 
+    struct login_light
+    {
+        enum class kind
+        {
+            directional,
+            point
+        };
+
+        kind type = kind::directional;
+        math::vec3 position{};
+        math::vec3 direction{0.0f, -1.0f, 0.0f};
+        math::color color{1.0f, 1.0f, 1.0f, 1.0f};
+        float intensity = 0.0f;
+        float range = 0.0f;
+        uint32_t source_index = 0;
+        bool has_intensity = false;
+        bool has_range = false;
+    };
+
     auto init(rtti::context& ctx) -> bool;
     auto deinit(rtti::context& ctx) -> bool;
     void on_frame_end(rtti::context& ctx, delta_t dt);
     auto ensure_camera(rtti::context& ctx) -> entt::handle;
     void invalidate_camera();
     void request_screenshot(const std::string& path, uint32_t w, uint32_t h, bool render_ui = false);
-    void start_login_load(const std::string& content_root, uint32_t buildings_per_frame, bool restart);
+    void start_map_load(rtti::context& ctx,
+                        const std::string& content_root,
+                        const std::string& map_slug,
+                        uint32_t buildings_per_frame,
+                        bool restart);
+    void start_login_load(rtti::context& ctx, const std::string& content_root, uint32_t buildings_per_frame, bool restart);
     auto get_login_load_status() const -> login_load_status;
     auto get_screenshot_status() const -> screenshot_status;
     auto has_login_terrain() const -> bool;
@@ -160,6 +189,8 @@ private:
     void service_login_loader(rtti::context& ctx);
     void service_pw_session(rtti::context& ctx);
     void clear_pending_readback();
+    void despawn_loaded_map(rtti::context& ctx);
+    void reset_login_loader_if_scene_changed(rtti::context& ctx);
 
     McpControlServer server_;
     pw_runtime_client pw_runtime_;
@@ -193,12 +224,21 @@ private:
     struct login_loader
     {
         std::string content_root;
+        std::string map_slug = "login";
         std::string status = "idle";
         std::string error;
         std::vector<login_building> buildings;
         std::vector<login_foliage> foliage;
         std::vector<login_water> water;
+        std::vector<login_light> lights;
+        std::vector<entt::handle> created_entities;
+        std::vector<std::function<void()>> shared_entity_rollbacks;
+        std::vector<std::string> generated_mesh_keys;
+        std::vector<std::string> generated_texture_keys;
+        entt::handle scene_anchor;
+        entt::registry* scene_registry = nullptr;
         terrain_heightfield terrain;
+        uint64_t generation = 0;
         uint32_t buildings_per_frame = 3;
         uint32_t cursor = 0;
         uint32_t created = 0;
@@ -217,5 +257,9 @@ private:
     };
 
     login_loader login_;
+    uint64_t next_map_generation_ = 0;
+    std::string attempted_content_root_;
+    std::string attempted_map_slug_;
+    std::string map_start_error_;
 };
 } // namespace unravel

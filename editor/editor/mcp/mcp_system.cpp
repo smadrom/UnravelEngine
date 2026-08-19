@@ -96,11 +96,24 @@ struct partial_login_scene_vec3
     bool z = false;
 };
 
-auto normalize_content_root(std::string root) -> std::string
+auto is_valid_map_slug(const std::string& slug) -> bool
+{
+    if(slug.empty())
+    {
+        return false;
+    }
+    return std::all_of(slug.begin(), slug.end(), [](char c)
+    {
+        return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+    });
+}
+
+auto normalize_content_root(std::string root, const std::string& expected_map_slug = {}) -> std::string
 {
     if(root.empty())
     {
-        root = "app:/data/login";
+        const auto map_slug = expected_map_slug.empty() ? std::string("login") : expected_map_slug;
+        root = "app:/data/" + map_slug;
     }
 
     while(!root.empty() && (root.back() == '/' || root.back() == '\\'))
@@ -108,20 +121,31 @@ auto normalize_content_root(std::string root) -> std::string
         root.pop_back();
     }
 
-    if(root == "login:")
+    if(root.size() > 1 && root.back() == ':')
     {
-        const auto login_data_root = std::string("login:/data/login");
-        if(fs::has_known_protocol(login_data_root))
+        const auto protocol_slug = root.substr(0, root.size() - 1);
+        if(!is_valid_map_slug(protocol_slug))
         {
-            return login_data_root;
+            throw std::runtime_error("load_login: invalid content-root protocol '" + root + "'");
+        }
+        if(!expected_map_slug.empty() && protocol_slug != expected_map_slug)
+        {
+            throw std::runtime_error("load_login: content-root protocol '" + protocol_slug +
+                                     "' does not match map '" + expected_map_slug + "'");
         }
 
-        fs::error_code ec;
-        const auto default_project_root = fs::path("C:/Temp/UnravelPW");
-        if(fs::is_directory(default_project_root / "data" / "login", ec) && !ec)
+        const auto protocol_data_root = protocol_slug + ":/data/" + protocol_slug;
+        if(fs::has_known_protocol(protocol_data_root))
         {
-            fs::add_path_protocol("login", default_project_root);
-            return login_data_root;
+            return protocol_data_root;
+        }
+
+        const auto app_data_root = std::string("app:/data/") + protocol_slug;
+        fs::error_code ec;
+        if(fs::has_known_protocol(app_data_root) &&
+           fs::is_directory(fs::resolve_protocol(app_data_root), ec) && !ec)
+        {
+            return app_data_root;
         }
     }
 
@@ -142,14 +166,17 @@ auto normalize_content_root(std::string root) -> std::string
             const auto canonical_root = fs::weakly_canonical(root, ec);
             const auto data_dir = canonical_root.parent_path();
             const auto project_root = data_dir.parent_path();
-            if(canonical_root.filename() == "login" && data_dir.filename() == "data" && fs::is_directory(project_root, ec))
+            if(data_dir.filename() == "data" && fs::is_directory(project_root, ec))
             {
-                fs::add_path_protocol("login", project_root);
-                return "login:/data/login";
+                const auto inferred_map_slug = canonical_root.filename().string();
+                if(!expected_map_slug.empty() && inferred_map_slug != expected_map_slug)
+                {
+                    throw std::runtime_error("load_login: content-root directory '" + inferred_map_slug +
+                                             "' does not match map '" + expected_map_slug + "'");
+                }
             }
-
-            fs::add_path_protocol("login", canonical_root);
-            return "login:";
+            throw std::runtime_error(
+                "load_login: content_root is outside a registered project; open its project or use a known asset protocol");
         }
 
         throw std::runtime_error(
@@ -157,6 +184,19 @@ auto normalize_content_root(std::string root) -> std::string
     }
 
     return root;
+}
+
+auto map_title_from_slug(const std::string& slug) -> std::string
+{
+    std::string title = slug.empty() ? std::string("Map") : slug;
+    title[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(title[0])));
+    return title;
+}
+
+auto make_generated_map_asset_key(const std::string& map_slug, uint64_t generation, const std::string& suffix)
+    -> std::string
+{
+    return "app:/generated/pw_map_" + map_slug + "_" + std::to_string(generation) + "_" + suffix;
 }
 
 auto make_asset_key(const std::string& content_root, std::string relative) -> std::string
@@ -184,6 +224,16 @@ auto read_json_asset(const std::string& asset_key) -> json
         throw std::runtime_error("load_login: failed to parse '" + asset_key + "'");
     }
     return doc;
+}
+
+auto read_map_lights_document(const std::string& content_root, const std::string& map_slug) -> json
+{
+    auto lights_doc = read_json_asset(make_asset_key(content_root, "lights/" + map_slug + ".eds.lights.json"));
+    if(!lights_doc.contains("lights") || !lights_doc["lights"].is_array())
+    {
+        throw std::runtime_error("load_login: map '" + map_slug + "' lights document has no lights[]");
+    }
+    return lights_doc;
 }
 
 auto trim_login_scene_text(std::string text) -> std::string
@@ -609,12 +659,12 @@ void add_unique_terrain_albedo_ref(std::vector<std::string>& refs, std::string r
     }
 }
 
-auto read_login_terrain_albedo_refs(const std::string& content_root) -> std::vector<std::string>
+auto read_login_terrain_albedo_refs(const std::string& content_root, const std::string& map_slug) -> std::vector<std::string>
 {
     std::vector<std::string> refs;
     try
     {
-        const auto layers_doc = read_json_asset(make_asset_key(content_root, "terrain/login/layers.json"));
+        const auto layers_doc = read_json_asset(make_asset_key(content_root, "terrain/" + map_slug + "/layers.json"));
         if(layers_doc.contains("bakedAlbedo") && layers_doc["bakedAlbedo"].is_object())
         {
             const auto& baked_albedo = layers_doc["bakedAlbedo"];
@@ -707,6 +757,85 @@ auto normalize_login_light_direction(const math::vec3& direction) -> math::vec3
     return math::normalize(direction);
 }
 
+void validate_login_light_vec3(const math::vec3& value, const char* key)
+{
+    if(!std::isfinite(value.x) || !std::isfinite(value.y) || !std::isfinite(value.z))
+    {
+        throw std::runtime_error(std::string("load_login: light '") + key + "' contains a non-finite value");
+    }
+}
+
+void read_optional_login_light_float(const json& item, const char* key, float& value, bool& present)
+{
+    if(!item.contains(key))
+    {
+        return;
+    }
+    value = item[key].get<float>();
+    if(!std::isfinite(value))
+    {
+        throw std::runtime_error(std::string("load_login: light '") + key + "' is not finite");
+    }
+    present = true;
+}
+
+auto parse_map_lights(const std::string& content_root, const std::string& map_slug)
+    -> std::vector<mcp_system::login_light>
+{
+    const auto lights_doc = read_map_lights_document(content_root, map_slug);
+    const auto& items = lights_doc["lights"];
+    std::vector<mcp_system::login_light> result;
+    result.reserve(items.size());
+
+    for(size_t i = 0; i < items.size(); ++i)
+    {
+        const auto& item = items[i];
+        if(!item.is_object())
+        {
+            continue;
+        }
+
+        try
+        {
+            const auto type = item.value("type", std::string{});
+            mcp_system::login_light parsed;
+            parsed.source_index = static_cast<uint32_t>(i);
+
+            if(type == "directional")
+            {
+                parsed.type = mcp_system::login_light::kind::directional;
+                parsed.direction = read_login_light_vec3_member(item, "direction");
+                validate_login_light_vec3(parsed.direction, "direction");
+                parsed.direction = normalize_login_light_direction(parsed.direction);
+            }
+            else if(type == "point")
+            {
+                parsed.type = mcp_system::login_light::kind::point;
+                parsed.position = read_login_light_vec3_member(item, "position");
+                validate_login_light_vec3(parsed.position, "position");
+                read_optional_login_light_float(item, "range", parsed.range, parsed.has_range);
+            }
+            else
+            {
+                continue;
+            }
+
+            parsed.color = read_login_light_color(item);
+            validate_login_light_vec3(
+                {parsed.color.value.r, parsed.color.value.g, parsed.color.value.b}, "colorRGB");
+            read_optional_login_light_float(item, "intensity", parsed.intensity, parsed.has_intensity);
+            result.emplace_back(parsed);
+        }
+        catch(const std::exception& e)
+        {
+            throw std::runtime_error("load_login: invalid light[" + std::to_string(i) + "] for map '" + map_slug +
+                                     "': " + e.what());
+        }
+    }
+
+    return result;
+}
+
 auto map_source_position_to_unravel(const math::vec3& source_pos) -> math::vec3
 {
     return source_pos;
@@ -795,14 +924,14 @@ auto decode_r16_heightmap(const std::string& heightmap_key, uint32_t& width, uin
     return heights;
 }
 
-auto load_login_terrain_heightfield(const std::string& content_root) -> terrain_heightfield
+auto load_login_terrain_heightfield(const std::string& content_root, const std::string& map_slug) -> terrain_heightfield
 {
-    const auto layers_doc = read_json_asset(make_asset_key(content_root, "terrain/login/layers.json"));
+    const auto layers_doc = read_json_asset(make_asset_key(content_root, "terrain/" + map_slug + "/layers.json"));
     const auto heightmap_doc = layers_doc.contains("heightmap") && layers_doc["heightmap"].is_object()
                                    ? layers_doc["heightmap"]
                                    : json::object();
 
-    const auto heightmap_ref = heightmap_doc.value("path", std::string("terrain/login/height.r16.png"));
+    const auto heightmap_ref = heightmap_doc.value("path", std::string("terrain/" + map_slug + "/height.r16.png"));
 
     terrain_heightfield terrain;
     terrain.height_min = heightmap_doc.value("heightMin", 134.59677124023438f);
@@ -883,7 +1012,12 @@ auto terrain_height_color(float h) -> terrain_rgb
     return mix_color(rock, high, (h - 0.82f) / 0.18f);
 }
 
-auto create_login_terrain_debug_albedo(rtti::context& ctx, const terrain_heightfield& terrain) -> asset_handle<gfx::texture>
+auto create_login_terrain_debug_albedo(rtti::context& ctx,
+                                       const std::string& map_slug,
+                                       uint64_t generation,
+                                       const terrain_heightfield& terrain,
+                                       std::vector<std::string>& generated_texture_keys)
+    -> asset_handle<gfx::texture>
 {
     if(!terrain.is_valid())
     {
@@ -937,14 +1071,17 @@ auto create_login_terrain_debug_albedo(rtti::context& ctx, const terrain_heightf
     }
 
     auto& am = ctx.get_cached<asset_manager>();
-    return am.get_asset_from_instance<gfx::texture>("app:/generated/login_terrain_debug_albedo", texture);
+    const auto key = make_generated_map_asset_key(map_slug, generation, "terrain_debug_albedo");
+    generated_texture_keys.emplace_back(key);
+    return am.get_asset_from_instance<gfx::texture>(key, texture);
 }
 
-auto load_login_terrain_albedo(rtti::context& ctx, const std::string& content_root) -> asset_handle<gfx::texture>
+auto load_login_terrain_albedo(rtti::context& ctx, const std::string& content_root, const std::string& map_slug)
+    -> asset_handle<gfx::texture>
 {
     try
     {
-        const auto albedo_refs = read_login_terrain_albedo_refs(content_root);
+        const auto albedo_refs = read_login_terrain_albedo_refs(content_root, map_slug);
         if(albedo_refs.empty())
         {
             return {};
@@ -1011,9 +1148,10 @@ auto positions_match(const math::vec3& lhs, const math::vec3& rhs) -> bool
     return math::dot(delta, delta) <= kDuplicatePositionEpsilon * kDuplicatePositionEpsilon;
 }
 
-auto make_login_buildings(const std::string& content_root, const terrain_heightfield& terrain) -> login_buildings_parse_result
+auto make_login_buildings(const std::string& content_root, const std::string& map_slug, const terrain_heightfield& terrain)
+    -> login_buildings_parse_result
 {
-    const auto scene_doc = read_json_asset(make_asset_key(content_root, "maps/login/scene.eds.json"));
+    const auto scene_doc = read_json_asset(make_asset_key(content_root, "maps/" + map_slug + "/scene.eds.json"));
     if(!scene_doc.contains("buildings") || !scene_doc["buildings"].is_array())
     {
         throw std::runtime_error("load_login: scene.eds.json has no buildings[]");
@@ -1076,7 +1214,8 @@ auto make_login_buildings(const std::string& content_root, const terrain_heightf
     return result;
 }
 
-auto login_scene_payload_asset_key(const std::string& content_root, std::string payload_ref) -> std::string
+auto login_scene_payload_asset_key(const std::string& content_root, const std::string& map_slug, std::string payload_ref)
+    -> std::string
 {
     std::replace(payload_ref.begin(), payload_ref.end(), '\\', '/');
     while(!payload_ref.empty() && payload_ref.front() == '/')
@@ -1092,12 +1231,12 @@ auto login_scene_payload_asset_key(const std::string& content_root, std::string 
     {
         return make_asset_key(content_root, payload_ref);
     }
-    return make_asset_key(content_root, "maps/login/" + payload_ref);
+    return make_asset_key(content_root, "maps/" + map_slug + "/" + payload_ref);
 }
 
-auto make_login_water(const std::string& content_root) -> login_water_parse_result
+auto make_login_water(const std::string& content_root, const std::string& map_slug) -> login_water_parse_result
 {
-    const auto scene_doc = read_json_asset(make_asset_key(content_root, "maps/login/scene.eds.json"));
+    const auto scene_doc = read_json_asset(make_asset_key(content_root, "maps/" + map_slug + "/scene.eds.json"));
 
     login_water_parse_result result;
     if(!scene_doc.contains("nodes") || !scene_doc["nodes"].is_array())
@@ -1140,7 +1279,7 @@ auto make_login_water(const std::string& content_root) -> login_water_parse_resu
                 continue;
             }
 
-            const auto payload_doc = read_json_asset(login_scene_payload_asset_key(content_root, payload_ref));
+            const auto payload_doc = read_json_asset(login_scene_payload_asset_key(content_root, map_slug, payload_ref));
             if(!payload_doc.contains("waterSurface") || !payload_doc["waterSurface"].is_object())
             {
                 ++result.skipped;
@@ -1188,9 +1327,10 @@ auto make_login_water(const std::string& content_root) -> login_water_parse_resu
     return result;
 }
 
-auto make_login_foliage(const std::string& content_root, const terrain_heightfield& terrain) -> login_foliage_parse_result
+auto make_login_foliage(const std::string& content_root, const std::string& map_slug, const terrain_heightfield& terrain)
+    -> login_foliage_parse_result
 {
-    const auto scene_doc = read_json_asset(make_asset_key(content_root, "maps/login/scene.eds.json"));
+    const auto scene_doc = read_json_asset(make_asset_key(content_root, "maps/" + map_slug + "/scene.eds.json"));
 
     login_foliage_parse_result result;
     if(!scene_doc.contains("nodes") || !scene_doc["nodes"].is_array())
@@ -1228,7 +1368,7 @@ auto make_login_foliage(const std::string& content_root, const terrain_heightfie
                 continue;
             }
 
-            const auto payload_doc = read_json_asset(make_asset_key(content_root, "maps/login/" + payload_ref));
+            const auto payload_doc = read_json_asset(login_scene_payload_asset_key(content_root, map_slug, payload_ref));
             if(!payload_doc.contains("foliageInstance") || !payload_doc["foliageInstance"].is_object())
             {
                 ++result.skipped;
@@ -1447,7 +1587,14 @@ auto build_login_terrain_skirt_mesh_data(const terrain_heightfield& terrain, mes
     return true;
 }
 
-void create_login_terrain(rtti::context& ctx, const std::string& content_root, const terrain_heightfield& terrain)
+void create_login_terrain(rtti::context& ctx,
+                          const std::string& content_root,
+                          const std::string& map_slug,
+                          uint64_t generation,
+                          const terrain_heightfield& terrain,
+                          std::vector<entt::handle>& created_entities,
+                          std::vector<std::string>& generated_mesh_keys,
+                          std::vector<std::string>& generated_texture_keys)
 {
     auto terrain_mesh = std::make_shared<mesh>();
     const bool created = terrain_mesh->create_heightfield(gfx::mesh_vertex::get_layout(),
@@ -1465,7 +1612,9 @@ void create_login_terrain(rtti::context& ctx, const std::string& content_root, c
     }
 
     auto& am = ctx.get_cached<asset_manager>();
-    auto terrain_handle = am.get_asset_from_instance<mesh>("app:/generated/login_terrain", terrain_mesh);
+    const auto terrain_key = make_generated_map_asset_key(map_slug, generation, "terrain");
+    generated_mesh_keys.emplace_back(terrain_key);
+    auto terrain_handle = am.get_asset_from_instance<mesh>(terrain_key, terrain_mesh);
 
     mesh::load_data terrain_skirt_data;
     if(!build_login_terrain_skirt_mesh_data(terrain, terrain_skirt_data))
@@ -1478,7 +1627,9 @@ void create_login_terrain(rtti::context& ctx, const std::string& content_root, c
     {
         throw std::runtime_error("load_login: failed to create terrain skirt mesh");
     }
-    auto terrain_skirt_handle = am.get_asset_from_instance<mesh>("app:/generated/login_terrain_skirt", terrain_skirt_mesh);
+    const auto terrain_skirt_key = make_generated_map_asset_key(map_slug, generation, "terrain_skirt");
+    generated_mesh_keys.emplace_back(terrain_skirt_key);
+    auto terrain_skirt_handle = am.get_asset_from_instance<mesh>(terrain_skirt_key, terrain_skirt_mesh);
 
     auto material_instance = std::make_shared<pbr_material>();
     material_instance->set_base_color({1.0f, 1.0f, 1.0f, 1.0f});
@@ -1486,7 +1637,7 @@ void create_login_terrain(rtti::context& ctx, const std::string& content_root, c
     material_instance->set_roughness(0.85f);
     material_instance->set_cull_type(cull_type::none);
 
-    auto terrain_albedo = load_login_terrain_albedo(ctx, content_root);
+    auto terrain_albedo = load_login_terrain_albedo(ctx, content_root, map_slug);
     if(terrain_albedo.is_valid())
     {
         material_instance->set_color_map(terrain_albedo);
@@ -1494,7 +1645,8 @@ void create_login_terrain(rtti::context& ctx, const std::string& content_root, c
     }
     else
     {
-        terrain_albedo = create_login_terrain_debug_albedo(ctx, terrain);
+        terrain_albedo =
+            create_login_terrain_debug_albedo(ctx, map_slug, generation, terrain, generated_texture_keys);
         if(terrain_albedo.is_valid())
         {
             material_instance->set_color_map(terrain_albedo);
@@ -1513,8 +1665,10 @@ void create_login_terrain(rtti::context& ctx, const std::string& content_root, c
         }
     }
 
+    const auto map_title = map_title_from_slug(map_slug);
     auto& scn = ctx.get_cached<ecs>().get_scene();
-    auto entity = scene::create_entity(*scn.registry, "Login Terrain");
+    auto entity = scene::create_entity(*scn.registry, map_title + " Terrain");
+    created_entities.emplace_back(entity);
     entity.get<transform_component>().set_position_local({0.0f, terrain.heightfield_entity_y(), 0.0f});
     entity.emplace<model_component>().set_model(terrain_model);
 
@@ -1529,7 +1683,8 @@ void create_login_terrain(rtti::context& ctx, const std::string& content_root, c
         }
     }
 
-    auto skirt_entity = scene::create_entity(*scn.registry, "Login Terrain Skirt");
+    auto skirt_entity = scene::create_entity(*scn.registry, map_title + " Terrain Skirt");
+    created_entities.emplace_back(skirt_entity);
     skirt_entity.get<transform_component>().set_position_local({0.0f, terrain.heightfield_entity_y(), 0.0f});
     skirt_entity.emplace<model_component>().set_model(terrain_skirt_model);
 }
@@ -1646,10 +1801,14 @@ auto build_login_water_mesh_data(const json& water_payload, mesh::load_data& dat
 
 auto create_login_water_surface(rtti::context& ctx,
                                 const std::string& content_root,
+                                const std::string& map_slug,
+                                uint64_t generation,
                                 const mcp_system::login_water& water,
-                                uint32_t index) -> bool
+                                uint32_t index,
+                                std::vector<entt::handle>& created_entities,
+                                std::vector<std::string>& generated_mesh_keys) -> bool
 {
-    const auto payload_doc = read_json_asset(login_scene_payload_asset_key(content_root, water.payload));
+    const auto payload_doc = read_json_asset(login_scene_payload_asset_key(content_root, map_slug, water.payload));
     mesh::load_data data;
     if(!build_login_water_mesh_data(payload_doc, data))
     {
@@ -1663,7 +1822,10 @@ auto create_login_water_surface(rtti::context& ctx,
     }
 
     auto& am = ctx.get_cached<asset_manager>();
-    auto water_handle = am.get_asset_from_instance<mesh>("app:/generated/login_water_" + std::to_string(index), water_mesh);
+    const auto water_key =
+        make_generated_map_asset_key(map_slug, generation, "water_" + std::to_string(index));
+    generated_mesh_keys.emplace_back(water_key);
+    auto water_handle = am.get_asset_from_instance<mesh>(water_key, water_mesh);
 
     uint32_t source_argb = 0xff1f5d72u;
     if(payload_doc.contains("waterSurface") && payload_doc["waterSurface"].is_object())
@@ -1696,6 +1858,7 @@ auto create_login_water_surface(rtti::context& ctx,
 
     auto& scn = ctx.get_cached<ecs>().get_scene();
     auto entity = scene::create_entity(*scn.registry, water.name.empty() ? std::string("Water ") + std::to_string(index) : water.name);
+    created_entities.emplace_back(entity);
     auto& model_comp = entity.emplace<model_component>();
     model_comp.set_model(water_model);
     model_comp.set_casts_shadow(false);
@@ -2047,9 +2210,12 @@ void configure_login_effect_emitter(particle_emitter_component& emitter,
     emitter.play();
 }
 
-void create_login_effects(rtti::context& ctx, const std::string& content_root)
+void create_login_effects(rtti::context& ctx,
+                          const std::string& content_root,
+                          const std::string& map_slug,
+                          std::vector<entt::handle>& created_entities)
 {
-    const auto scene_doc = read_json_asset(make_asset_key(content_root, "maps/login/scene.eds.json"));
+    const auto scene_doc = read_json_asset(make_asset_key(content_root, "maps/" + map_slug + "/scene.eds.json"));
     if(!scene_doc.contains("nodes") || !scene_doc["nodes"].is_array())
     {
         APPLOG_WARNING("load_login: scene.eds.json has no nodes[]; effects skipped");
@@ -2138,6 +2304,7 @@ void create_login_effects(rtti::context& ctx, const std::string& content_root)
                 }
 
                 auto entity = scene::create_entity(*scn.registry, entity_name);
+                created_entities.emplace_back(entity);
                 auto& transform = entity.get<transform_component>();
                 transform.set_position_local(position);
                 if(item.contains("dir") && item.contains("up"))
@@ -2235,7 +2402,8 @@ void apply_login_character_camera_pose(entt::handle camera, const login_scene_co
     camera_comp.set_far_clip(kLoginCharacterCameraFar);
 }
 
-auto create_login_character(rtti::context& ctx, const std::string& content_root) -> bool
+auto create_login_character(rtti::context& ctx, const std::string& content_root, std::vector<entt::handle>& created_entities)
+    -> bool
 {
     auto& scn = ctx.get_cached<ecs>().get_scene();
     if(find_scene_entity_named(scn, kLoginCharacterEntityName))
@@ -2309,7 +2477,7 @@ auto create_login_character(rtti::context& ctx, const std::string& content_root)
     terrain_heightfield terrain;
     try
     {
-        terrain = load_login_terrain_heightfield(content_root);
+        terrain = load_login_terrain_heightfield(content_root, "login");
     }
     catch(const std::exception& e)
     {
@@ -2323,6 +2491,7 @@ auto create_login_character(rtti::context& ctx, const std::string& content_root)
         local_bounds.is_populated() && std::isfinite(local_bounds.min.y) ? local_bounds.min.y : 0.0f;
     position.y = terrain_surface_y - local_min_y + kLoginCharacterGroundOffset;
     auto entity = scene::create_entity(*scn.registry, kLoginCharacterEntityName);
+    created_entities.emplace_back(entity);
     auto& transform = entity.get<transform_component>();
     transform.set_position_local(position);
     // Face the char-select camera (horizontal), matching the client create/select pose.
@@ -2352,64 +2521,112 @@ auto create_login_character(rtti::context& ctx, const std::string& content_root)
     return true;
 }
 
-void create_login_lights(rtti::context& ctx, const std::string& content_root)
+auto is_map_owned_entity(const std::vector<entt::handle>& created_entities, entt::handle entity) -> bool
 {
-    const auto lights_doc = read_json_asset(make_asset_key(content_root, "lights/login.eds.lights.json"));
-    if(!lights_doc.contains("lights") || !lights_doc["lights"].is_array())
+    return std::any_of(created_entities.begin(), created_entities.end(), [entity](const entt::handle& candidate)
     {
-        throw std::runtime_error("load_login: login.eds.lights.json has no lights[]");
-    }
+        return candidate == entity;
+    });
+}
 
+void create_login_lights(rtti::context& ctx,
+                         const std::string& map_slug,
+                         const std::vector<mcp_system::login_light>& lights,
+                         std::vector<entt::handle>& created_entities,
+                         std::vector<std::function<void()>>& shared_entity_rollbacks)
+{
     auto& scn = ctx.get_cached<ecs>().get_scene();
     size_t directional_count = 0;
     size_t point_count = 0;
 
-    const auto& lights = lights_doc["lights"];
-    for(size_t i = 0; i < lights.size(); ++i)
+    for(const auto& light_item : lights)
     {
-        const auto& light_item = lights[i];
-        if(!light_item.is_object())
-        {
-            continue;
-        }
-
-        const auto type = light_item.value("type", std::string{});
-        if(type == "directional")
+        if(light_item.type == mcp_system::login_light::kind::directional)
         {
             auto sun = find_scene_entity_named(scn, "Sun Light");
             if(!sun)
             {
                 sun = defaults::create_light_entity(ctx, scn, light_type::directional, "Sun");
+                created_entities.emplace_back(sun);
             }
 
-            const auto direction =
-                normalize_login_light_direction(read_login_light_vec3_member(light_item, "direction"));
+            if(!is_map_owned_entity(created_entities, sun))
+            {
+                const bool had_transform = sun.all_of<transform_component>();
+                const auto previous_transform = had_transform
+                                                    ? sun.get<transform_component>().get_transform_global()
+                                                    : math::transform{};
+                const bool had_light = sun.all_of<light_component>();
+                const auto previous_light = had_light ? sun.get<light_component>().get_light() : light{};
+                shared_entity_rollbacks.emplace_back([sun, had_transform, previous_transform]()
+                {
+                    if(!sun.valid())
+                    {
+                        return;
+                    }
+                    if(had_transform)
+                    {
+                        sun.get_or_emplace<transform_component>().set_transform_global(previous_transform);
+                    }
+                    else if(sun.all_of<transform_component>())
+                    {
+                        sun.remove<transform_component>();
+                    }
+                });
+                shared_entity_rollbacks.emplace_back([sun, had_light, previous_light]()
+                {
+                    if(!sun.valid())
+                    {
+                        return;
+                    }
+                    if(had_light)
+                    {
+                        sun.get_or_emplace<light_component>().set_light(previous_light);
+                    }
+                    else if(sun.all_of<light_component>())
+                    {
+                        sun.remove<light_component>();
+                    }
+                });
+            }
+
             auto& transform = sun.get_or_emplace<transform_component>();
-            transform.set_rotation_global(math::from_to_rotation(math::vec3{0.0f, 0.0f, 1.0f}, direction));
+            transform.set_rotation_global(
+                math::from_to_rotation(math::vec3{0.0f, 0.0f, 1.0f}, light_item.direction));
 
             auto& light_comp = sun.get_or_emplace<light_component>();
             auto light_data = light_comp.get_light();
             light_data.type = light_type::directional;
-            light_data.color = read_login_light_color(light_item);
+            light_data.color = light_item.color;
             // PW authored sun intensity (~1.0) is far below this engine's photometric scale (engine default ~5.0).
-            light_data.intensity = light_item.value("intensity", light_data.intensity) * 4.5f;
+            light_data.intensity =
+                (light_item.has_intensity ? light_item.intensity : light_data.intensity) * 4.5f;
             light_comp.set_light(light_data);
 
             ++directional_count;
             continue;
         }
 
-        if(type == "point")
+        if(light_item.type == mcp_system::login_light::kind::point)
         {
-            auto point_entity = scene::create_entity(*scn.registry, "Login Light " + std::to_string(i));
+            auto point_entity = scene::create_entity(*scn.registry,
+                                                     map_title_from_slug(map_slug) + " Light " +
+                                                         std::to_string(light_item.source_index));
+            created_entities.emplace_back(point_entity);
             auto& transform = point_entity.get<transform_component>();
-            transform.set_position_local(read_login_light_vec3_member(light_item, "position"));
+            transform.set_position_local(light_item.position);
 
             light light_data;
             light_data.type = light_type::point;
-            light_data.color = read_login_light_color(light_item);
-            light_data.intensity = light_item.value("intensity", light_data.intensity);
-            light_data.point_data.range = light_item.value("range", light_data.point_data.range);
+            light_data.color = light_item.color;
+            if(light_item.has_intensity)
+            {
+                light_data.intensity = light_item.intensity;
+            }
+            if(light_item.has_range)
+            {
+                light_data.point_data.range = light_item.range;
+            }
             light_data.casts_shadows = false;
 
             point_entity.emplace<light_component>().set_light(light_data);
@@ -2421,7 +2638,9 @@ void create_login_lights(rtti::context& ctx, const std::string& content_root)
     APPLOG_INFO("load_login lights created: directional={} points={}", directional_count, point_count);
 }
 
-void create_login_environment(rtti::context& ctx)
+void create_login_environment(rtti::context& ctx,
+                              std::vector<entt::handle>& created_entities,
+                              std::vector<std::function<void()>>& shared_entity_rollbacks)
 {
     auto& scn = ctx.get_cached<ecs>().get_scene();
 
@@ -2429,6 +2648,32 @@ void create_login_environment(rtti::context& ctx)
     if(!volume)
     {
         volume = defaults::create_volume_entity(ctx, scn, "Volume", volume_mode::global);
+        created_entities.emplace_back(volume);
+    }
+    else
+    {
+        if(const auto* tonemapping = volume.try_get<tonemapping_component>())
+        {
+            const auto previous = *tonemapping;
+            shared_entity_rollbacks.emplace_back([volume, previous]()
+            {
+                if(volume.valid() && volume.all_of<tonemapping_component>())
+                {
+                    volume.get<tonemapping_component>() = previous;
+                }
+            });
+        }
+        if(const auto* auto_exposure = volume.try_get<auto_exposure_component>())
+        {
+            const auto previous = *auto_exposure;
+            shared_entity_rollbacks.emplace_back([volume, previous]()
+            {
+                if(volume.valid() && volume.all_of<auto_exposure_component>())
+                {
+                    volume.get<auto_exposure_component>() = previous;
+                }
+            });
+        }
     }
 
     if(auto* tonemapping = volume.try_get<tonemapping_component>())
@@ -2447,6 +2692,27 @@ void create_login_environment(rtti::context& ctx)
     if(!sun)
     {
         sun = defaults::create_light_entity(ctx, scn, light_type::directional, "Sun");
+        created_entities.emplace_back(sun);
+    }
+    else
+    {
+        const bool had_skylight = sun.all_of<skylight_component>();
+        const auto previous = had_skylight ? sun.get<skylight_component>() : skylight_component{};
+        shared_entity_rollbacks.emplace_back([sun, had_skylight, previous]()
+        {
+            if(!sun.valid())
+            {
+                return;
+            }
+            if(had_skylight)
+            {
+                sun.get_or_emplace<skylight_component>() = previous;
+            }
+            else if(sun.all_of<skylight_component>())
+            {
+                sun.remove<skylight_component>();
+            }
+        });
     }
 
     if(sun)
@@ -2456,10 +2722,12 @@ void create_login_environment(rtti::context& ctx)
         skylight.set_irradiance_intensity(0.35f);
     }
 
-    if(!find_scene_entity_named(scn, "Reflection Probe Global"))
+    auto reflection_probe = find_scene_entity_named(scn, "Reflection Probe Global");
+    if(!reflection_probe)
     {
-        auto probe_entity = defaults::create_reflection_probe_entity(ctx, scn, probe_type::sphere, " Global");
-        auto& reflection_comp = probe_entity.get_or_emplace<reflection_probe_component>();
+        reflection_probe = defaults::create_reflection_probe_entity(ctx, scn, probe_type::sphere, " Global");
+        created_entities.emplace_back(reflection_probe);
+        auto& reflection_comp = reflection_probe.get_or_emplace<reflection_probe_component>();
         auto probe = reflection_comp.get_probe();
         probe.method = reflect_method::environment;
         probe.sphere_data.range = 1600.0f;
@@ -2470,7 +2738,8 @@ void create_login_environment(rtti::context& ctx)
 auto create_login_building(rtti::context& ctx,
                            const std::string& content_root,
                            mcp_system::login_building& building,
-                           bool allow_untextured) -> bool
+                           bool allow_untextured,
+                           std::vector<entt::handle>& created_entities) -> bool
 {
     auto& am = ctx.get_cached<asset_manager>();
     const auto mesh_key = make_asset_key(content_root, building.model);
@@ -2603,6 +2872,7 @@ auto create_login_building(rtti::context& ctx,
 
     auto& scn = ctx.get_cached<ecs>().get_scene();
     auto entity = scene::create_entity(*scn.registry, building.name);
+    created_entities.emplace_back(entity);
     auto& transform = entity.get<transform_component>();
     auto position = building.position;
     const auto& local_bounds = mesh_instance->get_bounds();
@@ -2635,7 +2905,8 @@ auto create_login_building(rtti::context& ctx,
 auto create_login_foliage(rtti::context& ctx,
                           const std::string& content_root,
                           mcp_system::login_foliage& foliage,
-                          bool allow_untextured) -> bool
+                          bool allow_untextured,
+                          std::vector<entt::handle>& created_entities) -> bool
 {
     auto& am = ctx.get_cached<asset_manager>();
     const auto mesh_key = make_asset_key(content_root, foliage.model);
@@ -2769,6 +3040,7 @@ auto create_login_foliage(rtti::context& ctx,
 
     auto& scn = ctx.get_cached<ecs>().get_scene();
     auto entity = scene::create_entity(*scn.registry, foliage.name);
+    created_entities.emplace_back(entity);
     auto& transform = entity.get<transform_component>();
     auto position = foliage.position;
     const auto& local_bounds = mesh_instance->get_bounds();
@@ -2856,6 +3128,7 @@ auto mcp_system::deinit(rtti::context& ctx) -> bool
 void mcp_system::on_frame_end(rtti::context& ctx, delta_t dt)
 {
     (void)dt;
+    reset_login_loader_if_scene_changed(ctx);
     service_pw_session(ctx);
     service_login_loader(ctx);
     service_pending_screenshot(ctx);
@@ -2973,34 +3246,193 @@ void mcp_system::request_screenshot(const std::string& path, uint32_t w, uint32_
     ++pending_.request_id;
 }
 
-void mcp_system::start_login_load(const std::string& content_root, uint32_t buildings_per_frame, bool restart)
+void mcp_system::despawn_loaded_map(rtti::context& ctx)
 {
-    const auto normalized_root = normalize_content_root(content_root);
-    if(!restart && (login_.active || login_.completed) && login_.content_root == normalized_root)
+    auto& scene = ctx.get_cached<ecs>().get_scene();
+    const bool registry_changed =
+        login_.scene_registry != nullptr && login_.scene_registry != scene.registry.get();
+    if(registry_changed)
+    {
+        login_.shared_entity_rollbacks.clear();
+        login_.created_entities.clear();
+        login_.scene_anchor = {};
+    }
+    else
+    {
+        for(auto it = login_.shared_entity_rollbacks.rbegin(); it != login_.shared_entity_rollbacks.rend(); ++it)
+        {
+            try
+            {
+                (*it)();
+            }
+            catch(const std::exception& e)
+            {
+                APPLOG_WARNING("load_login: failed to restore shared scene state: {}", e.what());
+            }
+        }
+        login_.shared_entity_rollbacks.clear();
+        for(auto& handle : login_.created_entities)
+        {
+            if(handle.valid())
+            {
+                handle.destroy();
+            }
+        }
+        login_.created_entities.clear();
+        if(login_.scene_anchor.valid())
+        {
+            login_.scene_anchor.destroy();
+        }
+        login_.scene_anchor = {};
+    }
+
+    // Runtime-created assets live in the manager independently of their scene
+    // entities. Invalidate their typed handles and metadata only after every
+    // entity/material reference has been released above.
+    auto& am = ctx.get_cached<asset_manager>();
+    for(const auto& key : login_.generated_mesh_keys)
+    {
+        am.unload_asset<mesh>(key);
+        am.remove_asset_info_for_key(key);
+    }
+    login_.generated_mesh_keys.clear();
+    for(const auto& key : login_.generated_texture_keys)
+    {
+        am.unload_asset<gfx::texture>(key);
+        am.remove_asset_info_for_key(key);
+    }
+    login_.generated_texture_keys.clear();
+    login_.scene_registry = nullptr;
+}
+
+void mcp_system::reset_login_loader_if_scene_changed(rtti::context& ctx)
+{
+    if(login_.scene_registry == nullptr)
     {
         return;
     }
-    if(!restart && login_.active && login_.content_root != normalized_root)
+    auto& scene = ctx.get_cached<ecs>().get_scene();
+    entt::registry* current_registry = scene.registry.get();
+    if(login_.scene_registry == current_registry && login_.scene_anchor.valid())
     {
-        throw std::runtime_error("load_login: another content_root is already loading");
+        return;
     }
-
+    despawn_loaded_map(ctx);
     login_ = {};
-    login_.content_root = normalized_root;
-    login_.buildings_per_frame = std::clamp(buildings_per_frame, 1u, 8u);
-    login_.terrain = load_login_terrain_heightfield(login_.content_root);
-    auto parsed = make_login_buildings(login_.content_root, login_.terrain);
-    login_.skipped = parsed.duplicate_skipped;
-    login_.buildings = std::move(parsed.buildings);
-    auto parsed_foliage = make_login_foliage(login_.content_root, login_.terrain);
-    login_.foliage_skipped = parsed_foliage.skipped;
-    login_.foliage = std::move(parsed_foliage.foliage);
-    auto parsed_water = make_login_water(login_.content_root);
-    login_.water_skipped = parsed_water.skipped;
-    login_.water = std::move(parsed_water.water);
-    login_.active = true;
-    login_.completed = false;
-    login_.status = "loading";
+    attempted_content_root_.clear();
+    attempted_map_slug_.clear();
+    map_start_error_.clear();
+    applied_pw_camera_ = pw_session_camera::none;
+    invalidate_camera();
+}
+
+void mcp_system::start_map_load(rtti::context& ctx,
+                                const std::string& content_root,
+                                const std::string& map_slug,
+                                uint32_t buildings_per_frame,
+                                bool restart)
+{
+    reset_login_loader_if_scene_changed(ctx);
+    std::string normalized_root;
+    bool candidate_installed = false;
+    attempted_content_root_ = content_root;
+    attempted_map_slug_ = map_slug;
+    map_start_error_.clear();
+    try
+    {
+        if(!is_valid_map_slug(map_slug))
+        {
+            throw std::runtime_error("map must match [a-z0-9_]+, got '" + map_slug + "'");
+        }
+        normalized_root = normalize_content_root(content_root, map_slug);
+        attempted_content_root_ = normalized_root;
+        const auto& current_scene = ctx.get_cached<ecs>().get_scene();
+        const bool current_anchor_valid = login_.scene_registry == current_scene.registry.get() &&
+                                          login_.scene_anchor.valid();
+        if(!restart && current_anchor_valid && login_.error.empty() && (login_.active || login_.completed) &&
+           login_.content_root == normalized_root && login_.map_slug == map_slug)
+        {
+            attempted_content_root_.clear();
+            attempted_map_slug_.clear();
+            return;
+        }
+        if(!restart && login_.active &&
+           (login_.content_root != normalized_root || login_.map_slug != map_slug))
+        {
+            throw std::runtime_error("another map is already loading");
+        }
+
+        // Parse the complete target manifest before mutating the scene. A bad
+        // or partial conversion must not destroy the map that is still visible.
+        login_loader next;
+        next.content_root = normalized_root;
+        next.map_slug = map_slug;
+        next.buildings_per_frame = std::clamp(buildings_per_frame, 1u, 8u);
+        next.lights = parse_map_lights(next.content_root, next.map_slug);
+        next.terrain = load_login_terrain_heightfield(next.content_root, next.map_slug);
+        auto parsed = make_login_buildings(next.content_root, next.map_slug, next.terrain);
+        next.skipped = parsed.duplicate_skipped;
+        next.buildings = std::move(parsed.buildings);
+        auto parsed_foliage = make_login_foliage(next.content_root, next.map_slug, next.terrain);
+        next.foliage_skipped = parsed_foliage.skipped;
+        next.foliage = std::move(parsed_foliage.foliage);
+        auto parsed_water = make_login_water(next.content_root, next.map_slug);
+        next.water_skipped = parsed_water.skipped;
+        next.water = std::move(parsed_water.water);
+        ++next_map_generation_;
+        if(next_map_generation_ == 0)
+        {
+            ++next_map_generation_;
+        }
+        next.generation = next_map_generation_;
+        next.active = true;
+        next.status = "loading";
+
+        // A validated map replaces the previous one: despawn every entity the
+        // previous load created so two terrains never overlap.
+        despawn_loaded_map(ctx);
+        login_ = std::move(next);
+        candidate_installed = true;
+        auto& scene = ctx.get_cached<ecs>().get_scene();
+        login_.scene_registry = scene.registry.get();
+        login_.scene_anchor = entt::handle(*scene.registry, scene.registry->create());
+        attempted_content_root_.clear();
+        attempted_map_slug_.clear();
+    }
+    catch(const std::exception& e)
+    {
+        const auto attempted_root = normalized_root.empty() ? content_root : normalized_root;
+        map_start_error_ = "load_login: failed to start map '" + map_slug + "' from '" + attempted_root +
+                           "': " + e.what();
+        if(candidate_installed)
+        {
+            login_.active = false;
+            login_.completed = false;
+            login_.status = "error";
+            login_.error = map_start_error_;
+            despawn_loaded_map(ctx);
+            login_.terrain = {};
+            return;
+        }
+        const bool has_current_map = login_.active || login_.completed || login_.terrain.is_valid() ||
+                                     !login_.created_entities.empty();
+        if(!has_current_map)
+        {
+            login_ = {};
+            login_.content_root = normalized_root.empty() ? content_root : normalized_root;
+            login_.map_slug = map_slug;
+            login_.error = map_start_error_;
+            login_.status = "error";
+        }
+    }
+}
+
+void mcp_system::start_login_load(rtti::context& ctx,
+                                  const std::string& content_root,
+                                  uint32_t buildings_per_frame,
+                                  bool restart)
+{
+    start_map_load(ctx, content_root, "login", buildings_per_frame, restart);
 }
 
 auto mcp_system::get_login_load_status() const -> login_load_status
@@ -3008,7 +3440,11 @@ auto mcp_system::get_login_load_status() const -> login_load_status
     login_load_status result;
     result.status = login_.status;
     result.content_root = login_.content_root;
+    result.map = login_.map_slug;
     result.error = login_.error;
+    result.attempted_content_root = attempted_content_root_;
+    result.attempted_map = attempted_map_slug_;
+    result.start_error = map_start_error_;
     result.done = login_.cursor;
     result.total = static_cast<uint32_t>(login_.buildings.size());
     result.created = login_.created;
@@ -3095,7 +3531,8 @@ auto mcp_system::get_screenshot_status() const -> screenshot_status
 
 auto mcp_system::has_login_terrain() const -> bool
 {
-    return login_.terrain.is_valid();
+    return login_.scene_registry != nullptr && login_.scene_anchor.valid() && login_.map_slug == "login" &&
+           login_.terrain.is_valid();
 }
 
 auto mcp_system::sample_login_terrain(float world_x, float world_z, float& out_height) const -> bool
@@ -3132,9 +3569,13 @@ void mcp_system::service_login_loader(rtti::context& ctx)
 
         if(!login_.environment_created)
         {
-            create_login_environment(ctx);
-            create_login_lights(ctx, login_.content_root);
-            create_login_effects(ctx, login_.content_root);
+            create_login_environment(ctx, login_.created_entities, login_.shared_entity_rollbacks);
+            create_login_lights(ctx,
+                                login_.map_slug,
+                                login_.lights,
+                                login_.created_entities,
+                                login_.shared_entity_rollbacks);
+            create_login_effects(ctx, login_.content_root, login_.map_slug, login_.created_entities);
             login_.environment_created = true;
         }
 
@@ -3142,7 +3583,7 @@ void mcp_system::service_login_loader(rtti::context& ctx)
         {
             auto& building = login_.buildings[login_.cursor];
             const bool wait_limit_reached = building.attempts >= kLoginMaxAssetWaitFrames;
-            if(!create_login_building(ctx, login_.content_root, building, wait_limit_reached))
+            if(!create_login_building(ctx, login_.content_root, building, wait_limit_reached, login_.created_entities))
             {
                 if(building.attempts < kLoginMaxAssetWaitFrames)
                 {
@@ -3160,9 +3601,9 @@ void mcp_system::service_login_loader(rtti::context& ctx)
             ++processed_this_frame;
         }
 
-        if(login_.cursor >= login_.buildings.size())
+        if(login_.cursor >= login_.buildings.size() && login_.map_slug == "login")
         {
-            if(!create_login_character(ctx, login_.content_root))
+            if(!create_login_character(ctx, login_.content_root, login_.created_entities))
             {
                 // The preview character is decorative: bound the wait and continue
                 // without it instead of blocking the scene load forever.
@@ -3182,7 +3623,7 @@ void mcp_system::service_login_loader(rtti::context& ctx)
         {
             auto& foliage = login_.foliage[login_.foliage_cursor];
             const bool wait_limit_reached = foliage.attempts >= kLoginMaxAssetWaitFrames;
-            if(!create_login_foliage(ctx, login_.content_root, foliage, wait_limit_reached))
+            if(!create_login_foliage(ctx, login_.content_root, foliage, wait_limit_reached, login_.created_entities))
             {
                 if(foliage.attempts < kLoginMaxAssetWaitFrames)
                 {
@@ -3204,7 +3645,14 @@ void mcp_system::service_login_loader(rtti::context& ctx)
         {
             if(!login_.terrain_created)
             {
-                create_login_terrain(ctx, login_.content_root, login_.terrain);
+                create_login_terrain(ctx,
+                                     login_.content_root,
+                                     login_.map_slug,
+                                     login_.generation,
+                                     login_.terrain,
+                                     login_.created_entities,
+                                     login_.generated_mesh_keys,
+                                     login_.generated_texture_keys);
                 login_.terrain_created = true;
             }
 
@@ -3214,7 +3662,14 @@ void mcp_system::service_login_loader(rtti::context& ctx)
                 {
                     try
                     {
-                        if(create_login_water_surface(ctx, login_.content_root, login_.water[i], static_cast<uint32_t>(i)))
+                        if(create_login_water_surface(ctx,
+                                                      login_.content_root,
+                                                      login_.map_slug,
+                                                      login_.generation,
+                                                      login_.water[i],
+                                                      static_cast<uint32_t>(i),
+                                                      login_.created_entities,
+                                                      login_.generated_mesh_keys))
                         {
                             ++login_.water_created;
                         }
@@ -3254,6 +3709,11 @@ void mcp_system::service_login_loader(rtti::context& ctx)
         login_.completed = false;
         login_.status = "error";
         login_.error = e.what();
+        despawn_loaded_map(ctx);
+        login_.terrain = {};
+        login_.terrain_created = false;
+        login_.water_created_flag = false;
+        login_.environment_created = false;
     }
 }
 

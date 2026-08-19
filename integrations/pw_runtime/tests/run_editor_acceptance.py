@@ -158,6 +158,7 @@ def launch_editor(account, password, client_exe=None, workdir=None):
     env["PW_PASSWORD"] = password
     proc = subprocess.Popen(
         [EDITOR_EXE, "--project", PROJECT_DIR],
+        cwd=os.path.dirname(os.path.abspath(EDITOR_EXE)),
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
