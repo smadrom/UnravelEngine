@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 namespace
@@ -46,5 +47,24 @@ int main()
     expect_near(terrain.heightfield_mesh_scale(), -20.0f);
 
     assert(!terrain.sample_terrain_height(2.1f, 0.0f, sampled));
+
+    terrain.world_left = -10.0f;
+    terrain.world_top = 20.0f;
+    terrain.has_world_origin = true;
+    assert(terrain.is_valid());
+
+    assert(terrain.sample_terrain_height(-10.0f, 16.0f, sampled));
+    expect_near(sampled, 20.0f);
+
+    assert(terrain.sample_terrain_height(-6.0f, 20.0f, sampled));
+    expect_near(sampled, 30.0f);
+
+    assert(terrain.sample_terrain_height(-8.0f, 18.0f, sampled));
+    expect_near(sampled, 25.0f);
+
+    assert(!terrain.sample_terrain_height(-5.9f, 18.0f, sampled));
+
+    terrain.world_left = std::numeric_limits<float>::infinity();
+    assert(!terrain.is_valid());
     return 0;
 }

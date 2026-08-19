@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <exception>
 #include <iterator>
 #include <utility>
 
@@ -34,6 +35,20 @@ namespace unravel
 namespace
 {
 constexpr const char* kDocumentAsset = "editor:/data/ui/pw_login.rhtml";
+
+// Configs/instance.txt is the source of truth for this mapping. The converter
+// records the resolved instance id in each map manifest; keep this mirror
+// intentionally narrow until the editor consumes that mapping dynamically.
+auto world_map_slug_for_instance(int32_t instance_id) -> std::string
+{
+    switch(instance_id)
+    {
+    case 161:
+        return "a61";
+    default:
+        return {};
+    }
+}
 
 void set_element_text(Rml::ElementDocument* document, const char* id, const std::string& text)
 {
@@ -868,6 +883,35 @@ void pw_login_ui::service_world_view(rtti::context& ctx)
         clear_world_markers();
         world_epoch_ = snapshot.world.epoch;
         applied_world_seq_ = 0;
+        if(snapshot.world.epoch != world_map_loaded_epoch_)
+        {
+            world_map_loaded_epoch_ = snapshot.world.epoch;
+            const std::string map_slug = world_map_slug_for_instance(snapshot.attested_instance_id);
+            if(!map_slug.empty())
+            {
+                try
+                {
+                    // Entering the world makes an in-flight login-map load obsolete.
+                    // Restart preflights the instance map before replacing the old scene.
+                    mcp.start_map_load(ctx, map_slug + ":", map_slug, 3, true);
+                    const auto status = mcp.get_login_load_status();
+                    if(!status.start_error.empty())
+                    {
+                        APPLOG_WARNING("world map auto-load failed to start: instance={} slug='{}' reason='{}'",
+                                       snapshot.attested_instance_id,
+                                       map_slug,
+                                       status.start_error);
+                    }
+                }
+                catch(const std::exception& e)
+                {
+                    APPLOG_WARNING("world map auto-load failed to start: instance={} slug='{}' reason='{}'",
+                                   snapshot.attested_instance_id,
+                                   map_slug,
+                                   e.what());
+                }
+            }
+        }
     }
 
     auto& scene = ctx.get_cached<ecs>().get_scene();

@@ -936,12 +936,41 @@ auto load_login_terrain_heightfield(const std::string& content_root, const std::
     terrain_heightfield terrain;
     terrain.height_min = heightmap_doc.value("heightMin", 134.59677124023438f);
     terrain.height_max = heightmap_doc.value("heightMax", 424.2374267578125f);
-    terrain.world_width = layers_doc.contains("world") && layers_doc["world"].is_object()
-                              ? layers_doc["world"].value("widthM", 1024.0f)
-                              : 1024.0f;
-    terrain.world_depth = layers_doc.contains("world") && layers_doc["world"].is_object()
-                              ? layers_doc["world"].value("depthM", 1024.0f)
-                              : 1024.0f;
+    terrain.world_width = 1024.0f;
+    terrain.world_depth = 1024.0f;
+    if(layers_doc.contains("world") && layers_doc["world"].is_object())
+    {
+        const auto& world_doc = layers_doc["world"];
+        const float world_width = world_doc.value("widthM", 1024.0f);
+        const float world_depth = world_doc.value("depthM", 1024.0f);
+        const bool has_world_left = world_doc.contains("leftM");
+        const bool has_world_top = world_doc.contains("topM");
+        if(has_world_left != has_world_top)
+        {
+            throw std::runtime_error("load_login: terrain world rect requires both leftM and topM");
+        }
+        terrain.world_width = world_width;
+        terrain.world_depth = world_depth;
+        if(has_world_left)
+        {
+            const float world_left = world_doc.at("leftM").get<float>();
+            const float world_top = world_doc.at("topM").get<float>();
+            if(!std::isfinite(world_left) || !std::isfinite(world_top) ||
+               !std::isfinite(world_left + world_width) || !std::isfinite(world_top - world_depth))
+            {
+                throw std::runtime_error("load_login: terrain world rect is not finite");
+            }
+            terrain.world_left = world_left;
+            terrain.world_top = world_top;
+            terrain.has_world_origin = true;
+        }
+    }
+    if(!std::isfinite(terrain.height_min) || !std::isfinite(terrain.height_max) ||
+       terrain.height_max < terrain.height_min || !std::isfinite(terrain.world_width) ||
+       !std::isfinite(terrain.world_depth) || terrain.world_width <= 0.0f || terrain.world_depth <= 0.0f)
+    {
+        throw std::runtime_error("load_login: terrain height or world dimensions are invalid");
+    }
     terrain.heights = decode_r16_heightmap(make_asset_key(content_root, heightmap_ref), terrain.width, terrain.height);
     if(!terrain.is_valid())
     {
@@ -1667,9 +1696,16 @@ void create_login_terrain(rtti::context& ctx,
 
     const auto map_title = map_title_from_slug(map_slug);
     auto& scn = ctx.get_cached<ecs>().get_scene();
+    // Heightfield meshes are centered locally. Region exports place that center in their absolute world rect;
+    // legacy maps remain centered on the scene origin.
+    const math::vec3 terrain_position = terrain.has_world_origin
+                                            ? math::vec3{terrain.world_left + terrain.world_width * 0.5f,
+                                                         terrain.heightfield_entity_y(),
+                                                         terrain.world_top - terrain.world_depth * 0.5f}
+                                            : math::vec3{0.0f, terrain.heightfield_entity_y(), 0.0f};
     auto entity = scene::create_entity(*scn.registry, map_title + " Terrain");
     created_entities.emplace_back(entity);
-    entity.get<transform_component>().set_position_local({0.0f, terrain.heightfield_entity_y(), 0.0f});
+    entity.get<transform_component>().set_position_local(terrain_position);
     entity.emplace<model_component>().set_model(terrain_model);
 
     model terrain_skirt_model;
@@ -1685,7 +1721,7 @@ void create_login_terrain(rtti::context& ctx,
 
     auto skirt_entity = scene::create_entity(*scn.registry, map_title + " Terrain Skirt");
     created_entities.emplace_back(skirt_entity);
-    skirt_entity.get<transform_component>().set_position_local({0.0f, terrain.heightfield_entity_y(), 0.0f});
+    skirt_entity.get<transform_component>().set_position_local(terrain_position);
     skirt_entity.emplace<model_component>().set_model(terrain_skirt_model);
 }
 

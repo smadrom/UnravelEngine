@@ -14,10 +14,12 @@ Configuration is environment-only (no secrets in this file or in the report):
   UNRAVEL_EDITOR_EXE            - default build/bin/RelWithDebInfo/UnravelEditor.exe
   UNRAVEL_PW_PROJECT            - Unravel project containing PW content (required)
   UNRAVEL_MCP_PORT              - default 17890
+  UNRAVEL_MCP_CALL_TIMEOUT      - per-call seconds; raise for a cold world asset import
   PW_ACCEPTANCE_OUT             - output dir for transcript/screenshots/SUMMARY
+  PW_ACCEPTANCE_ROLE_ID         - live worldmap role id; default 3057
   PW_ACCEPTANCE_ACCOUNT_EMPTY   - account expected to have zero roles (empty-roles run)
 
-Usage: py -3 run_editor_acceptance.py [happy|preview|preview-offline|world|wrong-password|empty-roles|all]
+Usage: py -3 run_editor_acceptance.py [happy|preview|preview-offline|world|worldmap|worldmap-offline|wrong-password|empty-roles|all]
 """
 
 import datetime
@@ -36,10 +38,30 @@ EDITOR_EXE = os.environ.get(
     "UNRAVEL_EDITOR_EXE", os.path.join(REPO_ROOT, "build", "bin", "RelWithDebInfo", "UnravelEditor.exe"))
 PROJECT_DIR = os.environ.get("UNRAVEL_PW_PROJECT", "")
 MCP_PORT = int(os.environ.get("UNRAVEL_MCP_PORT", "17890"))
+MCP_CALL_TIMEOUT_S = float(os.environ.get("UNRAVEL_MCP_CALL_TIMEOUT", "30"))
 OUT_DIR = os.environ.get(
     "PW_ACCEPTANCE_OUT",
     os.path.join(REPO_ROOT, "artifacts", "pw-acceptance-" + datetime.date.today().isoformat()))
 CLIENT_EXE = os.environ.get("PW_RUNTIME_CLIENT_EXE", "")
+
+WORLD_MAP_INSTANCE_ID = 161
+WORLD_MAP_SLUG = "a61"
+WORLD_MAP_LOAD_TIMEOUT_S = 600
+WORLD_MAP_TERRAIN_TOLERANCE_M = 0.5
+WORLD_MAP_MOVE_DISTANCE_M = 5.0
+WORLD_MAP_MIN_DISPLACEMENT_M = 0.1
+WORLD_MAP_ROLE_ID = int(os.environ.get("PW_ACCEPTANCE_ROLE_ID", "3057"))
+# Genuine role-3057 ground positions captured before/after a successful move.
+# These are deliberately not assembled from nearby entity coordinates.
+WORLD_MAP_OFFLINE_GROUND_POINTS = (
+    {"x": 227.10800170898438, "y": 36.10300064086914, "z": 164.4810028076172},
+    {"x": 223.24200439453125, "y": 36.16400146484375, "z": 167.65199279785156},
+)
+OFFLINE_MODES = ("preview-offline", "worldmap-offline")
+SUPPORTED_MODES = (
+    "happy", "preview", "preview-offline", "world", "worldmap", "worldmap-offline",
+    "wrong-password", "empty-roles", "all",
+)
 
 SECRET_VALUES = []  # filled from env; swept out of every artifact
 
@@ -133,6 +155,26 @@ def wait_login_scene(mcp, timeout_s):
     raise RuntimeError("login scene load timed out")
 
 
+def wait_map_load(mcp, slug, timeout_s):
+    """Wait until the requested map owns the active, completed load state."""
+    deadline = time.time() + timeout_s
+    last = None
+    while time.time() < deadline:
+        status = mcp.call_result("login_status")
+        last = status
+        if status.get("status") == "done" and status.get("map") == slug:
+            return status
+        attempted_map = status.get("attempted_map")
+        start_error = status.get("start_error")
+        if attempted_map == slug and start_error:
+            raise RuntimeError("map {} load failed to start: {}".format(slug, start_error))
+        if status.get("status") == "error":
+            raise RuntimeError("map {} load failed: {}".format(
+                slug, status.get("error") or start_error or status))
+        time.sleep(2)
+    raise RuntimeError("map {} load timed out; last={}".format(slug, last))
+
+
 def screenshot(mcp, name):
     path = os.path.join(OUT_DIR, name)
     mcp.call_result("screenshot", {"path": path, "w": 1600, "h": 900, "ui": True})
@@ -166,18 +208,46 @@ def launch_editor(account, password, client_exe=None, workdir=None):
     return proc
 
 
+def launch_editor_headless():
+    """Launch the editor for asset-only MCP checks without a PW session environment."""
+    env = dict(os.environ)
+    for key in ("PW_ACCOUNT", "PW_PASSWORD", "PW_SERVER", "PW_RUNTIME_CLIENT_EXE",
+                "PW_RUNTIME_WORKING_DIRECTORY", "PW_ACCEPTANCE_ACCOUNT_EMPTY",
+                "PW_ACCEPTANCE_PASSWORD_EMPTY"):
+        env.pop(key, None)
+    env["PW_MCP_PORT"] = str(MCP_PORT)
+    return subprocess.Popen(
+        [EDITOR_EXE, "--project", PROJECT_DIR],
+        cwd=os.path.dirname(os.path.abspath(EDITOR_EXE)),
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def redact(text):
-    for secret in SECRET_VALUES:
+    # Longest-first prevents a shorter overlapping secret from exposing the
+    # suffix of a longer one (account=alice, password=alice123).
+    for secret in sorted(set(SECRET_VALUES), key=len, reverse=True):
         if secret:
             text = text.replace(secret, "***")
     return text
 
 
+def redact_value(value):
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, list):
+        return [redact_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: redact_value(item) for key, item in value.items()}
+    return value
+
+
 def save_transcript(mcp, name):
     path = os.path.join(OUT_DIR, name)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(json.loads(redact(json.dumps(mcp.transcript, ensure_ascii=False, indent=2))), f,
-                  ensure_ascii=False, indent=2)
+        json.dump(redact_value(mcp.transcript), f, ensure_ascii=False, indent=2)
     return path
 
 
@@ -189,8 +259,13 @@ def sweep_leaks():
             with open(path, "rb") as f:
                 content = f.read()
             for secret in SECRET_VALUES:
-                if secret and secret.encode() in content:
+                if not secret:
+                    continue
+                raw = secret.encode("utf-8")
+                json_escaped = json.dumps(secret, ensure_ascii=False)[1:-1].encode("utf-8")
+                if raw in content or json_escaped in content:
                     leaks.append(path)
+                    break
     return leaks
 
 
@@ -401,31 +476,268 @@ def run_world(mcp):
             "entities": len(entities0), "moved": round(moved, 2), "targeted": targeted}
 
 
+def probe_terrain_position(mcp, position, label):
+    probe = mcp.call_result("terrain_probe", {
+        "points": [{"x": position["x"], "z": position["z"], "y": position["y"]}],
+    })
+    samples = probe.get("samples", [])
+    if len(samples) != 1:
+        raise RuntimeError("{} terrain_probe returned {} samples, want 1".format(
+            label, len(samples)))
+    sample = samples[0]
+    if not sample.get("ok"):
+        raise RuntimeError("{} is outside the loaded terrain region".format(label))
+    delta_y = sample.get("delta_y")
+    if not isinstance(delta_y, (int, float)):
+        raise RuntimeError("{} terrain_probe did not return delta_y: {}".format(label, sample))
+    if abs(delta_y) > WORLD_MAP_TERRAIN_TOLERANCE_M:
+        raise RuntimeError("{} terrain height mismatch: delta_y={}".format(label, delta_y))
+    return sample
+
+
+def verify_world_map_manifest():
+    """Fail closed if the staged slug belongs to a different PW instance."""
+    path = os.path.join(PROJECT_DIR, "data", WORLD_MAP_SLUG, "_meta", "manifest.eds.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("cannot read staged instance manifest {}: {}".format(path, exc))
+    source_map = str(manifest.get("sourceMap", "")).replace("\\", "/").lower()
+    expected_suffix = "/{0}/{0}.ecwld".format(WORLD_MAP_SLUG)
+    if manifest.get("instanceId") != WORLD_MAP_INSTANCE_ID:
+        raise RuntimeError("staged map instanceId {} != {}".format(
+            manifest.get("instanceId"), WORLD_MAP_INSTANCE_ID))
+    if not source_map.endswith(expected_suffix):
+        raise RuntimeError("staged sourceMap {!r} is not {}".format(
+            manifest.get("sourceMap"), expected_suffix))
+    return {"instance": manifest["instanceId"], "source_map": source_map}
+
+
+def run_worldmap_offline(mcp):
+    """Load the converted instance-161 region and prove its absolute terrain placement."""
+    manifest = verify_world_map_manifest()
+    mcp.call_result("pw_session_ui", {"active": True})
+    wait_login_scene(mcp, WORLD_MAP_LOAD_TIMEOUT_S)
+
+    mcp.call_result("load_login", {
+        "content_root": WORLD_MAP_SLUG + ":",
+        "map": WORLD_MAP_SLUG,
+    })
+    status = wait_map_load(mcp, WORLD_MAP_SLUG, WORLD_MAP_LOAD_TIMEOUT_S)
+    if not status.get("terrain"):
+        raise RuntimeError("instance map load completed without terrain")
+
+    ground_points = list(WORLD_MAP_OFFLINE_GROUND_POINTS)
+    probe = mcp.call_result("terrain_probe", {
+        "points": ground_points + [{"x": 2000.0, "z": 2000.0}],
+    })
+    samples = probe.get("samples", [])
+    if len(samples) != len(ground_points) + 1:
+        raise RuntimeError("terrain_probe returned {} samples, want {}".format(
+            len(samples), len(ground_points) + 1))
+    ground_samples = samples[:-1]
+    for index, sample in enumerate(ground_samples):
+        if not sample.get("ok"):
+            raise RuntimeError("known instance-161 ground point {} is outside terrain".format(index))
+        delta_y = sample.get("delta_y")
+        if not isinstance(delta_y, (int, float)):
+            raise RuntimeError("ground terrain_probe did not return delta_y: {}".format(sample))
+        if abs(delta_y) > WORLD_MAP_TERRAIN_TOLERANCE_M:
+            raise RuntimeError("ground point {} height mismatch: delta_y={}".format(index, delta_y))
+    if samples[-1].get("ok"):
+        raise RuntimeError("terrain probe at (2000, 2000) must be outside the region")
+
+    focus = ground_points[0]
+    mcp.call_result("camera_set", {
+        "pos": [focus["x"], focus["y"] + 28.0, focus["z"] - 40.0],
+        "target": [focus["x"], focus["y"], focus["z"]],
+    })
+    time.sleep(2)
+    screenshot(mcp, "worldmap-offline-01-spawn.png")
+    mcp.call_result("camera_set", {
+        "pos": [211.0, 420.0, -200.0],
+        "target": [211.0, 40.0, 200.0],
+    })
+    time.sleep(2)
+    screenshot(mcp, "worldmap-offline-02-overview.png")
+    return {
+        "map": status.get("map"),
+        "manifest": manifest,
+        "probe_delta_y": [round(sample["delta_y"], 3) for sample in ground_samples],
+        "buildings": status.get("created", 0),
+        "foliage": status.get("foliage_created", 0),
+        "water": status.get("water_created", 0),
+    }
+
+
+def wait_world_self(mcp, role_id, instance_id, timeout_s):
+    deadline = time.time() + timeout_s
+    last = None
+    while time.time() < deadline:
+        world = mcp.call_result("pw_session_world")
+        last = world
+        if world.get("error"):
+            raise RuntimeError("world stream error: {}".format(world["error"]))
+        self_state = world.get("self", {})
+        if (world.get("seq", 0) > 0 and self_state.get("roleId") == role_id and
+                self_state.get("instanceId") == instance_id):
+            return world
+        time.sleep(1)
+    raise RuntimeError("timed out waiting for attested world self; last={}".format(last))
+
+
+def wait_for_displacement(mcp, origin, direction_x, direction_z,
+                          minimum_distance, timeout_s):
+    deadline = time.time() + timeout_s
+    last = None
+    while time.time() < deadline:
+        world = mcp.call_result("pw_session_world")
+        last = world
+        if world.get("error"):
+            raise RuntimeError("world action error: {}".format(world["error"]))
+        position = world.get("self", {}).get("position", {})
+        if all(isinstance(position.get(axis), (int, float)) for axis in ("x", "y", "z")):
+            delta_x = position["x"] - origin["x"]
+            delta_z = position["z"] - origin["z"]
+            moved = (delta_x ** 2 + delta_z ** 2) ** 0.5
+            progress = delta_x * direction_x + delta_z * direction_z
+            if moved >= minimum_distance and progress > 0.0:
+                return world, moved
+        time.sleep(1)
+    raise RuntimeError("move_to never displaced the character by {:.2f}m; last={}".format(
+        minimum_distance, last))
+
+
+def run_worldmap(mcp):
+    """Enter a live instance-161 role and prove terrain-aligned movement."""
+    manifest = verify_world_map_manifest()
+    mcp.call_result("pw_session_ui", {"active": True})
+    wait_login_scene(mcp, WORLD_MAP_LOAD_TIMEOUT_S)
+    time.sleep(5)
+
+    mcp.call_result("pw_session_connect")
+    snap = wait_session_state(mcp, "character_select", 120)
+    candidates = [
+        role for role in snap.get("roles", [])
+        if role.get("role_id") == WORLD_MAP_ROLE_ID
+        and role.get("worldtag") == WORLD_MAP_INSTANCE_ID
+        and isinstance(role.get("role_id"), int)
+        and role.get("role_id") > 0
+        and not role.get("deleting", False)
+    ]
+    if not candidates:
+        available = [
+            {"role_id": role.get("role_id"), "worldtag": role.get("worldtag"),
+             "deleting": role.get("deleting", False)}
+            for role in snap.get("roles", [])
+        ]
+        raise RuntimeError("no enterable role for instance {}; available={}".format(
+            WORLD_MAP_INSTANCE_ID, available))
+    target = candidates[0]
+    role_id = target["role_id"]
+    mcp.call_result("pw_session_select", {"role_id": role_id})
+    selected = mcp.call_result("pw_session_status")
+    if selected.get("selectedRoleId") != role_id:
+        raise RuntimeError("selection mismatch: {} != {}".format(
+            selected.get("selectedRoleId"), role_id))
+    mcp.call_result("pw_session_enter")
+    snap = wait_session_state(mcp, "in_world", 120)
+    if snap.get("attestedRoleId") != role_id:
+        raise RuntimeError("attested role {} != selected {}".format(
+            snap.get("attestedRoleId"), role_id))
+    if snap.get("attestedInstanceId") != WORLD_MAP_INSTANCE_ID:
+        raise RuntimeError("attested instance {} != {}".format(
+            snap.get("attestedInstanceId"), WORLD_MAP_INSTANCE_ID))
+
+    status = wait_map_load(mcp, WORLD_MAP_SLUG, WORLD_MAP_LOAD_TIMEOUT_S)
+    if not status.get("terrain"):
+        raise RuntimeError("instance map load completed without terrain")
+
+    mcp.call_result("pw_session_world_action", {"action": "stop"})
+    time.sleep(2)
+    world = wait_world_self(mcp, role_id, WORLD_MAP_INSTANCE_ID, 60)
+    self0 = world["self"]["position"]
+    if not all(isinstance(self0.get(axis), (int, float)) for axis in ("x", "y", "z")):
+        raise RuntimeError("world self position is incomplete: {}".format(self0))
+    sample0 = probe_terrain_position(mcp, self0, "world self")
+    time.sleep(3)
+    screenshot(mcp, "worldmap-01-in-world.png")
+
+    direction = world["self"].get("direction", {})
+    direction_x = direction.get("x", 0.0)
+    direction_z = direction.get("z", 0.0)
+    horizontal_length = (direction_x ** 2 + direction_z ** 2) ** 0.5
+    if horizontal_length < 0.001:
+        direction_x, direction_z, horizontal_length = 1.0, 0.0, 1.0
+    direction_x /= horizontal_length
+    direction_z /= horizontal_length
+    target_x = self0["x"] + direction_x * WORLD_MAP_MOVE_DISTANCE_M
+    target_z = self0["z"] + direction_z * WORLD_MAP_MOVE_DISTANCE_M
+    mcp.call_result("pw_session_world_action", {
+        "action": "move_to",
+        "x": target_x,
+        "y": self0["y"],
+        "z": target_z,
+    })
+    world2, moved = wait_for_displacement(
+        mcp, self0, direction_x, direction_z, WORLD_MAP_MIN_DISPLACEMENT_M, 20)
+    pos1 = world2["self"]["position"]
+    sample1 = probe_terrain_position(mcp, pos1, "moved world self")
+    time.sleep(2)
+    screenshot(mcp, "worldmap-02-moved.png")
+
+    mcp.call_result("pw_session_disconnect")
+    wait_session_state(mcp, "idle", 30)
+    return {
+        "role": role_id,
+        "eligible_roles": len(candidates),
+        "instance": WORLD_MAP_INSTANCE_ID,
+        "map": status.get("map"),
+        "manifest": manifest,
+        "moved": round(moved, 2),
+        "probe_delta_y": round(sample0["delta_y"], 3),
+        "probe_delta_y_after_move": round(sample1["delta_y"], 3),
+        "entities": len(world2.get("entities", [])),
+    }
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "all"
-    if mode != "preview-offline":
+    if mode not in SUPPORTED_MODES:
+        print("unknown mode: {}; choose one of {}".format(mode, "|".join(SUPPORTED_MODES)))
+        return 1
+    if mode not in OFFLINE_MODES:
         for required in ("PW_ACCOUNT", "PW_PASSWORD", "PW_SERVER",
                          "PW_RUNTIME_CLIENT_EXE", "PW_RUNTIME_WORKING_DIRECTORY",
                          "UNRAVEL_PW_PROJECT"):
             if not os.environ.get(required):
                 print("missing env: {}".format(required))
                 return 1
-        SECRET_VALUES.append(os.environ["PW_PASSWORD"])
+        SECRET_VALUES.extend((os.environ["PW_ACCOUNT"], os.environ["PW_PASSWORD"],
+                              os.environ["PW_SERVER"]))
     else:
-        # Offline fake-sidecar run: no live server, dummy non-secret credentials.
+        # Offline modes need only converted project assets; preview-offline adds
+        # its fake sidecar below, while worldmap-offline starts no PW session.
         for required in ("UNRAVEL_PW_PROJECT",):
             if not os.environ.get(required):
                 print("missing env: {}".format(required))
                 return 1
-        os.environ.setdefault("PW_SERVER", "fake.local:29000")
+        if mode == "preview-offline":
+            os.environ.setdefault("PW_SERVER", "fake.local:29000")
+        SECRET_VALUES.extend(
+            os.environ[key] for key in ("PW_ACCOUNT", "PW_PASSWORD", "PW_SERVER")
+            if os.environ.get(key)
+        )
     os.makedirs(OUT_DIR, exist_ok=True)
 
     results = {}
     failures = 0
 
-    def one(name, account, password, fn, client_exe=None, workdir=None):
+    def one(name, account, password, fn, client_exe=None, workdir=None,
+            headless_editor=False):
         nonlocal failures
-        print("=== {} (account={})".format(name, account))
+        print("=== {}".format(name))
         # A stale editor from a previous run would own the control port and its
         # environment (credentials), silently hijacking this run.
         if wait_for_port(MCP_PORT, 2):
@@ -438,19 +750,21 @@ def main():
                 return
         # A hard-terminated editor leaves its headless client orphaned and still
         # logged in; a same-account relogin then races the stale server session.
-        effective_client_exe = client_exe or CLIENT_EXE
-        subprocess.run(["taskkill", "/IM", os.path.basename(effective_client_exe), "/F"],
-                       capture_output=True)
-        proc = launch_editor(account, password, client_exe, workdir)
+        effective_client_exe = None if headless_editor else (client_exe or CLIENT_EXE)
+        if effective_client_exe:
+            subprocess.run(["taskkill", "/IM", os.path.basename(effective_client_exe), "/F"],
+                           capture_output=True)
+        proc = (launch_editor_headless() if headless_editor
+                else launch_editor(account, password, client_exe, workdir))
         try:
             if not wait_for_port(MCP_PORT, 300):
                 raise RuntimeError("editor control port did not come up")
-            mcp = EditorMcp(MCP_PORT)
+            mcp = EditorMcp(MCP_PORT, timeout=MCP_CALL_TIMEOUT_S)
             try:
                 results[name] = fn(mcp)
-                save_transcript(mcp, "transcript-{}.json".format(name))
                 print("PASS {} -> {}".format(name, results[name]))
             finally:
+                save_transcript(mcp, "transcript-{}.json".format(name))
                 mcp.close()
         except Exception as exc:  # noqa: BLE001 - acceptance runner reports any failure
             failures += 1
@@ -478,6 +792,8 @@ def main():
         one("preview", os.environ["PW_ACCOUNT"], os.environ["PW_PASSWORD"], run_preview)
     if mode in ("world", "all"):
         one("world", os.environ["PW_ACCOUNT"], os.environ["PW_PASSWORD"], run_world)
+    if mode in ("worldmap",):
+        one("worldmap", os.environ["PW_ACCOUNT"], os.environ["PW_PASSWORD"], run_worldmap)
     if mode in ("preview-offline",):
         # WP5 visual gate without the live server: the editor's session stack
         # drives the fake sidecar (preview scenario), so the two fixture roles
@@ -506,6 +822,8 @@ def main():
                 client_exe=fake_exe, workdir=tmp)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+    if mode in ("worldmap-offline",):
+        one("worldmap-offline", None, None, run_worldmap_offline, headless_editor=True)
     if mode in ("wrong-password",):
         # NOTE: not part of "all" — the spw test authd accepts any password
         # (verified live 2026-08-14), so a wrong-password rejection can only be
@@ -517,18 +835,18 @@ def main():
         if not empty_account or not empty_password:
             print("SKIP empty-roles: set PW_ACCEPTANCE_ACCOUNT_EMPTY / PW_ACCEPTANCE_PASSWORD_EMPTY")
         else:
-            SECRET_VALUES.append(empty_password)
+            SECRET_VALUES.extend((empty_account, empty_password))
             one("empty-roles", empty_account, empty_password, run_empty_roles)
 
     leaks = sweep_leaks()
     if leaks:
         failures += 1
-        print("CREDENTIAL LEAK in artifacts: {}".format(leaks))
+        print("CREDENTIAL LEAK in artifacts: {}".format(redact(str(leaks))))
 
     summary = {"date": datetime.date.today().isoformat(), "results": results,
                "credential_leaks": len(leaks), "out": OUT_DIR}
     with open(os.path.join(OUT_DIR, "results.json"), "w", encoding="utf-8") as f:
-        json.dump(json.loads(redact(json.dumps(summary, indent=1))), f, indent=1)
+        json.dump(redact_value(summary), f, indent=1)
     print("SUMMARY: {}".format(redact(json.dumps(summary))))
     return 1 if failures else 0
 
