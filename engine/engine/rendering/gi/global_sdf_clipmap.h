@@ -174,6 +174,21 @@ public:
         return content_epoch_;
     }
 
+    /**
+     * @brief As @ref get_content_epoch, but advancing only when changed content actually
+     *        LANDS in a composed level - the edit-coalescing throttle and the per-update
+     *        budget both sit between the two.
+     *
+     * Consumers whose state derives from the COMPOSED field key on this one: the bounce
+     * vis-memo's verdicts are marched against the composed volume, so invalidating them on
+     * the target epoch during a drag re-marched every relight against a field that had not
+     * changed since the last recompose (~1.3 ms of pure loss per drag frame).
+     */
+    auto get_composed_content_epoch() const -> uint64_t
+    {
+        return composed_content_epoch_;
+    }
+
     struct level
     {
         ///< World-space minimum corner, snapped to a whole multiple of @ref voxel_size.
@@ -191,6 +206,19 @@ public:
         ///< re-snaps the finest level almost every frame, and a strictly finest-first policy
         ///< would then never recompose the coarse ones at all.
         uint32_t stale_updates = 0;
+        ///< The instance content revision this level was last composed under (0 = never).
+        uint64_t composed_revision = 0;
+        ///< SCROLL-ONLY recompose: set when the level was recomposed because its origin moved
+        ///< while the instance content revision held still. The composed value of a voxel is
+        ///< a function of its world centre and the instance set alone, and the origin moves
+        ///< by whole snap cells, so every voxel of the old window that lies in the new one
+        ///< holds exactly the byte a recompose would write: the GPU composer copies the
+        ///< overlap and composes only the exposed slabs (see compute_scroll_boxes). The CPU
+        ///< reference composer ignores it and recomposes in full.
+        bool scroll_only = false;
+        ///< The origin's move for a scroll-only recompose, in this level's voxels: the new
+        ///< window's voxel v holds what the old window held at v + scroll_shift.
+        math::ivec3 scroll_shift{0};
         ///< Attribute voxels at half the distance resolution (GI v2 plan 3.1), recomposed with
         ///< the level. RGBA8 packed (r,g,b = winning instance albedo, a = 255 where the voxel is
         ///< SURFACE - within GI_SURFACE_VOXEL_BAND attribute voxels of the composed isosurface -
@@ -241,10 +269,17 @@ public:
      *
      * @param instances Every resident field placement in the world, NOT only visible ones.
      * @param camera_position Centre of the cascade.
+     * @param instances_revision Monotonic revision of everything the level fingerprints can
+     *        depend on (surface_cache_system::get_content_revision). While it and a level's
+     *        target origin both hold still, that level's fingerprint is recalled from cache
+     *        instead of re-walking every instance - the walk ran for all four levels every
+     *        frame regardless of change. 0 means "unknown", which disables the cache and
+     *        keeps the old always-recompute behaviour.
      * @return The number of levels recomposed, for budgeting and diagnostics.
      */
-    auto update(const std::vector<global_sdf_instance>& instances, const math::vec3& camera_position)
-        -> uint32_t;
+    auto update(const std::vector<global_sdf_instance>& instances,
+                const math::vec3& camera_position,
+                uint64_t instances_revision = 0) -> uint32_t;
 
     /// Levels currently waiting to be recomposed, for diagnostics. Persistently non-zero means
     /// the budget is not keeping up with how fast the scene or the camera is changing.
@@ -321,10 +356,42 @@ public:
     /// World-space extent covered by a level.
     auto get_level_extent(uint32_t index) const -> float;
 
+    /// A box of one level's voxels: [min, min + size) per axis, in level voxel coordinates.
+    struct voxel_box
+    {
+        math::ivec3 min{0};
+        math::ivec3 size{0};
+    };
+
+    /**
+     * @brief The decomposition of a scroll-only recompose (see level::scroll_only).
+     *
+     * @param shift The origin's move in voxels (level::scroll_shift).
+     * @param resolution Voxels per axis.
+     * @param out_overlap The voxels the new window shares with the old one, in NEW window
+     *        coordinates; their source in the old window is min + shift.
+     * @param out_exposed The voxels the new window exposes, as up to three DISJOINT slabs (one
+     *        per moved axis, each trimmed to the ranges the earlier slabs did not cover) that
+     *        together with the overlap tile the whole window exactly.
+     * @return The number of exposed slabs; 0 when the shift is zero (nothing to do) or when
+     *         the windows do not overlap at all (a full recompose is the only option).
+     */
+    static auto compute_scroll_boxes(const math::ivec3& shift,
+                                     uint32_t resolution,
+                                     voxel_box& out_overlap,
+                                     std::array<voxel_box, 3>& out_exposed) -> uint32_t;
+
     /// Attribute voxels per axis: half the distance resolution. Halving is the memory/coverage
     /// point the plan's section 6 budget is computed at; the light voxels this feeds live at the
     /// same resolution.
     static constexpr uint32_t attr_downsample = 2;
+
+    /// Origin snap granularity, in ATTRIBUTE voxels. Must stay an integer so the toroidal
+    /// attribute/light-volume cell identity survives re-snaps; raising it trades a fraction of
+    /// guaranteed level coverage at the window edge (half a snap, absorbed by the cross-fade
+    /// and the next level) for proportionally fewer full recomposes while the camera moves -
+    /// at 1 the finest level recomposed every 0.25 m of travel.
+    static constexpr uint32_t origin_snap_attr_voxels = 8;
 
     auto get_attr_resolution() const -> uint32_t
     {
@@ -377,6 +444,13 @@ private:
                                    float reach,
                                    const std::vector<global_sdf_instance>& instances) const -> uint64_t;
 
+    /// One instance's contribution to a level fingerprint: placement, identity and material.
+    static auto compute_instance_entry_hash(const global_sdf_instance& instance) -> uint64_t;
+
+    /// Recomputes @ref instance_entry_hashes_ when the content revision moved (or is unknown).
+    void refresh_instance_entry_hashes(const std::vector<global_sdf_instance>& instances,
+                                       uint64_t instances_revision);
+
     settings settings_{};
     compose_stats last_compose_stats_{};
     std::array<level, level_count> levels_{};
@@ -385,6 +459,32 @@ private:
     /// reaches the level, which would re-fire the epoch every frame while a level waits.
     std::array<uint64_t, level_count> seen_fingerprints_{};
     uint64_t content_epoch_ = 0;
+    /// See get_composed_content_epoch - bumped in the compose pass when a level lands a
+    /// content_fingerprint it did not hold before.
+    uint64_t composed_content_epoch_ = 0;
+    /// The fingerprint cache update() recalls when neither the instances revision nor a
+    /// level's target origin moved. Revision 0 = nothing cached.
+    std::array<math::vec3, level_count> cached_target_origin_{};
+    std::array<uint64_t, level_count> cached_target_fingerprint_{};
+    uint64_t cached_instances_revision_ = 0;
+    /// Per-instance entry hashes (compute_instance_entry_hash) for the instance list of
+    /// @ref instance_entry_hash_revision_, parallel to that list; the level fingerprints sum
+    /// them instead of re-hashing every instance per level per frame. A non-sampleable
+    /// instance carries 0 and a cleared sampleable flag.
+    std::vector<uint64_t> instance_entry_hashes_;
+    std::vector<uint8_t> instance_entry_sampleable_;
+    uint64_t instance_entry_hash_revision_ = 0;
+    /// Edit coalescing (GI_CLIPMAP_EDIT_THROTTLE_FRAMES), LEADING-EDGE: the first edit after
+    /// a quiet stretch recomposes immediately (the pinned editor behaviour), and only a
+    /// CONTINUOUS stream of edits - a drag re-fingerprinting its levels every frame -
+    /// coalesces to one recompose per window. The pending diff persists either way, so the
+    /// final state lands within one window of the stream ending; origin re-snaps never
+    /// throttle. update_counter_ ticks once per update(); the arrays hold each level's last
+    /// recompose tick and last observed content change (signed, seeded to -window in init so
+    /// the very first edit reads as idle-started).
+    int64_t update_counter_ = 0;
+    std::array<int64_t, level_count> last_compose_counter_{};
+    std::array<int64_t, level_count> last_content_seen_{};
     /// One bit per level, set when that level's voxels were rewritten and the GPU mirror is
     /// therefore stale. Cleared by the owner once it has uploaded.
     uint32_t dirty_levels_ = 0;

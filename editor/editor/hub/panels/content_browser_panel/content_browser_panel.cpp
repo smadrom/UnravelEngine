@@ -53,6 +53,7 @@
 #include <imgui_widgets/imcoolbar.h>
 #include <logging/logging.h>
 #include <subprocess/subprocess.hpp>
+#include <editor/hub/panels/inspector_panel/inspectors/inspectors.h>
 
 namespace unravel
 {
@@ -225,7 +226,46 @@ void process_drag_drop_target(const fs::path& absolute_path)
 
                                 auto& am = ctx.get_cached<asset_manager>();
                                 auto key = fs::convert_to_protocol(prefab_path);
-                                dropped.get_or_emplace<prefab_component>().source = am.get_asset<prefab>(key.generic_string());
+
+                                // The entity may already be an instance of a different prefab.
+                                // Its old bookkeeping is keyed by uids that also exist in the
+                                // file just written (prefab uids survive the save), so keeping
+                                // it would suppress those properties from the new asset on
+                                // every resync - and a stale instance_id would claim a slot in
+                                // a document that never wrote this instance. Becoming the
+                                // source of a new prefab leaves nothing overridden by
+                                // definition.
+                                //
+                                // Reset field by field, not replaced: emplace_or_replace on an
+                                // existing component takes entt's patch path, which assigns a
+                                // default-constructed component over the live one - owner
+                                // handle included - and fires only on_update, so the owner
+                                // never gets re-stamped. That null owner surfaced as a crash
+                                // in the inspector's Apply All. And not removed-and-re-added
+                                // either: the on_destroy hook strips prefab ids from the whole
+                                // subtree.
+                                // A nested instance saved as its own prefab is no longer its
+                                // container's slot: the container's document would put the old
+                                // instance back there on its next replay. The slot is stated
+                                // removed on the container, and the new instance is the user's.
+                                if(const auto* old_prefab = dropped.try_get<prefab_component>();
+                                   old_prefab != nullptr && !old_prefab->instance_id.is_nil())
+                                {
+                                    const auto* trans = dropped.try_get<transform_component>();
+                                    auto container = trans != nullptr
+                                                         ? prefab_override_context::find_prefab_root_entity(trans->get_parent())
+                                                         : entt::handle{};
+                                    if(auto* container_prefab = container ? container.try_get<prefab_component>() : nullptr)
+                                    {
+                                        container_prefab->remove_instance(old_prefab->instance_id);
+                                        container_prefab->changed = true;
+                                    }
+                                }
+                                auto& prefab_comp = dropped.get_or_emplace<prefab_component>();
+                                prefab_comp.clear_overrides();
+                                prefab_comp.instance_id = {};
+                                prefab_comp.instance_document = {};
+                                prefab_comp.source = am.get_asset<prefab>(key.generic_string());
                             };
 
 

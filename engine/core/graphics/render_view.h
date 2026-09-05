@@ -15,15 +15,54 @@ namespace gfx
 class render_view
 {
 public:
-    auto fbo_get_or_emplace(const hpp::string_view& id) -> frame_buffer::ptr&;
+    /// Frames an entry may go unaccessed before release_unused() drops it. Generous on
+    /// purpose: a feature in use touches its entries every frame, so only targets of a
+    /// disabled or idle feature ever reach the window.
+    static constexpr uint32_t default_max_idle_frames = 240;
+
+    /**
+     * @brief Returns the (possibly null) entry slot for @p id, creating it when absent.
+     *
+     * @param auto_collect Whether release_unused() may drop the entry once it goes
+     * unaccessed for the idle window (the default). Pass false for resources whose
+     * absence their consumers cannot detect or regenerate -- a reflection probe's
+     * product cubemaps go unaccessed for as long as the probe is frustum-culled, and
+     * the bake bookkeeping would not know to rebuild them. The flag is part of the
+     * entry's description and is applied on every call: owning call sites for a key
+     * must agree on it, the same way they must agree on size and format.
+     */
+    auto fbo_get_or_emplace(const hpp::string_view& id, bool auto_collect = true) -> frame_buffer::ptr&;
     auto fbo_get(const hpp::string_view& id) const -> const frame_buffer::ptr&;
     auto fbo_safe_get(const hpp::string_view& id) const -> const frame_buffer::ptr&;
     void fbo_remove(const hpp::string_view& id);
 
-    auto tex_get_or_emplace(const hpp::string_view& id) -> texture::ptr&;
+    /// @copydoc fbo_get_or_emplace
+    auto tex_get_or_emplace(const hpp::string_view& id, bool auto_collect = true) -> texture::ptr&;
     auto tex_get(const hpp::string_view& id) const -> const texture::ptr&;
     auto tex_safe_get(const hpp::string_view& id) const -> const texture::ptr&;
     void tex_remove(const hpp::string_view& id);
+
+    /**
+     * @brief Drops every texture/framebuffer entry that has not been accessed for
+     * @p max_idle_frames, releasing the GPU resources with it.
+     *
+     * Every accessor above counts as an access, the const gets included, and using a
+     * framebuffer counts as using its attachment textures: a texture entry referenced
+     * by a live fbo inherits that fbo entry's stamp, so a texture reached only through
+     * its fbo (created once, attached, then always bound via the fbo) ages IN LOCKSTEP
+     * with the fbo and the pair expires in the same call. It can neither die before
+     * the fbo -- which would not free it (the fbo's strong attachment reference keeps
+     * it alive) but WOULD desync the name, handing the next get_or_emplace a second
+     * texture while the fbo still renders into the old one -- nor outlive it, which
+     * would open a window where a creation site keyed on the texture's validity finds
+     * a healthy texture next to a null fbo slot and hands its caller the null.
+     *
+     * Entries created with auto_collect = false are never dropped here, and their fbo
+     * attachments stay permanently refreshed. The OWNER of the view decides whether
+     * and when to call this (typically its component's per-frame update): lifetime is
+     * a per-view concern.
+     */
+    void release_unused(uint32_t current_frame, uint32_t max_idle_frames = default_max_idle_frames);
 
     auto data_get_or_emplace(const hpp::string_view& id, uint32_t default_val = 0) -> uint32_t&;
     auto data_get(const hpp::string_view& id, uint32_t default_val = 0) const -> uint32_t;
@@ -51,8 +90,19 @@ public:
     }
 
 private:
-    std::map<std::string, texture::ptr, std::less<>> textures_;
-    std::map<std::string, frame_buffer::ptr, std::less<>> fbos_;
+    template<typename T>
+    struct slot
+    {
+        T ptr{};
+        /// Mutable: the const gets are logically reads of the resource and must still
+        /// count as an access for release_unused().
+        mutable uint32_t last_used_frame{0};
+        /// Whether release_unused() may drop this entry once it idles past the window.
+        bool auto_collect{true};
+    };
+
+    std::map<std::string, slot<texture::ptr>, std::less<>> textures_;
+    std::map<std::string, slot<frame_buffer::ptr>, std::less<>> fbos_;
     /// Backs both the uint32_t accessors above and @ref data. The scalar pair is kept because it
     /// reads better at its call sites than a templated get would.
     rtti::named_context data_;

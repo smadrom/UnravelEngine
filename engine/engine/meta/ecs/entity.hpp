@@ -1,4 +1,5 @@
 #pragma once
+#include "entt/entity/fwd.hpp"
 #include <engine/assets/asset_handle.h>
 #include <engine/ecs/scene.h>
 
@@ -6,6 +7,8 @@
 #include <serialization/serialization.h>
 
 #include <string_view>
+
+#include <engine/ecs/components/prefab_component.h>
 
 namespace unravel
 {
@@ -48,6 +51,37 @@ struct save_context
     clone_mode_t clone_mode{};
     bool to_prefab{};
     entt::const_handle save_source{};
+
+    /**
+     * @brief Marks the document as one whose nested prefab instances are already current.
+     *
+     * Set by the deploy bake, which resolves every nested instance against its own asset
+     * before writing. A loader seeing the marker can skip that work, because it has been
+     * done - see load_context::nesting_resolved.
+     *
+     * Deliberately a property of the *document*, not of the running mode: keying it on
+     * "is this a deployed build" would give two paths whose results differ only when the
+     * bake is stale, which is the failure that never shows up until it ships.
+     */
+    bool nesting_resolved{};
+
+    /**
+     * @brief The asset uid of the prefab file being written, for a prefab save.
+     *
+     * What the ids issued by this save name as their document. Nil for a scene or a clone
+     * stream - neither issues ids - and for a prefab written without knowing which asset it
+     * is, in which case ids are issued unnamed and attributed on load like a legacy file's.
+     */
+    hpp::uuid document_uid{};
+};
+
+/// What a prefab_component record in the released format carried: a flat override set and
+/// the removed entities of one instance, all of it the scene's. Kept aside by the loader and
+/// converted once the document has loaded (convert_legacy_override_state).
+struct legacy_override_state
+{
+    std::set<prefab_property_override_data> property_overrides;
+    std::set<hpp::uuid> removed_entities;
 };
 
 struct load_context
@@ -62,15 +96,69 @@ struct load_context
         return clone_mode != clone_mode_t::none;
     }
 
+    /// Whether records are currently being applied over an existing prefab instance,
+    /// i.e. matched by prefab uid rather than creating fresh entities.
     auto is_updating_prefab() const -> bool
     {
-        return !mapping_by_prefab_uid.empty();
+        const auto* frame = current_instance();
+        return frame != nullptr && !frame->mapping_by_prefab_uid.empty();
     }
-
 
     std::vector<entity_data<entt::handle>> entities;
     clone_mode_t clone_mode{};
     entt::registry* reg{};
+
+    /// True when the document being read declared its nested instances already resolved.
+    /// Read before the context is popped; see load_from_prefab.
+    bool nesting_resolved{};
+
+    /// Set only while an entity *record*'s header is being resolved, as opposed to an
+    /// entity link. Both go through the same resolver, but only a record means "the asset
+    /// still contains this entity" - a link merely refers to one, and a parent's children
+    /// list refers to every child it has.
+    bool resolving_record{};
+
+    /// The asset being loaded, when it is a prefab. What a record's own statement about a
+    /// nested instance is keyed by, and what a nested instance's placement is attributed to.
+    hpp::uuid document_uid{};
+
+    /// Set by any record whose prefab id did not name its document - the released format.
+    /// The loader then runs qualify_legacy_prefab_ids over what it loaded.
+    bool saw_unqualified_ids{};
+
+    /// The statements of the prefab document being loaded - what it states about the content
+    /// it nests - read before its records, so the filter can ask "does this document state
+    /// it" while they load. Assigned to the loaded root's from_document afterwards, wholesale.
+    prefab_statements document_statements;
+    bool has_document_statements{};
+
+    /// Override and removal state from records in the released format, keyed by the instance
+    /// root that carried them. Converted once the document has loaded
+    /// (convert_legacy_override_state).
+    std::map<entt::entity, legacy_override_state> legacy_overrides;
+
+    /// Set while a record resolves into a nested scope and lands on an entity whose prefab id
+    /// names the document being loaded: content this document introduced inside a nested
+    /// instance. Its record is content, not a statement about the nested asset - applied
+    /// unless something stated here or above keeps it. Promoted to `current` for the record's
+    /// components, like the nested owner.
+    bool pending_record_is_own_content{};
+    bool current_record_is_own_content{};
+
+    /**
+     * @brief The nested instance whose contents are currently being read, if any.
+     *
+     * A containing document stores a full snapshot of what it nests, but only the part it
+     * *overrides* is its own authoring - the rest is the nested asset's, and arrives from
+     * there. Replaying the whole snapshot over a live instance would revert every edit made
+     * to it here, so the instance's override set decides what is allowed through.
+     *
+     * `pending` is set while a record's header resolves and promoted to `current` for the
+     * duration of its components, since only the header knows which instance it belongs to.
+     */
+    entt::handle pending_nested_owner{};
+    entt::handle current_nested_owner{};
+
 
     // The ids are not globally unique, so we need to map them to the handles
     std::map<entt::entity, entt::handle> mapping_by_eid;
@@ -81,12 +169,122 @@ struct load_context
     struct prefab_uid_mapping_t
     {
         entt::handle handle;
-        bool consumed{};
+
+        /// How many records addressed this prefab uid. Counted only for records, not links: a
+        /// parent's children list refers to every child it has, and counting those would make
+        /// the asset look like it still contains an entity it dropped.
+        size_t consumed_count{};
+
+        auto consumed() const -> bool
+        {
+            return consumed_count > 0;
+        }
     };
 
-    // The uids are globally unique, so we can use them to map the entities
-    std::map<hpp::uuid, prefab_uid_mapping_t> mapping_by_prefab_uid;
+    /**
+     * @brief Per-instance state for a prefab being loaded over.
+     *
+     * Prefab uids are unique only *within* one prefab asset, so two instances of the same
+     * asset in a single scene carry identical uids. A flat map cannot hold both - the
+     * second instance's entities would resolve to the first instance's handles. Scoping
+     * the map to the instance being loaded is what makes the identity well-defined.
+     *
+     * Nothing pushes more than one frame today; nested prefabs are what will
+     * (tasks/nested_prefabs_design.md). The scoping is separated out first because it is
+     * the part that has to be correct before anything can nest.
+     */
+    struct instance_frame
+    {
+        std::map<hpp::uuid, prefab_uid_mapping_t> mapping_by_prefab_uid;
 
+        /**
+         * @brief One live nested instance, addressable by the document that contains it.
+         *
+         * Its contents are keyed by prefab uid, which is unique inside the nested asset -
+         * ambiguous across the whole load, but not within one instance. Scoping is what
+         * makes a containing document able to say "this property, of this entity, of *this*
+         * instance" and have it land.
+         */
+        struct nested_scope
+        {
+            entt::handle root;
+
+            /// Entities of this instance. A null handle is one the instance removed, kept so
+            /// the document's record for it is skipped rather than resurrecting it.
+            std::map<hpp::uuid, entt::handle> by_prefab_uid;
+
+            /// The document addressed this instance, so it still contains it.
+            bool consumed{};
+        };
+
+        /// Keyed by the chain of instance ids leading to it. A chain, not one id, because at
+        /// depth the id repeats: a prefab holding two instances of B holds two instances of
+        /// whatever B nests, and those carry the same id.
+        std::map<std::vector<hpp::uuid>, nested_scope> nested_scopes;
+
+        /// Nested instances deleted here, by the same chain. There is no scope for one - it
+        /// is gone - so without this the document's record for it simply creates it again,
+        /// which is what a deletion looks like from the document's side.
+        std::set<std::vector<hpp::uuid>> removed_instance_paths;
+
+        /// Every removal stated about content under the instance being loaded over - here, by
+        /// the documents above it, and by its own document's previous statements - relative to
+        /// it. What the mapping consults so a document's record for a removed entity or
+        /// instance is skipped rather than bringing it back.
+        prefab_statements removals;
+
+        /// The instance being loaded over, when there is one.
+        entt::handle root;
+    };
+
+    /// Innermost instance being loaded over, or nullptr when entities are being created
+    /// rather than matched - a plain scene load, or a fresh instantiate.
+    auto current_instance() -> instance_frame*
+    {
+        return instance_stack.empty() ? nullptr : &instance_stack.back();
+    }
+    auto current_instance() const -> const instance_frame*
+    {
+        return instance_stack.empty() ? nullptr : &instance_stack.back();
+    }
+
+    std::vector<instance_frame> instance_stack;
+};
+
+/**
+ * @brief While alive, a replay does not cascade into the instances nested in what it loads.
+ *
+ * sync_prefab_instance holds one around its own load and cascades itself afterwards, once the
+ * removals stated about the nested content are re-applied; a caller holding one above that
+ * gets a replay of one document only - what it states about nested content applied, nothing
+ * of the nested documents' own. Thread-local, nested-safe.
+ */
+struct scoped_deferred_nested_sync
+{
+    scoped_deferred_nested_sync();
+    ~scoped_deferred_nested_sync();
+
+    scoped_deferred_nested_sync(const scoped_deferred_nested_sync&) = delete;
+    auto operator=(const scoped_deferred_nested_sync&) -> scoped_deferred_nested_sync& = delete;
+
+private:
+    bool previous_{};
+};
+
+/**
+ * @brief Scopes one prefab instance's uid mapping for the duration of a load.
+ *
+ * Requires an active load context. Nested-safe.
+ */
+struct scoped_instance_frame
+{
+    scoped_instance_frame();
+    ~scoped_instance_frame();
+
+    scoped_instance_frame(const scoped_instance_frame&) = delete;
+    scoped_instance_frame(scoped_instance_frame&&) = delete;
+    auto operator=(const scoped_instance_frame&) -> scoped_instance_frame& = delete;
+    auto operator=(scoped_instance_frame&&) -> scoped_instance_frame& = delete;
 };
 
 struct post_load_callbacks
@@ -100,10 +298,14 @@ auto get_post_load_callbacks() -> const post_load_callbacks*;
 auto push_load_context(entt::registry& registry) -> bool;
 void pop_load_context(bool push_result);
 auto get_load_context() -> load_context&;
+/// The active load context, or nullptr outside a load.
+auto try_get_load_context() -> load_context*;
 
 auto push_save_context() -> bool;
 void pop_save_context(bool push_result);
 auto get_save_context() -> save_context&;
+/// The active save context, or nullptr outside a save.
+auto try_get_save_context() -> save_context*;
 
 template<typename T>
 concept HasCharAndTraits = requires {
@@ -132,6 +334,9 @@ auto atomic_save_to_file(const fs::path& key, entt::const_handle obj) -> bool;
 auto atomic_save_to_file(const fs::path& key, entt::handle obj) -> bool;
 } // namespace asset_writer
 
+void load_from_view(std::string_view view, entt::registry& obj);
+void load_from_stream(std::istream& stream, entt::registry& obj);
+
 void load_from_view(std::string_view view, entt::handle& obj);
 void load_from_stream(std::istream& stream, entt::handle& obj);
 void load_from_file(const std::string& absolute_path, entt::handle& obj);
@@ -141,6 +346,79 @@ void load_from_file_bin(const std::string& absolute_path, entt::handle& obj);
 auto load_from_prefab_out(const asset_handle<prefab>& pfb,
                           entt::registry& registry,
                           entt::handle& obj) -> bool;
+
+/**
+ * @brief Reloads an instance from its prefab asset, keeping what belongs to the instance.
+ *
+ * Its local position and rotation are preserved unconditionally - those are per-placement
+ * and treated as implicit overrides - as is its parent. Everything else follows the asset
+ * except properties recorded in the instance's `property_overrides`.
+ *
+ * Scale and skew deliberately follow the asset unless explicitly overridden; see
+ * tasks/lessons.md before "fixing" that asymmetry.
+ *
+ * @return false if the handle is not an instance, has no source asset, or the expansion was
+ *         refused because the asset is already being expanded further up (a nesting cycle).
+ */
+auto sync_prefab_instance(entt::handle instance) -> bool;
+
+/**
+ * @brief Syncs every prefab instance nested inside a subtree against its own asset.
+ *
+ * Does not descend past an instance root - each instance's own sync handles what is nested
+ * inside it, so the recursion happens through sync_prefab_instance rather than here.
+ */
+auto sync_nested_prefab_instances(entt::handle root) -> size_t;
+
+/**
+ * @brief Syncs every prefab instance in a registry against its own asset.
+ *
+ * Unlike sync_nested_prefab_instances this includes instances that are themselves scene
+ * roots, which is the difference between a scene and a single-rooted prefab.
+ *
+ * Each instance's sync cascades into whatever is nested inside it, so this walks only the
+ * top level.
+ */
+auto sync_all_prefab_instances(entt::registry& registry) -> size_t;
+
+/**
+ * @brief The chain of slots from one instance root down to another, outermost first.
+ * @return False when inner is not under outer, or an unnamed instance lies between them - in
+ *         which case nothing above can address inner.
+ */
+auto instance_path_between(entt::handle outer_root, entt::handle inner_root, std::vector<hpp::uuid>& out) -> bool;
+
+/// What is stated about one instance's own direct content, and by whom.
+struct statements_about_instance
+{
+    /// By the documents above it: each containing document's from_document, seen from here.
+    prefab_statements stated;
+    /// Here: the instance's own local list, plus an authoring root's adopted list above it.
+    prefab_statements local;
+};
+auto collect_statements_about(entt::handle root) -> statements_about_instance;
+
+/// Everything a replay over `root` has to respect, relative to root and at every depth below
+/// it: what outer documents state (stated), and what was stated here - root's local list, the
+/// local list of every named instance nested in it, an authoring root's adopted list above.
+struct replay_statements
+{
+    prefab_statements stated;
+    prefab_statements local;
+};
+auto collect_replay_statements(entt::handle root) -> replay_statements;
+
+/// A document's list as written into its file: its root's from_document, what the root's
+/// local list states about nested content, and every nested root's local list, re-rooted.
+auto fold_document_statements(entt::handle root) -> prefab_statements;
+
+/// Clears the local list of every named instance nested under root (root's own is kept).
+void clear_local_statements_below(entt::handle root);
+
+/// Hands root's document statements (from_document, and the nested part of its local list) to
+/// the nearest roots they are about, as those roots' local lists, and clears them on root. For
+/// an instance about to lose its link: what its document stated becomes what this scene states.
+void re_home_document_statements(entt::handle root);
 
 auto load_from_prefab(const asset_handle<prefab>& pfb, entt::registry& registry) -> entt::handle;
 auto load_from_prefab_bin(const asset_handle<prefab>& pfb, entt::registry& registry) -> entt::handle;
@@ -178,6 +456,7 @@ void load_from(Stream& stream, T& scn)
         load_from_stream(stream, scn);
     }
 }
+
 } // namespace unravel
 
 namespace ser20

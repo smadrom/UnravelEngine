@@ -51,6 +51,11 @@ public:
         reflection_probe = 1u << 3,
         atmospheric = 1u << 5,
         particles_pass = 1u << 6,
+        /// Velocity (motion vector) buffer production - UNCONDITIONAL for camera runs (a
+        /// standing frame resource, like depth). Camera runs use the default full mask so
+        /// this is on by default; probe captures build pflags from 0 and never set it, and
+        /// clearing the bit is the opt-out for custom callers.
+        velocity_pass = 1u << 7,
 
         full = 0xFFFFFFFFu,
     };
@@ -67,6 +72,20 @@ public:
                            const camera& camera,
                            gfx::render_view& rview,
                            delta_t dt);
+
+    /// Produces the per-pixel velocity (motion vector) buffer ("VELOCITY", RG16F, uv delta
+    /// uv_curr - uv_prev): a fullscreen camera-motion pass reconstructed from depth, then the
+    /// movers (has_motion models) drawn over it with true per-object motion, depth-tested
+    /// EQUAL against the shared G-buffer depth. Removes the buffer when inactive.
+    void run_velocity_pass(const visibility_set_models_t& visibility_set,
+                           const camera& camera,
+                           gfx::render_view& rview);
+
+    /// Renders the VELOCITY buffer visualization (debug view @c debug_pass_velocity):
+    /// hue = direction, brightness = magnitude, magenta = NaN.
+    void run_velocity_debug_pass(const camera& camera,
+                                 gfx::render_view& rview,
+                                 const gfx::frame_buffer::ptr& output);
 
     void run_assao_pass(const camera& camera,
                         gfx::render_view& rview,
@@ -86,6 +105,9 @@ public:
                                const camera& camera,
                                gfx::render_view& rview,
                                delta_t dt) -> gfx::frame_buffer::ptr;
+
+    /// Renders the cloud shadow map for this run into cloud_shadow_ (before the lighting passes).
+    void run_cloud_shadow_pass(scene& scn, const camera& camera, gfx::render_view& rview);
 
     void run_ssr_pass(const camera& camera, gfx::render_view& rview, const run_params& rparams);
 
@@ -133,6 +155,10 @@ public:
     static constexpr int debug_pass_sdf_sun_tiers = 26;
     static constexpr int debug_pass_sdf_probe_sky = 27;
     static constexpr int debug_pass_sdf_vis_memo = 28;
+    /// Velocity buffer visualization. Not part of the SDF band: dispatched by an exact match
+    /// BEFORE the >= debug_pass_sdf_normals check. Selecting it forces velocity production
+    /// for camera runs even when no other consumer (TAA) is active.
+    static constexpr int debug_pass_velocity = 29;
     void run_sdf_debug_pass(const camera& camera,
                             gfx::render_view& rview,
                             const run_params& rparams,
@@ -161,7 +187,8 @@ public:
     void run_gi_world_probe_pass(const camera& camera,
                                  gfx::render_view& rview,
                                  surface_cache_system& surface_cache,
-                                 surface_cache_view& view_cache);
+                                 surface_cache_view& view_cache,
+                                 const gi_settings& gi);
 
     /// World-space specular tier into RBUFFER, layered UNDER SSR. No-op unless a
     /// camera run with GI reflections enabled.
@@ -282,6 +309,50 @@ private:
     geom_program geom_program_skinned_;
     geom_program geom_program_instanced_;
 
+    struct velocity_geom_program : uniforms_cache
+    {
+        void cache_uniforms()
+        {
+            cache_uniform(program.get(), u_prev_view_proj, "u_prev_view_proj", gfx::uniform_type::Mat4);
+        }
+
+        gfx::program::uniform_ptr u_prev_view_proj;
+
+        std::unique_ptr<gpu_program> program;
+    };
+
+    velocity_geom_program velocity_program_;
+    velocity_geom_program velocity_program_skinned_;
+    velocity_geom_program velocity_program_instanced_;
+
+    struct velocity_camera_program : uniforms_cache
+    {
+        void cache_uniforms()
+        {
+            cache_uniform(program.get(), s_depth, "s_depth", gfx::uniform_type::Sampler);
+            cache_uniform(program.get(), u_prev_view_proj, "u_prev_view_proj", gfx::uniform_type::Mat4);
+        }
+
+        gfx::program::uniform_ptr s_depth;
+        gfx::program::uniform_ptr u_prev_view_proj;
+
+        std::unique_ptr<gpu_program> program;
+    } velocity_camera_program_;
+
+    struct velocity_debug_program : uniforms_cache
+    {
+        void cache_uniforms()
+        {
+            cache_uniform(program.get(), s_velocity, "s_velocity", gfx::uniform_type::Sampler);
+            cache_uniform(program.get(), u_params, "u_params", gfx::uniform_type::Vec4);
+        }
+
+        gfx::program::uniform_ptr s_velocity;
+        gfx::program::uniform_ptr u_params;
+
+        std::unique_ptr<gpu_program> program;
+    } velocity_debug_program_;
+
     struct color_lighting : uniforms_cache
     {
         void cache_uniforms()
@@ -292,6 +363,8 @@ private:
             cache_uniform(program.get(), u_contact_shadow, "u_contact_shadow", gfx::uniform_type::Vec4);
             cache_uniform(program.get(), u_light_color_intensity, "u_light_color_intensity", gfx::uniform_type::Vec4);
             cache_uniform(program.get(), u_camera_position, "u_camera_position", gfx::uniform_type::Vec4);
+            cache_uniform(program.get(), u_cloudShadow, "u_cloudShadow", gfx::uniform_type::Vec4);
+            cache_uniform(program.get(), u_cloudShadow2, "u_cloudShadow2", gfx::uniform_type::Vec4);
 
             cache_uniform(program.get(), s_tex[0], "s_tex0", gfx::uniform_type::Sampler);
             cache_uniform(program.get(), s_tex[1], "s_tex1", gfx::uniform_type::Sampler);
@@ -300,6 +373,7 @@ private:
             cache_uniform(program.get(), s_tex[4], "s_tex4", gfx::uniform_type::Sampler);
             cache_uniform(program.get(), s_tex[5], "s_tex5", gfx::uniform_type::Sampler);
             cache_uniform(program.get(), s_tex[6], "s_tex6", gfx::uniform_type::Sampler);
+            cache_uniform(program.get(), s_cloudShadow, "s_cloudShadow", gfx::uniform_type::Sampler);
         }
         gfx::program::uniform_ptr u_light_position;
         gfx::program::uniform_ptr u_light_direction;
@@ -307,7 +381,10 @@ private:
         gfx::program::uniform_ptr u_contact_shadow;
         gfx::program::uniform_ptr u_light_color_intensity;
         gfx::program::uniform_ptr u_camera_position;
+        gfx::program::uniform_ptr u_cloudShadow;
+        gfx::program::uniform_ptr u_cloudShadow2;
         std::array<gfx::program::uniform_ptr, 7> s_tex;
+        gfx::program::uniform_ptr s_cloudShadow;
 
         std::shared_ptr<gpu_program> program;
     };
@@ -324,6 +401,7 @@ private:
             cache_uniform(program.get(), u_exposition, "u_exposition", gfx::uniform_type::Vec4);
             cache_uniform(program.get(), u_perez_coeff, "u_perez_coeff", gfx::uniform_type::Vec4, 5);
             cache_uniform(program.get(), s_env, "s_env", gfx::uniform_type::Sampler);
+            cache_uniform(program.get(), s_cloudShadow, "s_cloudShadow", gfx::uniform_type::Sampler);
         }
         gfx::program::uniform_ptr u_mode;
         gfx::program::uniform_ptr u_irradiance_tint_intensity;
@@ -333,9 +411,14 @@ private:
         gfx::program::uniform_ptr u_exposition;
         gfx::program::uniform_ptr u_perez_coeff;
         gfx::program::uniform_ptr s_env;
+        gfx::program::uniform_ptr s_cloudShadow;
 
         std::unique_ptr<gpu_program> program;
     } irradiance_compute_program_;
+
+    /// Cloud shadow map of the current run (rendered before the lighting passes, consumed by
+    /// the directional light and the irradiance bake).
+    atmospheric_pass_perez::cloud_shadow_result cloud_shadow_{};
 
     struct indirect_lighting_program : uniforms_cache
     {
@@ -398,6 +481,10 @@ private:
     auto get_light_program_no_shadows(const light& l) const -> const color_lighting&;
     void submit_pbr_material(geom_program& program, const pbr_material& mat);
     void submit_batched_geometry(gfx::render_pass& pass, const camera& camera);
+    /// Velocity for batched movers: draws the mover instances of this frame's prepared
+    /// batches (instance stream doubled with the previous world matrix) into the velocity
+    /// target, depth-tested EQUAL. Batches without movers cost nothing.
+    void submit_batched_velocity(gfx::render_pass& pass, const math::transform& prev_vp);
 
     color_lighting color_lighting_[uint8_t(light_type::count)][uint8_t(sm_depth::count)][uint8_t(sm_impl::count)];
     color_lighting color_lighting_no_shadow_[uint8_t(light_type::count)];
@@ -417,10 +504,22 @@ private:
     /// next frame's SSR trace and GI far-field. Deliberately pre-bloom/tonemap/UI: the old
     /// source (final OBUFFER) fed display-encoded values back into linear lighting, which
     /// with free-floating auto exposure formed a brightness feedback loop in dark scenes.
-    void snapshot_prev_scene_color(gfx::render_view& rview, const gfx::frame_buffer::ptr& source);
+    void snapshot_prev_scene_color(gfx::render_view& rview,
+                                   const gfx::frame_buffer::ptr& source,
+                                   const camera& camera);
 
     std::shared_ptr<int> sentinel_ = std::make_shared<int>(0);
     int debug_pass_{-1};
+    /// Velocity buffer production is active for the CURRENT run (camera run + velocity_pass
+    /// step bit + a consumer). Set per run in run_pipeline_impl; also excludes movers from
+    /// static-mesh batching so their G-buffer depth matches the velocity pass raster (EQUAL).
+    bool velocity_run_active_{false};
+    /// Render frame of the last velocity pass that drew ANY mover (individual or batched),
+    /// stamped inside run_velocity_pass's own visibility walk - the CPU-side signal for the
+    /// GI reflection temporal's mover gate, held one temporal window by the consumer.
+    /// Riding the owning pass's loop keeps the signal exactly as covered as the buffer it
+    /// describes (off-screen movers are accepted as uncovered by design - no registry scan).
+    uint64_t velocity_movers_frame_{~0ull};
     /// Rotation phase of the light-voxel update (GI_LIGHT_VOXEL_UPDATE_DENOM slices).
     uint32_t light_voxel_frame_{0};
 

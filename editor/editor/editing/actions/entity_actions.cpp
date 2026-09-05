@@ -29,6 +29,11 @@ auto restore_root_from_serialized_subtree(entt::registry& registry, std::string_
     {
         return {};
     }
+    // Scratch entity for deserialization. Gameplay never sees it, so its teardown must
+    // not announce anything - but it still goes through the funnel, so a partially
+    // loaded subtree under it is disposed of the same way as any other.
+    scene::scoped_destroy_suppression no_announce;
+
     entt::entity stub = registry.create();
     entt::handle handle(registry, stub);
     try
@@ -37,18 +42,18 @@ auto restore_root_from_serialized_subtree(entt::registry& registry, std::string_
     }
     catch(const std::exception&)
     {
-        registry.destroy(stub);
+        scene::destroy_entity(entt::handle(registry, stub));
         return {};
     }
     if(handle)
     {
         if(handle.entity() != stub)
         {
-            registry.destroy(stub);
+            scene::destroy_entity(entt::handle(registry, stub));
         }
         return handle;
     }
-    registry.destroy(stub);
+    scene::destroy_entity(entt::handle(registry, stub));
     return {};
 }
 
@@ -157,7 +162,11 @@ void create_entities_action_t::do_action()
             }
 
             std::stringstream ss;
-            save_to_stream(ss, static_cast<entt::const_handle>(root));
+            {
+                // Undo snapshot: replayed by this process and never shown to anyone.
+                serialization::scoped_output_format compact(serialization::output_format::compact);
+                save_to_stream(ss, static_cast<entt::const_handle>(root));
+            }
             serialized_roots.emplace_back(ss.str());
             root_entities.emplace_back(entt::make_uhandle(root));
             parent_entities.emplace_back(parent_uh);
@@ -207,6 +216,13 @@ void create_entities_action_t::do_action()
         {
             tr->set_parent(desired_parent, false);
         }
+
+        // After reparenting, because the record names the instance that contained it and that
+        // is only knowable once the entity is back where it was.
+        if(i < removal_records.size())
+        {
+            prefab_override_context::restore_entity_removal(removal_records[i]);
+        }
     }
 }
 
@@ -219,6 +235,8 @@ void create_entities_action_t::undo_action()
 
     auto& ctx = engine::context();
     auto& em = ctx.get_cached<editing_manager>();
+
+    removal_records.assign(root_entities.size(), {});
 
     // Re-snapshot each root before destroying it so that any out-of-band edits made since creation
     // (or since the last redo) are preserved on the next redo - parent may also have changed.
@@ -252,13 +270,23 @@ void create_entities_action_t::undo_action()
         if(i < serialized_roots.size())
         {
             std::stringstream ss;
-            save_to_stream(ss, static_cast<entt::const_handle>(target));
+            {
+                serialization::scoped_output_format compact(serialization::output_format::compact);
+                save_to_stream(ss, static_cast<entt::const_handle>(target));
+            }
             serialized_roots[i] = ss.str();
         }
 
         em.unselect(target);
-        prefab_override_context::mark_entity_as_removed(target);
-        target.destroy();
+
+        // Destroying an entity inside a prefab instance records it on that instance. The
+        // record has to be kept, because the entity coming back on redo does not bring it
+        // back - it lives on the container, not on the entity.
+        if(i < removal_records.size())
+        {
+            removal_records[i] = prefab_override_context::mark_entity_as_removed(target);
+        }
+        scene::destroy_entity(target);
     }
 }
 
@@ -341,7 +369,10 @@ delete_entities_action_t::delete_entities_action_t(std::vector<entt::handle> ent
             continue;
         }
         std::stringstream ss;
-        save_to_stream(ss, static_cast<entt::const_handle>(root));
+        {
+            serialization::scoped_output_format compact(serialization::output_format::compact);
+            save_to_stream(ss, static_cast<entt::const_handle>(root));
+        }
         serialized_roots.emplace_back(ss.str());
         root_entities.emplace_back(entt::make_uhandle(root));
         parent_entities.emplace_back(parent_uh);
@@ -356,16 +387,24 @@ void delete_entities_action_t::do_action()
     }
     auto& ctx = engine::context();
     auto& em = ctx.get_cached<editing_manager>();
-    for(const auto& root_uh : root_entities)
+
+    removal_records.assign(root_entities.size(), {});
+
+    for(size_t i = 0; i < root_entities.size(); ++i)
     {
-        auto target = root_uh.resolve();
+        auto target = root_entities[i].resolve();
         if(!target)
         {
             continue;
         }
         em.unselect(target);
-        prefab_override_context::mark_entity_as_removed(target);
-        target.destroy();
+
+        // Kept so undo can put it back. Deleting an entity inside a prefab instance records
+        // it on that instance - as a removed entity, or as a removed nested instance - and
+        // restoring the entity restores none of that, so the instance would go on listing
+        // something that is there again and the next resync would delete it a second time.
+        removal_records[i] = prefab_override_context::mark_entity_as_removed(target);
+        scene::destroy_entity(target);
     }
 }
 
@@ -407,6 +446,14 @@ void delete_entities_action_t::undo_action()
         if(!current_parent || current_parent != desired_parent)
         {
             tr->set_parent(desired_parent, false);
+        }
+
+        // After reparenting: the record names the instance that contained the entity, which is
+        // only reachable once it is back where it was. Without this the entity returns while
+        // its instance still lists it as removed, and the next resync deletes it again.
+        if(i < removal_records.size())
+        {
+            prefab_override_context::restore_entity_removal(removal_records[i]);
         }
     }
 }

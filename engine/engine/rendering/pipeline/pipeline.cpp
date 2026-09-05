@@ -29,8 +29,7 @@
 #include <graphics/vertex_decl.h>
 
 #include <engine/profiler/profiler.h>
-#define POOLSTL_STD_SUPPLEMENT 1
-#include <poolstl/poolstl.hpp>
+#include <concurrency/parallel.h>
 
 #include <concurrency/concurrentqueue.h>
 
@@ -78,6 +77,7 @@ auto pipeline::init(rtti::context& ctx) -> bool
     gi_world_probe_pass_.init(ctx);
     gi_resolve_pass_.init(ctx);
     gi_reflection_pass_.init(ctx);
+    scene_history_pass_.init(ctx);
     sdf_debug_pass_.init(ctx);
 
     auto& am = ctx.get_cached<asset_manager>();
@@ -122,7 +122,7 @@ void pipeline::gather_visible_models(scene& scn,
     const camera* lod_reference_cam)
 {
     
-    APP_SCOPE_PERF(cam ? "Rendering/Cull   Models" : "Rendering/Gather Models");
+    APP_SCOPE_PERF(cam ? "Rendering/Cull Models  " : "Rendering/Gather Models");
     static const std::string thread_name = "Rendering/Gather Models Thread";
     tpp::this_thread::register_this_thread(thread_name, true);
     auto view = scn.registry->view<transform_component, model_component, layer_component, active_component>();
@@ -139,8 +139,8 @@ void pipeline::gather_visible_models(scene& scn,
 
     //get_lod_data_for_camera is not thread safe but we are only operating on a single model once
     //so we can use parallel execution here
-    std::for_each(poolstl::par,//std::execution::par,
-        view.begin(), 
+    poolstl::for_each_par_if(true,
+        view.begin(),
         view.end(),
         [&](auto entity)
         {

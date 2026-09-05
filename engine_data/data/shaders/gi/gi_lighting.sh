@@ -38,27 +38,32 @@
  * ONE split only, deliberately: the includer (cs_gi_light_voxels) has exactly one free
  * resource stage, and split 0 is the sharpest and covers the camera's neighbourhood - which
  * is where level-0/1 voxels live, the only cells fine enough to hold a sun pool anyway.
- * Outside its texcoord bounds, and for every other light, the traced field remains the
- * answer. Gated by a define so the debug direct view keeps showing the PURE traced tier -
+ * Outside its texcoord bounds, outside the frustum slice it was fitted to (see the
+ * contract in GiSunShadowmapVisibility), and for every other light, the traced field
+ * remains the answer. A world-stable map of the GI's own would answer the unseen faces
+ * too, but it costs a second scene render per window scroll, which was judged not worth
+ * it. Gated by a define so the debug direct view keeps showing the PURE traced tier -
  * the diagnostic contrast that found this bug.
  */
 SAMPLER2D(s_gi_sun_shadowmap, 14);
 uniform mat4 u_gi_sun_shadowmap_mtx;
 /// x = light-buffer index of the sun the bound map belongs to (< 0 disables the tier),
-/// y = receiver depth bias (the generator's u_params1.x), z = texcoord border.
+/// y = cascade-0 constant receiver bias in stored depth (the generator's texel bias converted),
+/// z = texcoord border, w = d(stored depth)/d(world distance along the sun).
 uniform vec4 u_gi_sun_shadowmap_params;
-#define u_gi_sun_index  u_gi_sun_shadowmap_params.x
-#define u_gi_sun_bias   u_gi_sun_shadowmap_params.y
-#define u_gi_sun_border u_gi_sun_shadowmap_params.z
+/// The camera's (TAA-unjittered) view-projection - the frustum cascade 0 was fitted to.
+uniform mat4 u_gi_sun_shadowmap_camera_vp;
+/// x = cascade 0's view-space far distance (the slice's far plane); yzw unused.
+uniform vec4 u_gi_sun_shadowmap_slice;
+#define u_gi_sun_index          u_gi_sun_shadowmap_params.x
+#define u_gi_sun_bias           u_gi_sun_shadowmap_params.y
+#define u_gi_sun_border         u_gi_sun_shadowmap_params.z
+#define u_gi_sun_world_to_depth u_gi_sun_shadowmap_params.w
 
-/// shaderlib.sh unpackRgbaToFloat, restated: the compute include chain does not carry
-/// shaderlib, and the depth maps pack RGBA (every technique except VSM, which the caller
-/// gates out).
-float GiUnpackShadowDepth(vec4 rgba)
-{
-	const vec4 shift = vec4(1.0 / (256.0 * 256.0 * 256.0), 1.0 / (256.0 * 256.0), 1.0 / 256.0, 1.0);
-	return dot(rgba, shift);
-}
+/// The quadrature taps sit half a voxel off the face centre; a face tilted toward the sun
+/// puts them at different depths than the centre. One voxel of receiver depth covers faces
+/// tilted up to about 63 degrees, beyond which the face receives little sun anyway.
+#define GI_SUN_SHADOWMAP_SLOPE_COVER_VOXELS 1.0
 
 /**
  * Sun visibility from the bound cascade-0 map, when it covers @p world_position.
@@ -76,13 +81,48 @@ float GiUnpackShadowDepth(vec4 rgba)
  * coverage through EXACTLY the code the lighting takes - a parallel implementation would
  * drift and the attribution would lie.
  *
+ * COARSE LEVELS DECLINE (GI_SUN_SHADOWMAP_MAX_VOXEL). The receiver bias below is one LEVEL
+ * voxel of light-space depth, which the quadrature genuinely needs - and which also means the
+ * tier reports LIT through any occluder thinner than that voxel. At the coarse cascades that
+ * is metres, so a sealed room whose roof is thinner than one cell is lit from outside through
+ * a path no field defence can see: not the SDF, not the cage visibility, not the dead-probe
+ * gate (measured: interior ceiling brightest, sun-white, falling off downward, the walls
+ * merely bouncing it). There is no bias that is simultaneously acne-free and leak-free over a
+ * metre-wide face, so the honest move is to decline and let the traced field answer, exactly
+ * as it did before this tier existed. The gate sits FIRST: declining costs one compare, and
+ * it skips the projection and the four taps as well.
+ *
  * @param voxel_size Voxel of the answering cascade level: the quadrature half-extent.
  * @return true when the map answered; @p out_lit then holds the lit fraction. False means
- *         out of cascade-0 coverage, and the traced field must answer instead.
+ *         out of cascade-0 coverage or too coarse a level, and the traced field must answer.
  */
 bool GiSunShadowmapVisibility(vec3 world_position, vec3 world_normal, float voxel_size, out float out_lit)
 {
 	out_lit = 0.0;
+	if(voxel_size > GI_SUN_SHADOWMAP_MAX_VOXEL)
+	{
+		return false;
+	}
+	// THE SLICE CONTRACT. Cascade 0 is fitted to the camera's near frustum slice, and the
+	// raster samples it for nothing outside that slice. Its crop footprint - a bounding sphere
+	// of the slice - reaches metres BEHIND and beside the camera, so a world-space receiver
+	// there projects inside the map's texcoords while nothing about the fit is contracted for
+	// it. Measured: faces of a sealed room BEHIND the camera read LIT through this map while
+	// the camera faced away, and every camera turn then revealed a lit room that decayed over
+	// seconds through the relight EMA and the closed-room bounce (the first-look glow). A
+	// receiver outside the slice - behind the near plane, past cascade 0's far plane, or
+	// outside the field of view - declines here and the traced field answers, exactly as it
+	// does past the map's edge. Costs one mat4 transform per face.
+	vec4 camera_clip = mul(u_gi_sun_shadowmap_camera_vp, vec4(world_position, 1.0));
+	if(camera_clip.w <= 0.0 || camera_clip.w > u_gi_sun_shadowmap_slice.x)
+	{
+		return false;
+	}
+	vec2 camera_ndc = camera_clip.xy / camera_clip.w;
+	if(any(greaterThan(abs(camera_ndc), vec2_splat(1.0))))
+	{
+		return false;
+	}
 	vec4 shadow_coord = mul(u_gi_sun_shadowmap_mtx, vec4(world_position, 1.0));
 	if(shadow_coord.w <= 1e-6)
 	{
@@ -102,14 +142,14 @@ bool GiSunShadowmapVisibility(vec3 world_position, vec3 world_normal, float voxe
 	vec4 delta_t = mul(u_gi_sun_shadowmap_mtx, vec4(tangent, 0.0));
 	vec4 delta_b = mul(u_gi_sun_shadowmap_mtx, vec4(bitangent, 0.0));
 	float lit = 0.0;
+	float bias = u_gi_sun_bias + voxel_size * GI_SUN_SHADOWMAP_SLOPE_COVER_VOXELS * u_gi_sun_world_to_depth;
 	for(int tap = 0; tap < 4; ++tap)
 	{
 		vec4 tap_coord = shadow_coord +
 		                 (tap < 2 ? delta_t : -delta_t) +
 		                 ((tap & 1) != 0 ? delta_b : -delta_b);
-		float receiver = (tap_coord.z - u_gi_sun_bias) / tap_coord.w;
-		float occluder = GiUnpackShadowDepth(
-		    texture2DLod(s_gi_sun_shadowmap, tap_coord.xy / tap_coord.w, 0.0));
+		float receiver = (tap_coord.z - bias) / tap_coord.w;
+		float occluder = texture2DLod(s_gi_sun_shadowmap, tap_coord.xy / tap_coord.w, 0.0).x;
 		lit += step(receiver, occluder);
 	}
 	out_lit = lit * 0.25;
@@ -231,37 +271,36 @@ float GiTraceShadow(vec3 world_position, vec3 world_normal, vec3 to_light, float
 vec3 GiEvalLight(GpuLight light, int light_index, vec3 world_position, vec3 world_normal,
                  float voxel_size, float near_field)
 {
-	vec3 unshadowed = GpuEvalLightUnshadowed(light, world_position, world_normal);
+	// The Ex form reports the direction and distance it derived for the attenuation, so the
+	// shadow ray below does not redo the same length and normalize.
+	vec3 to_light;
+	float light_distance;
+	vec3 unshadowed =
+	    GpuEvalLightUnshadowedEx(light, world_position, world_normal, to_light, light_distance);
 	// Nothing to occlude, so skip the ray entirely. This is the common case for a point far
 	// outside a light's range, and shadow rays are by far the most expensive part of this.
 	if(dot(unshadowed, unshadowed) <= 0.0)
 	{
 		return vec3_splat(0.0);
 	}
-	vec3 to_light;
-	float light_distance;
 	if(light.type == GPU_LIGHT_TYPE_DIRECTIONAL)
 	{
-		to_light = -light.direction;
 		light_distance = u_gi_shadow_distance;
 #if defined(GI_SUN_SHADOWMAP_TIER)
 		// The sun's own map answers inside cascade 0 (see the tier note above); four taps
 		// replace the whole sphere trace. Out of bounds falls through to the trace.
-		if(u_gi_sun_index >= 0.0 && float(light_index) == u_gi_sun_index)
+		if(u_gi_sun_index >= 0.0)
 		{
-			float lit;
-			if(GiSunShadowmapVisibility(world_position, world_normal, voxel_size, lit))
+			if(float(light_index) == u_gi_sun_index)
 			{
-				return unshadowed * lit;
+				float lit;
+				if(GiSunShadowmapVisibility(world_position, world_normal, voxel_size, lit))
+				{
+					return unshadowed * lit;
+				}
 			}
 		}
 #endif // GI_SUN_SHADOWMAP_TIER
-	}
-	else
-	{
-		vec3 delta = light.position - world_position;
-		light_distance = length(delta);
-		to_light = light_distance > 1e-6 ? delta / light_distance : world_normal;
 	}
 	return unshadowed *
 	       GiTraceShadow(world_position, world_normal, to_light, light_distance, voxel_size, near_field);
@@ -274,9 +313,140 @@ vec3 GiEvalLight(GpuLight light, int light_index, vec3 world_position, vec3 worl
 vec3 GiEvalDirectLighting(vec3 world_position, vec3 world_normal, float voxel_size, float near_field)
 {
 	vec3 total = vec3_splat(0.0);
+	// LOOP: the body carries a sphere trace; unrolling it multiplies the largest instruction
+	// footprint in the kernel by the light count.
+	LOOP
 	for(int i = 0; i < u_gpu_light_count; ++i)
 	{
 		total += GiEvalLight(GpuLoadLight(i), i, world_position, world_normal, voxel_size, near_field);
+	}
+	return total;
+}
+
+/**
+ * The light-voxel variant: like GiEvalDirectLighting, with one traced DIRECTIONAL ray per
+ * VOXEL instead of per face.
+ *
+ * A voxel's sun-facing faces launch from within one attribute voxel of each other along the
+ * identical direction, so tracing each one separately paid up to three ~100 m marches for
+ * one answer - and for level >= 2 (no CSM cover, no mesh near field) that was the majority
+ * of the pass's shadow cost. The trace is memoised per (voxel, light): the first face out of
+ * shadow-map coverage traces from a SHARED origin - the voxel centre lifted along the ray
+ * itself, by the same centre lift the faces use plus the answering level's normal bias -
+ * and every later face reuses the verdict with its own n.l. The CSM tier stays per face:
+ * four taps, area-averaged over the face, and the sharper answer wherever it covers.
+ *
+ * The receiver was already treated as a voxel-wide beam (see GiTraceShadow), so a shared
+ * per-voxel verdict is the same contract at the same scale; what changes is only that the
+ * faces of one voxel can no longer disagree about the traced tier's answer.
+ *
+ * One cached slot: scenes with several directional lights fall back to per-face traces for
+ * all but the first one encountered, which is the safe direction. A cached index of -2
+ * marks a REFUSED share (see GiSharedOriginClear): every face of that voxel traces its own
+ * ray for every directional light.
+ */
+/*
+ * SHARED-ORIGIN VALIDATION (GI_SHARED_ORIGIN_REDESCENT_VOXELS). The shared ray launches
+ * from the voxel centre lifted along the light by the centre's depth plus half an attribute
+ * voxel. That lift is the answering level's own scale - 0.5 to 1 m at the coarse levels -
+ * and it crosses any occluder thinner than itself standing between the voxel and the sun
+ * (measured: the door tunnel's floor faces lit through a 25 cm baffle, the shared ray
+ * starting on the baffle's sunlit side). The field along the lift tells the two cases
+ * apart: leaving the voxel's own surface the distance RISES; a re-descent before the
+ * origin means the segment entered another surface. Sampled once per voxel, on the face
+ * that would establish the memo.
+ */
+bool GiSharedOriginClear(int level, vec3 voxel_center, vec3 shared_origin, float voxel_size)
+{
+	float peak = SdfSampleClipmapLevel(level, voxel_center);
+	float tolerance = GI_SHARED_ORIGIN_REDESCENT_VOXELS * voxel_size;
+	LOOP
+	for(int sample_index = 1; sample_index <= GI_SHARED_ORIGIN_SAMPLES; ++sample_index)
+	{
+		vec3 sample_position = mix(voxel_center, shared_origin,
+		                           float(sample_index) / float(GI_SHARED_ORIGIN_SAMPLES));
+		float distance = SdfSampleClipmapLevel(level, sample_position);
+		if(distance < peak - tolerance)
+		{
+			return false;
+		}
+		peak = max(peak, distance);
+	}
+	return true;
+}
+
+vec3 GiEvalDirectLightingVoxel(vec3 world_position, vec3 world_normal, float voxel_size,
+                               float near_field, vec3 voxel_center, float center_lift,
+                               int level, inout float cached_dir_visibility,
+                               inout int cached_dir_index)
+{
+	vec3 total = vec3_splat(0.0);
+	LOOP
+	for(int i = 0; i < u_gpu_light_count; ++i)
+	{
+		GpuLight light = GpuLoadLight(i);
+		if(light.type == GPU_LIGHT_TYPE_DIRECTIONAL)
+		{
+			vec3 to_light;
+			float light_distance;
+			vec3 unshadowed = GpuEvalLightUnshadowedEx(light, world_position, world_normal,
+			                                           to_light, light_distance);
+			if(dot(unshadowed, unshadowed) <= 0.0)
+			{
+				continue;
+			}
+#if defined(GI_SUN_SHADOWMAP_TIER)
+			// Per face on purpose: four taps, and the map's area average over THIS face is
+			// sharper than any shared verdict.
+			if(u_gi_sun_index >= 0.0)
+			{
+				if(float(i) == u_gi_sun_index)
+				{
+					float lit;
+					if(GiSunShadowmapVisibility(world_position, world_normal, voxel_size, lit))
+					{
+						total += unshadowed * lit;
+						continue;
+					}
+				}
+			}
+#endif // GI_SUN_SHADOWMAP_TIER
+			float visibility;
+			if(cached_dir_index == i)
+			{
+				visibility = cached_dir_visibility;
+			}
+			else if(cached_dir_index == -1)
+			{
+				// The shared origin lifts along the RAY, so the trace's own normal bias
+				// (measured along what it is given as the normal) cannot teleport through a
+				// sun-facing wall the way a slope-scaled skip would. The lift itself can cross
+				// a thin occluder; the validation refuses the share when it does.
+				vec3 shared_origin = voxel_center + to_light * center_lift;
+				BRANCH
+				if(GiSharedOriginClear(level, voxel_center, shared_origin, voxel_size))
+				{
+					visibility = GiTraceShadow(shared_origin, to_light, to_light,
+					                           u_gi_shadow_distance, voxel_size, near_field);
+					cached_dir_visibility = visibility;
+					cached_dir_index = i;
+				}
+				else
+				{
+					cached_dir_index = -2;
+					visibility = GiTraceShadow(world_position, world_normal, to_light,
+					                           u_gi_shadow_distance, voxel_size, near_field);
+				}
+			}
+			else
+			{
+				visibility = GiTraceShadow(world_position, world_normal, to_light,
+				                           u_gi_shadow_distance, voxel_size, near_field);
+			}
+			total += unshadowed * visibility;
+			continue;
+		}
+		total += GiEvalLight(light, i, world_position, world_normal, voxel_size, near_field);
 	}
 	return total;
 }

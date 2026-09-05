@@ -7,12 +7,16 @@
 namespace unravel
 {
 
+SAVE_EXTERN(prefab_statements);
+LOAD_EXTERN(prefab_statements);
+
 SAVE_EXTERN(prefab_component);
 LOAD_EXTERN(prefab_component);
 REFLECT_EXTERN(prefab_component);
 
 SAVE_EXTERN(prefab_id_component);
 LOAD_EXTERN(prefab_id_component);
+
 REFLECT_EXTERN(prefab_id_component);
 
 } // namespace unravel

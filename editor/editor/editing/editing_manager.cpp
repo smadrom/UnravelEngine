@@ -1,4 +1,5 @@
 #include "editing_manager.h"
+#include "authoring_root.h"
 #include "base/basetypes.hpp"
 #include "engine/profiler/profiler.h"
 #include "imgui/imgui.h"
@@ -107,7 +108,7 @@ auto editing_manager::init(rtti::context& ctx) -> bool
     ev.on_play_before_begin.connect(sentinel_, 1000, this, &editing_manager::on_play_before_begin);
     ev.on_play_begin.connect(sentinel_, 1000, this, &editing_manager::on_play_begin);
     ev.on_play_after_end.connect(sentinel_, -1000, this, &editing_manager::on_play_after_end);
-    ev.on_frame_update.connect(sentinel_, 1000, this, &editing_manager::on_frame_update);
+    ev.on_frame_update.connect(sentinel_, frame_update_priority::editing, this, &editing_manager::on_frame_update);
     ev.on_script_recompile.connect(sentinel_, 1000, this, &editing_manager::on_script_recompile);
 
     return true;
@@ -135,8 +136,9 @@ void editing_manager::on_play_before_begin(rtti::context& ctx)
     }
 
 
-    exit_prefab_mode(ctx, save_option::no);
-
+    // Play starts from the scene; prefab-mode edits are saved rather than dropped (a prompt
+    // cannot stop this path, which continues synchronously). No-op when nothing was edited.
+    exit_prefab_mode(ctx, save_option::yes);
     undo_stack.clear();
     pending_actions.clear();
 
@@ -363,6 +365,9 @@ void editing_manager::save_checkpoint(rtti::context& ctx, scene_cache& cache)
     // first save scene
     // APPLOG_TRACE_PERF_NAMED(std::chrono::milliseconds, "save_to_stream");
 
+    // An in-memory snapshot that load_checkpoint reads back and then drops. Nobody sees
+    // it, and it is written on play start, play stop and every script recompile.
+    serialization::scoped_output_format compact(serialization::output_format::compact);
     save_to_stream(cache.cache, *cache.scn);
 }
 
@@ -459,70 +464,142 @@ void editing_manager::on_prefab_updated(const asset_handle<prefab>& pfb)
 
 void editing_manager::sync_prefab_entity(rtti::context& ctx, entt::handle entity, const asset_handle<prefab>& pfb)
 {
+    // The one funnel every editor-side sync goes through, so this is where the authoring root
+    // is kept out. It is upstream of its file: a replay can only restore what was last saved,
+    // which undoes any revert made since, and it re-labels the root's own authoring on its
+    // nested instances as "inherited from the containing prefab". Both are the file flowing
+    // the wrong way.
+    if(is_authoring_root(entity))
+    {
+        return;
+    }
+
     queue_action("Sync Prefab Entity",
         [&ctx, entity, pfb]() mutable
     {
-        auto& ev = ctx.get_cached<events>();
-    
         auto& play = ctx.get_cached<play_mode>();
-    if(play.is_active())
+        if(play.is_active())
         {
             return;
         }
 
-        if(!entity.valid())
+        if(!entity.valid() || !pfb.is_valid())
         {
             return;
         }
 
-        if(!pfb.is_valid())
+        // The sync itself lives in the engine. It is the version that knows about nesting:
+        // it snapshots each nested instance's locally-made overrides and removals before the
+        // replay and puts them back after, filters the document's snapshot of a nested
+        // instance through that instance's override set, and copies the prefab_component
+        // rather than holding a reference across a load that adds and removes them (the pool
+        // swap-and-pops). The editor used to keep its own pre-nesting copy of this dance,
+        // which replayed stale snapshots over live nested instances.
+        if(auto* prefab_comp = entity.try_get<prefab_component>())
         {
-            return;
+            prefab_comp->source = pfb;
         }
 
-        if(auto trans_comp = entity.template try_get<transform_component>())
-        {
-            auto parent = trans_comp->get_parent();
-            auto pos = trans_comp->get_position_local();
-            auto rot = trans_comp->get_rotation_local();
-
-            auto& prefab_comp = entity.get<prefab_component>();
-            // Enable path recording for prefab loading
-            serialization::path_context path_ctx;
-            path_ctx.should_serialize_property_callback = [&](const std::string& property_path) -> bool
-            {
-                return !prefab_comp.has_serialization_override(property_path);
-            };
-            path_ctx.enable_recording();
-            serialization::path_context* old_ctx = serialization::get_path_context();
-            serialization::set_path_context(&path_ctx);
-
-            
-            if(scene::instantiate_out(*entity.registry(), pfb, entity))
-            {
-                auto& new_trans = entity.get<transform_component>();
-                new_trans.set_position_local(pos);
-                new_trans.set_rotation_local(rot);
-
-                new_trans.set_parent(parent, false);
-            }
-
-            
-            // Restore previous path context
-            serialization::set_path_context(old_ctx);
-        }
-
+        sync_prefab_instance(entity);
     });
+}
+
+namespace
+{
+/// The instance root furthest up from `entity`, `entity` itself included; null when it is
+/// neither an instance nor inside one.
+auto find_outermost_instance(entt::handle entity) -> entt::handle
+{
+    if(!entity)
+    {
+        return {};
+    }
+
+    entt::handle outermost = entity.all_of<prefab_component>() ? entity : entt::handle{};
+    const auto* trans_comp = entity.try_get<transform_component>();
+    auto current = trans_comp != nullptr ? trans_comp->get_parent() : entt::handle{};
+    while(current)
+    {
+        if(current.all_of<prefab_component>())
+        {
+            outermost = current;
+        }
+        const auto* parent_trans = current.try_get<transform_component>();
+        current = parent_trans != nullptr ? parent_trans->get_parent() : entt::handle{};
+    }
+    return outermost;
+}
+
+/// The instance roots directly under `entity`, not descending into them.
+void collect_direct_nested_instances(entt::handle entity, std::vector<entt::handle>& out)
+{
+    const auto* trans_comp = entity.try_get<transform_component>();
+    if(trans_comp == nullptr)
+    {
+        return;
+    }
+    for(auto child : trans_comp->get_children())
+    {
+        if(child.all_of<prefab_component>())
+        {
+            out.push_back(child);
+            continue;
+        }
+        collect_direct_nested_instances(child, out);
+    }
+}
+} // namespace
+
+void editing_manager::sync_after_override_change(rtti::context& ctx, entt::handle entity)
+{
+    auto outermost = find_outermost_instance(entity);
+
+    if(outermost && !is_authoring_root(outermost))
+    {
+        if(const auto* prefab_comp = outermost.try_get<prefab_component>())
+        {
+            sync_prefab_entity(ctx, outermost, prefab_comp->source);
+        }
+        return;
+    }
+
+    // Under an authoring root, or under nothing at all. No document above to replay, so each
+    // instance directly under it is brought back in line with its own prefab - their own
+    // syncs cascade into anything nested further down.
+    const auto base = outermost ? outermost : entity;
+    std::vector<entt::handle> nested;
+    collect_direct_nested_instances(base, nested);
+    for(auto& instance : nested)
+    {
+        if(const auto* prefab_comp = instance.try_get<prefab_component>())
+        {
+            sync_prefab_entity(ctx, instance, prefab_comp->source);
+        }
+    }
 }
 
 void editing_manager::sync_prefab_instances(rtti::context& ctx, scene* scn)
 {
+    // Top-level instances only. An instance nested inside another is refreshed by its
+    // container's sync - load_from_prefab_out cascades into everything nested - so syncing
+    // it from here as well repeated the whole replay once per nesting level.
     scn->registry->view<prefab_component>().each(
     [&](auto e, auto&& comp)
     {
-        sync_prefab_entity(ctx, comp.get_owner(), comp.source);
+        auto owner = comp.get_owner();
+        const auto* trans_comp = owner.template try_get<transform_component>();
+        auto parent = trans_comp != nullptr ? trans_comp->get_parent() : entt::handle{};
+        while(parent)
+        {
+            if(parent.template all_of<prefab_component>())
+            {
+                return;
+            }
+            const auto* parent_trans = parent.template try_get<transform_component>();
+            parent = parent_trans != nullptr ? parent_trans->get_parent() : entt::handle{};
+        }
+        sync_prefab_entity(ctx, owner, comp.source);
     });
-    
 }
 
 auto editing_manager::get_select_mode() const -> select_mode
@@ -657,6 +734,21 @@ void editing_manager::enter_prefab_mode(rtti::context& ctx, const asset_handle<p
         
         // Instantiate the prefab in our editing scene
         prefab_entity = prefab_scene.instantiate(prefab);
+        prefab_has_unsaved_changes_ = false;
+
+        // The edit root stays an instance of the prefab - prefab mode is a scene holding one
+        // instance, and Save is Apply All - but it is an instance that is *upstream* of its
+        // file: its live state is the file's next content. The tag is what keeps the two
+        // instance behaviours that assume the opposite away from it - syncing against the
+        // file (sync_prefab_entity) and recording its own content as overrides of the file
+        // (find_prefab_root_entity). What the document states about its nested content is
+        // adopted as the root's own local list, so it reads as the author's own work - not as
+        // inherited - and a save folds it back into the file.
+        if(prefab_entity)
+        {
+            prefab_entity.emplace<authoring_root_tag>();
+            scene::adopt_document_statements(prefab_entity);
+        }
         
         // Select the prefab entity
         if (prefab_entity)
@@ -726,6 +818,11 @@ void editing_manager::exit_prefab_mode(rtti::context& ctx, save_option save_chan
     if (!is_prefab_mode())
     {
         return;
+    }
+    // Nothing edited since entering or saving: neither a prompt nor a rewrite of the file.
+    if(!prefab_has_unsaved_changes_ && save_changes != save_option::no)
+    {
+        save_changes = save_option::no;
     }
     
     auto on_save = [this,&ctx]()
@@ -798,7 +895,7 @@ void editing_manager::save_prefab_changes(rtti::context& ctx)
     
     auto prefab_path = fs::resolve_protocol(edited_prefab.id());
     asset_writer::atomic_save_to_file(prefab_path.string(), prefab_entity);
-
+    prefab_has_unsaved_changes_ = false;
     APPLOG_INFO("Saved changes to prefab: {}", edited_prefab.id());
     ImGui::PushNotification(ImGuiToast(ImGuiToastType_Success, 1000,"Prefab saved."));
 
@@ -846,8 +943,9 @@ void editing_manager::clear(bool clear_unsaved)
     // If in prefab mode, exit it
     if (is_prefab_mode())
     {
+        // Saved rather than dropped; no-op when nothing was edited.
         auto& ctx = engine::context();
-        exit_prefab_mode(ctx, save_option::no);
+        exit_prefab_mode(ctx, save_option::yes);
     }
 
     // Reset prefab editing mode and clean up all references
@@ -917,13 +1015,15 @@ void editing_manager::add_action(const std::string& name, std::shared_ptr<editin
         action->detach();
     }
     
-    // Queue the action for execution (don't execute immediately)
-    pending_actions.push_back(std::move(action));
-
     if(immediate)
     {
-        execute_actions();
+        // Only this action. Draining the whole queue here would run actions that were deferred
+        // on purpose - a delete queued from a panel still holding component references - from
+        // inside whatever called do_action, while it holds its own.
+        execute_action(action);
+        return;
     }
+    pending_actions.push_back(std::move(action));
 }
 
 
@@ -942,33 +1042,31 @@ void editing_manager::pop_undo_stack_enabled()
     undo_stack_enabled.pop();
 }
 
+void editing_manager::execute_action(std::shared_ptr<editing_action_t>& action)
+{
+    if(!action)
+    {
+        return;
+    }
+    action->execution_count++;
+    action->do_action();
+    on_action_executed(action);
+    // Moved to the undo stack if undoable; merging is handled there, now that it has run.
+    if(action->is_undoable())
+    {
+        undo_stack.push_if_undoable(std::move(action));
+    }
+}
+
 void editing_manager::execute_actions()
 {
     while(!pending_actions.empty())
     {
         auto actions = std::move(pending_actions);
-        // Process all pending actions
-        for (auto& action : actions)
+        for(auto& action : actions)
         {
-            if (action)
-            {
-                // Execute the action
-                action->execution_count++;
-                action->do_action();
-                
-                on_action_executed(action);
-                // Add to undo stack if the action is undoable
-                // Note: We need to handle merging here since the action is now executed
-                if (action->is_undoable())
-                {
-                    // Move the action to the undo stack
-                    undo_stack.push_if_undoable(std::move(action));
-                }
-
-                
-            }
+            execute_action(action);
         }
-
     }
 
 }
@@ -978,6 +1076,7 @@ auto editing_manager::undo() -> std::shared_ptr<editing_action_t>
     if (undo_stack.can_undo())
     {
         has_unsaved_changes_ = true;
+        prefab_has_unsaved_changes_ |= is_prefab_mode();
         return undo_stack.undo();
     }
     return nullptr;
@@ -988,6 +1087,7 @@ auto editing_manager::redo() -> std::shared_ptr<editing_action_t>
     if (undo_stack.can_redo())
     {
         has_unsaved_changes_ = true;
+        prefab_has_unsaved_changes_ |= is_prefab_mode();
         return undo_stack.redo();
     }
     return nullptr;
@@ -1001,6 +1101,10 @@ void editing_manager::on_action_executed(std::shared_ptr<editing_action_t> actio
     if(action->modifies_scene_content())
     {
         has_unsaved_changes_ = true;
+        if(is_prefab_mode())
+        {
+            prefab_has_unsaved_changes_ = true;
+        }
 
         if(auto_rebuild_reflection_probes)
         {

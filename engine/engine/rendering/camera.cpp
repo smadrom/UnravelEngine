@@ -270,9 +270,15 @@ auto camera::get_projection() const -> const math::transform&
     return projection_;
 }
 
-auto camera::get_prev_projection() const -> const math::transform&
+
+auto camera::get_projection_unjittered() const -> math::transform
 {
-    return last_projection_;
+    // The jitter lives additively in the [2][0]/[2][1] shear terms (see get_projection),
+    // so subtracting it back out reconstructs the pixel-center-aligned projection exactly.
+    math::mat4 projection = get_projection().get_matrix();
+    projection[2][0] -= aa_data_.z;
+    projection[2][1] -= aa_data_.w;
+    return math::transform(projection);
 }
 
 auto camera::get_view() const -> const math::transform&
@@ -280,19 +286,9 @@ auto camera::get_view() const -> const math::transform&
     return view_;
 }
 
-auto camera::get_prev_view() const -> const math::transform&
-{
-    return last_view_;
-}
-
 auto camera::get_view_relative() const -> const math::transform&
 {
     return view_relative_;
-}
-
-auto camera::get_prev_view_relative() const -> const math::transform&
-{
-    return last_view_relative_;
 }
 
 auto camera::get_view_inverse() const -> const math::transform&
@@ -310,14 +306,58 @@ auto camera::get_view_projection() const -> math::transform
     return get_projection() * get_view();
 }
 
+auto camera::get_view_projection_unjittered() const -> math::transform
+{
+    return get_projection_unjittered() * get_view();
+}
+
+auto camera::get_prev_view() const -> const math::transform&
+{
+    return prev_matrices_valid_ ? prev_view_ : view_;
+}
+
+auto camera::get_prev_projection() const -> const math::transform&
+{
+    return prev_matrices_valid_ ? prev_projection_ : get_projection();
+}
+
+auto camera::get_prev_projection_unjittered() const -> math::transform
+{
+    // By value: the never-recorded fallback is the CURRENT unjittered projection, which
+    // is itself computed on demand (jitter subtracted) rather than stored.
+    return prev_matrices_valid_ ? prev_projection_unjittered_ : get_projection_unjittered();
+}
+
 auto camera::get_prev_view_projection() const -> math::transform
 {
     return get_prev_projection() * get_prev_view();
 }
 
-auto camera::get_taa_prev_view_projection() const -> math::transform
+auto camera::get_prev_view_projection_unjittered() const -> math::transform
 {
-    return taa_prev_projection_ * taa_prev_view_;
+    // Never recorded: degrade to "previous == current" - zero motion, the same sane
+    // frame-0 semantic the first recording establishes; temporal consumers then treat
+    // the frame as fresh rather than reprojecting through default-constructed identity.
+    if(!prev_matrices_valid_)
+    {
+        return get_view_projection_unjittered();
+    }
+    return prev_projection_unjittered_ * prev_view_;
+}
+
+auto camera::get_prev_view_projection_relative_unjittered() const -> math::transform
+{
+    if(!prev_matrices_valid_)
+    {
+        return get_projection_unjittered() * get_view_relative();
+    }
+    // The view is rigid (lookAt), so zeroing its translation column yields exactly the
+    // rotation-only "camera at origin" form - the same matrix look_at builds for
+    // view_relative_. Derived here so camera-relative consumers (clouds) share the ONE
+    // recorded previous set instead of a second bookkeeping chain.
+    math::mat4 prev_view_relative = prev_view_.get_matrix();
+    prev_view_relative[3] = math::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    return prev_projection_unjittered_.get_matrix() * prev_view_relative;
 }
 
 auto camera::get_view_projection_relative() const -> math::transform
@@ -325,10 +365,6 @@ auto camera::get_view_projection_relative() const -> math::transform
     return get_projection() * get_view_relative();
 }
 
-auto camera::get_prev_view_projection_relative() const -> math::transform
-{
-    return get_prev_projection() * get_prev_view_relative();
-}
 
 void camera::look_at(const math::vec3& vEye, const math::vec3& vAt)
 {
@@ -337,9 +373,6 @@ void camera::look_at(const math::vec3& vEye, const math::vec3& vAt)
 
 void camera::look_at(const math::vec3& vEye, const math::vec3& vAt, const math::vec3& vUp)
 {
-    // First update so the camera can cache the previous matrices
-    // record_current_matrices();
-
     view_ = math::lookAt(vEye, vAt, vUp);
     view_inverse_ = math::inverse(view_);
 
@@ -756,13 +789,6 @@ auto camera::estimate_pick_tolerance(float wire_tolerance,
     return object_wire_tolerance / vAxisScale;
 }
 
-void camera::record_current_matrices()
-{
-    last_view_ = get_view();
-    last_view_relative_ = get_view_relative();
-    last_projection_ = get_projection();
-    
-}
 
 void camera::set_aa_data(const usize32_t& viewport_size,
                          std::uint32_t temporal_frame_index,
@@ -850,27 +876,41 @@ void camera::set_aa_data(const usize32_t& viewport_size,
     }
 
     projection_dirty_ = true;
+}
 
-    // Matrices THIS frame renders with; set_aa_data runs after the camera has been
-    // moved to the current transform, so get_view() here is the frame's real view.
-    // The projection is recorded with the fresh jitter subtracted back out: the TAA
-    // history is the resolved, pixel-center-aligned image, so reprojection must
-    // target unjittered NDC.
+void camera::record_current_matrices()
+{
+    // ONCE PER RENDER FRAME: a camera rendered more than once in a frame (a preview
+    // inset, future multi-view) must not re-record, or the previous set collapses onto
+    // the current one and every temporal consumer's reprojection silently degrades to
+    // a jitter-only offset.
+    const std::uint32_t render_frame = gfx::get_render_frame();
+    if(prev_record_frame_ == render_frame)
+    {
+        return;
+    }
+    prev_record_frame_ = render_frame;
+
+    // Matrices THIS frame renders with; the pipeline calls this after the camera has
+    // been moved to the current transform AND the frame's jitter has been applied, so
+    // both the jittered and unjittered pairs recorded here are the frame's final ones.
     const math::transform frame_view = get_view();
-    math::mat4 frame_proj = get_projection().get_matrix();
-    frame_proj[2][0] -= aa_data_.z;
-    frame_proj[2][1] -= aa_data_.w;
+    const math::transform frame_proj = get_projection();
+    const math::transform frame_proj_unjittered = get_projection_unjittered();
 
-    // Promote the pair recorded on the previous call: those are the matrices the
+    // Promote the set recorded on the previous call: those are the matrices the
     // previous frame actually rendered with. Snapshotting get_view() directly here
     // would capture the CURRENT view (the camera already moved), which cancels the
-    // view term in the TAA reprojection and reduces it to a jitter-only offset.
-    taa_prev_view_ = taa_frame_valid_ ? taa_frame_view_ : frame_view;
-    taa_prev_projection_ = taa_frame_valid_ ? taa_frame_projection_ : math::transform(frame_proj);
+    // view term in the reprojection and reduces it to a jitter-only offset.
+    prev_view_ = prev_matrices_valid_ ? frame_view_ : frame_view;
+    prev_projection_ = prev_matrices_valid_ ? frame_projection_ : frame_proj;
+    prev_projection_unjittered_ =
+        prev_matrices_valid_ ? frame_projection_unjittered_ : frame_proj_unjittered;
 
-    taa_frame_view_ = frame_view;
-    taa_frame_projection_ = frame_proj;
-    taa_frame_valid_ = true;
+    frame_view_ = frame_view;
+    frame_projection_ = frame_proj;
+    frame_projection_unjittered_ = frame_proj_unjittered;
+    prev_matrices_valid_ = true;
 }
 
 auto camera::get_aa_data() const -> const math::vec4&
@@ -944,7 +984,6 @@ auto camera::get_face_camera(uint32_t face, const math::transform& transform) ->
 
     // Set new transform
     cam.look_at(t.get_position(), t.get_position() + t.z_unit_axis(), t.y_unit_axis());
-    cam.record_current_matrices();
     return cam;
 }
 } // namespace unravel

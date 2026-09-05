@@ -8,6 +8,8 @@
 #include <graphics/render_pass.h>
 #include <graphics/render_view.h>
 
+#include <array>
+
 namespace unravel
 {
 
@@ -48,6 +50,16 @@ public:
         /// The sun's slot in the GPU light buffer, so the shader applies the map to exactly
         /// the light it was rendered for. Negative disables the tier.
         int sun_light_index = -1;
+        /// The camera's TAA-unjittered view-projection - the frustum cascade 0 was fitted to
+        /// this frame. The tier answers only for receivers inside that frustum slice
+        /// ([near, cascade-0 far] in view depth, inside the FOV): the map's crop footprint
+        /// (a bounding sphere of the slice) extends metres BEHIND and beside the camera, and
+        /// receivers there project into the map but are outside its contract - the raster
+        /// never samples them, and they measured LIT for sealed-room faces behind the camera
+        /// (the first-look glow: the room lights up while the camera faces away, then decays
+        /// when it turns). Outside the slice the traced field answers, as it does past the
+        /// map's edge.
+        math::mat4 camera_view_proj{1.0f};
         /// Diagnostic: dispatch the SUN-TIER debug PROGRAM (cs_gi_light_voxels_debug.sc),
         /// which writes tier-attribution colors into the light volume instead of radiance
         /// (see GiDebugSunTierColor in gi_light_voxels_kernel.sh), for the sun_tiers debug
@@ -73,7 +85,23 @@ public:
         return program_.is_valid();
     }
 
+    /// The latest completed relight-convergence readback (see collect_relight_stats), for
+    /// the quiescence gate (surface_cache_view::update_quiescence). Index 0 until the first
+    /// sample lands, and on backends without the statistic.
+    auto get_relight_sample() const -> const surface_cache_view::relight_sample&
+    {
+        return relight_sample_;
+    }
+
 private:
+    /**
+     * @brief Copies this frame's relight convergence sums out of the vis-memo texture's
+     *        statistics slice and stages them for the CPU, consuming the readbacks that
+     *        completed (a readback lands two frames after it is asked for; three staging
+     *        textures keep one in flight per frame).
+     */
+    void collect_relight_stats(const gfx::texture::ptr& vis_memo, uint32_t attr_resolution);
+
     /// One-time "the program never became valid" diagnostic; see run().
     bool invalid_warning_emitted_ = false;
     /// One-time "debug variant requested but its program never built" diagnostic; see run().
@@ -89,6 +117,30 @@ private:
     /// static scene means an invalidation tracker is churning and the memo can never hit -
     /// the CPU-side discriminator for the measured miss-every-rotation cost signature.
     uint32_t vis_memo_generation_logged_ = uint32_t(-1);
+    /// Relight-EMA change tracking (u_gi_vis_memo_params.y): what the blend was last
+    /// computed against, and how many write-through frames remain so every voxel's first
+    /// relight after a change snaps (one full rotation); see the blend block in run().
+    bool ema_history_valid_ = false;
+    uint64_t ema_light_hash_ = 0;
+    uint32_t ema_generation_ = uint32_t(-1);
+    uint32_t ema_snap_frames_ = 0;
+    /// Relight convergence statistic state (collect_relight_stats).
+    struct stats_readback_slot
+    {
+        gfx::texture::ptr texture;
+        std::array<uint32_t, 2u * global_sdf_clipmap::level_count> data{};
+        uint32_t ready_frame = 0;
+        bool pending = false;
+    };
+    std::unique_ptr<gpu_program> stats_program_;
+    gfx::texture::ptr stats_texture_;
+    std::array<stats_readback_slot, 3> stats_slots_{};
+    uint32_t stats_slot_cursor_ = 0;
+    /// The memo texture the statistic was last collected from: a fresh allocation carries
+    /// an unwritten statistics slice, so its first sample is discarded.
+    const gfx::texture* stats_source_ = nullptr;
+    bool stats_primed_ = false;
+    surface_cache_view::relight_sample relight_sample_{};
 
 private:
     struct light_voxel_program : uniforms_cache
@@ -112,6 +164,8 @@ private:
         gfx::program::uniform_ptr u_gi_vis_memo_params;
         gfx::program::uniform_ptr u_gi_world_probe_params;
         gfx::program::uniform_ptr u_gi_world_probe_atlas;
+        gfx::program::uniform_ptr u_gi_temporal_dirty;
+        gfx::program::uniform_ptr u_gi_temporal_bounds;
         gfx::program::uniform_ptr s_sdf_atlas;
         gfx::program::uniform_ptr s_sdf_clipmap;
         gfx::program::uniform_ptr s_attr_albedo;
@@ -120,11 +174,21 @@ private:
         gfx::program::uniform_ptr s_world_probe_depth;
         gfx::program::uniform_ptr u_gi_sun_shadowmap_mtx;
         gfx::program::uniform_ptr u_gi_sun_shadowmap_params;
+        gfx::program::uniform_ptr u_gi_sun_shadowmap_camera_vp;
+        gfx::program::uniform_ptr u_gi_sun_shadowmap_slice;
         gfx::program::uniform_ptr s_gi_sun_shadowmap;
 
         void cache_uniforms()
         {
             cache_uniform(program.get(), u_gi_sun_shadowmap_mtx, "u_gi_sun_shadowmap_mtx", gfx::uniform_type::Mat4);
+            cache_uniform(program.get(),
+                          u_gi_sun_shadowmap_camera_vp,
+                          "u_gi_sun_shadowmap_camera_vp",
+                          gfx::uniform_type::Mat4);
+            cache_uniform(program.get(),
+                          u_gi_sun_shadowmap_slice,
+                          "u_gi_sun_shadowmap_slice",
+                          gfx::uniform_type::Vec4);
             cache_uniform(program.get(),
                           u_gi_sun_shadowmap_params,
                           "u_gi_sun_shadowmap_params",
@@ -134,6 +198,12 @@ private:
             cache_uniform(program.get(), u_gi_vis_memo_params, "u_gi_vis_memo_params", gfx::uniform_type::Vec4);
             cache_uniform(program.get(), u_gi_world_probe_params, "u_gi_world_probe_params", gfx::uniform_type::Vec4);
             cache_uniform(program.get(), u_gi_world_probe_atlas, "u_gi_world_probe_atlas", gfx::uniform_type::Vec4);
+            cache_uniform(program.get(), u_gi_temporal_dirty, "u_gi_temporal_dirty", gfx::uniform_type::Vec4);
+            cache_uniform(program.get(),
+                          u_gi_temporal_bounds,
+                          "u_gi_temporal_bounds",
+                          gfx::uniform_type::Vec4,
+                          2u * uint16_t(gi::GI_TEMPORAL_DIRTY_MAX_BOUNDS));
             cache_uniform(program.get(),
                           s_world_probe_irradiance,
                           "s_world_probe_irradiance",

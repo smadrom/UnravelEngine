@@ -27,6 +27,9 @@ auto gi_light_voxel_pass::init(rtti::context& ctx) -> bool
     program_.program = std::make_unique<gpu_program>(cs);
     program_.debug_program = std::make_unique<gpu_program>(cs_debug);
     program_.vis_memo_debug_program = std::make_unique<gpu_program>(cs_vis_memo_debug);
+    // Optional: without it the quiescence gate falls back to its fixed settle.
+    auto cs_stats = am.get_asset<gfx::shader>("engine:/data/shaders/gi/cs_gi_light_voxel_stats.sc");
+    stats_program_ = std::make_unique<gpu_program>(cs_stats);
     return program_.is_valid();
 }
 
@@ -107,17 +110,19 @@ auto gi_light_voxel_pass::run(gfx::render_view& rview, const run_params& params)
     gfx::set_buffer(10, clipmap_gpu.get_surface_list_buffer(), gfx::access::Read);
     gfx::set_texture(program_.s_attr_albedo, 8, clipmap_gpu.get_attr_albedo_texture());
     gfx::set_texture(program_.s_attr_emissive, 9, clipmap_gpu.get_attr_emissive_texture());
+    // ReadWrite: the radiance store folds each relight into a per-voxel EMA, reading the
+    // texel's own previous value (see the store in gi_light_voxels_kernel.sh).
     gfx::set_image_3d(7,
                       clipmap_gpu.get_light_voxel_texture()->native_handle(),
                       0,
-                      gfx::access::Write,
+                      gfx::access::ReadWrite,
                       gfx::texture_format::RGBA16F);
     gfx::set_buffer(12, surface_cache.get_grid_offset_buffer(), gfx::access::Read);
     gfx::set_buffer(13, surface_cache.get_grid_instance_buffer(), gfx::access::Read);
     const float sdf_params[4] = {float(atlas.get_atlas_brick_dim()),
                                  float(atlas.get_atlas_voxel_dim()),
                                  float(instances.size()),
-                                 0.0f};
+                                 float(surface_cache.get_emitters().size())};
     gfx::set_uniform(program_.u_sdf_params, sdf_params);
     gfx::set_uniform(program_.u_sdf_grid_params, surface_cache.get_grid_params(), 2);
     gfx::set_uniform(program_.u_sdf_clipmap_params, clipmap_gpu.get_sampling_params());
@@ -153,12 +158,29 @@ auto gi_light_voxel_pass::run(gfx::render_view& rview, const run_params& params)
     if(bgfx::isValid(sun_map))
     {
         gfx::set_uniform(program_.u_gi_sun_shadowmap_mtx, params.sun_shadows->get_shadow_map_matrix(0));
+        // The map's CONTRACT: cascade 0 is fitted to the camera's near frustum slice and the
+        // raster samples it for nothing outside that slice. Its crop footprint (a bounding
+        // sphere of the slice) reaches metres behind and beside the camera, and receivers
+        // there project INTO the map while nothing about the fit is contracted for them -
+        // measured as LIT verdicts for sealed-room faces behind the camera (the room lights
+        // up while the camera faces away and decays when it turns: the first-look glow).
+        // The kernel declines outside the slice and the traced field answers, exactly as
+        // it does past the map's edge.
+        gfx::set_uniform(program_.u_gi_sun_shadowmap_camera_vp, params.camera_view_proj);
+        const float slice_params[4] = {params.sun_shadows->get_cascade_far_distance(0), 0.0f, 0.0f, 0.0f};
+        gfx::set_uniform(program_.u_gi_sun_shadowmap_slice, slice_params);
         sun_params[0] = float(params.sun_light_index);
         sun_params[1] = params.sun_shadows->get_shadow_map_bias();
         // One filter footprint inside the edge, mirroring the lighting shader's cascade
         // selection bounds, so a clamped tap never answers for a position outside the crop.
         sun_params[2] = 0.01f;
-        gfx::set_texture(14, program_.s_gi_sun_shadowmap->native_handle(), sun_map);
+        // World -> stored depth, so the kernel can cover a voxel of slope per answering level.
+        sun_params[3] = params.sun_shadows->get_shadow_map_world_to_depth();
+        // Raw float depth: point sampled and clamped, as the lighting pass binds it.
+        gfx::set_texture(14,
+                         program_.s_gi_sun_shadowmap->native_handle(),
+                         sun_map,
+                         BGFX_SAMPLER_POINT | BGFX_SAMPLER_UVW_CLAMP);
     }
     else
     {
@@ -174,9 +196,12 @@ auto gi_light_voxel_pass::run(gfx::render_view& rview, const run_params& params)
     // program was compiled in (see the variant note in gi_light_voxels_kernel.sh). The lanes
     // stay so a GPU-debugger capture can finally answer whether these uniforms ever arrive,
     // the question two hunts could not settle from the CPU side.
+    // The frame lane carries only the rotation phase, never the raw frame count: past 2^24 a
+    // float frame quantises to multiples of 2 and then 4, freezing `frame % 4` on one phase -
+    // three quarters of the surface set would silently stop relighting after ~77 h at 60 fps.
     const float voxel_params[4] = {float(attr_resolution),
                                    params.sun_tier_debug ? 1.0f : 0.0f,
-                                   float(params.frame),
+                                   float(params.frame % gi::GI_LIGHT_VOXEL_UPDATE_DENOM),
                                    1.0f};
     gfx::set_uniform(program_.u_gi_light_voxel_params, voxel_params);
     // Logged on every flip: the one question a screenshot cannot answer is whether the flag
@@ -207,16 +232,20 @@ auto gi_light_voxel_pass::run(gfx::render_view& rview, const run_params& params)
                                    params.probe_visibility_variance_gate};
     gfx::set_uniform(program_.u_gi_world_probe_params, probe_params);
     // The bounce's cage-visibility memo (stage 6, read+write - gfx::set_image_3d for the GL
-    // layered-binding rule). The generation refresh compares the clipmap's content epoch and
-    // the per-level probe-window cells against what the memo was stamped under; 0 means the
-    // memo is not yet seeded and the kernel takes the plain gated-march path.
+    // layered-binding rule). The generation refresh compares the clipmap's COMPOSED content
+    // epoch and the per-level probe-window cells against what the memo was stamped under;
+    // 0 means the memo is not yet seeded and the kernel takes the plain gated-march path.
+    // Composed, not target: the verdicts are marched against the composed field, and during
+    // an edit drag the target epoch churns every frame while the field only changes when
+    // the coalescing throttle lets a recompose land - keying on the target re-marched every
+    // relight against an unchanged field.
     uint32_t vis_memo_generation = 0;
     const auto& vis_memo = clipmap_gpu.get_bounce_vis_memo();
     if(vis_memo && vis_memo->is_valid())
     {
         vis_memo_generation =
             view_cache.get_clipmap_gpu_mutable().refresh_bounce_vis_generation(
-                view_clipmap.get_content_epoch(), params.camera_position, base_spacing);
+                view_clipmap.get_composed_content_epoch(), params.camera_position, base_spacing);
         gfx::set_image_3d(6, vis_memo->native_handle(), 0, gfx::access::ReadWrite, gfx::texture_format::R32U);
     }
     // Every change is logged: bumps are legitimate on edits and window scrolls, but a stream
@@ -241,8 +270,50 @@ auto gi_light_voxel_pass::run(gfx::render_view& rview, const run_params& params)
         //                 ? (vis_memo_debug_available ? "vis-memo variant" : "MISSING - radiance fallback")
         //                 : "radiance");
     }
-    const float vis_memo_params[4] = {float(vis_memo_generation), 0.0f, 0.0f, 0.0f};
+    // RELIGHT EMA blend (u_gi_vis_memo_params.y; the radiance store in the kernel). Any
+    // change of the light set (hash) or of the field/window (the vis-memo generation, which
+    // also bumps on window scrolls - a scrolled-in slot must never fade in the departed
+    // cell's radiance) holds the blend at write-through for one FULL rotation: only a
+    // quarter of the surface set relights per frame, so every voxel's first relight after
+    // the change has to snap. Debug variants overwrite the volume with attribution colors,
+    // so the rotation after they clear snaps too. Generation 0 means the change tracker is
+    // unavailable - the EMA stays off rather than integrating over undetected changes.
+    const bool radiance_write = !((want_vis_memo_debug && vis_memo_debug_available) ||
+                                  (want_debug && debug_available));
+    const uint64_t light_hash = light_buffer.is_valid() ? light_buffer.get_content_hash() : 0u;
+    if(!ema_history_valid_ || light_hash != ema_light_hash_ ||
+       vis_memo_generation != ema_generation_ || !radiance_write)
+    {
+        ema_snap_frames_ = uint32_t(gi::GI_LIGHT_VOXEL_UPDATE_DENOM);
+    }
+    ema_history_valid_ = radiance_write;
+    ema_light_hash_ = light_hash;
+    ema_generation_ = vis_memo_generation;
+    float ema_blend = 1.0f;
+    if(ema_snap_frames_ > 0u)
+    {
+        --ema_snap_frames_;
+    }
+    else if(vis_memo_generation != 0u)
+    {
+        ema_blend = float(gi::GI_LIGHT_VOXEL_EMA_BLEND);
+    }
+    const float vis_memo_params[4] = {float(vis_memo_generation), ema_blend, 0.0f, 0.0f};
     gfx::set_uniform(program_.u_gi_vis_memo_params, vis_memo_params);
+    // DIRTY REGIONS (gi_dirty_regions.sh): inside one the radiance store writes through
+    // instead of folding into the EMA - the bounce it integrates there is the light a moved
+    // placement left, and blending it in at 1/8 per relight kept a moved emissive's pool in
+    // the volume for a rotation window after the temporal's hold had already expired.
+    {
+        constexpr uint32_t max_regions = uint32_t(gi::GI_TEMPORAL_DIRTY_MAX_BOUNDS);
+        float dirty_bounds[max_regions * 2u * 4u] = {};
+        const uint32_t dirty_count = surface_cache.pack_dirty_regions(dirty_bounds, max_regions);
+        const float dirty_margin =
+            params.view_cache->get_clipmap().get_level(0).voxel_size * float(gi::GI_WORLD_PROBE_DIVISOR);
+        const float dirty_params[4] = {float(dirty_count), math::max(dirty_margin, 1e-3f), 0.0f, 0.0f};
+        gfx::set_uniform(program_.u_gi_temporal_dirty, dirty_params);
+        gfx::set_uniform(program_.u_gi_temporal_bounds, dirty_bounds, uint16_t(2u * max_regions));
+    }
     if(probes_ready)
     {
         gfx::set_texture(program_.s_world_probe_irradiance, 11, clipmap_gpu.get_world_probe_irradiance());
@@ -260,18 +331,103 @@ auto gi_light_voxel_pass::run(gfx::render_view& rview, const run_params& params)
         gfx::set_texture(program_.s_world_probe_irradiance, 11, black);
         gfx::set_texture(program_.s_world_probe_depth, 15, black);
     }
-    // Every level's full segment, early-out beyond the per-level count. The counts live on the
-    // GPU (the attribute dispatch appends them), so a tighter launch needs indirect args - a
-    // measured optimisation, not a correctness matter.
+    // One thread per entry due THIS frame: the 4-frame rotation is folded into the launch
+    // (the kernel maps thread id -> entry = denom * id + phase), so the X extent covers a
+    // quarter of the capacity, and the level rides Y so the kernel never divides. The
+    // early-out beyond the per-level count remains; a still-tighter launch needs indirect
+    // args from the GPU-side counts - a measured optimisation, not a correctness matter.
     const uint32_t capacity = attr_resolution * attr_resolution * attr_resolution;
-    const uint32_t total = capacity * global_sdf_clipmap::level_count;
+    const uint32_t rotation_slice =
+        (capacity + uint32_t(gi::GI_LIGHT_VOXEL_UPDATE_DENOM) - 1u) / uint32_t(gi::GI_LIGHT_VOXEL_UPDATE_DENOM);
     gfx::dispatch(pass.id,
                   active_program.native_handle(),
-                  (total + light_voxel_group_size - 1u) / light_voxel_group_size,
-                  1,
+                  (rotation_slice + light_voxel_group_size - 1u) / light_voxel_group_size,
+                  global_sdf_clipmap::level_count,
                   1);
     active_program.end();
+    collect_relight_stats(vis_memo, attr_resolution);
     return true;
+}
+
+void gi_light_voxel_pass::collect_relight_stats(const gfx::texture::ptr& vis_memo, uint32_t attr_resolution)
+{
+    if(!stats_program_ || !stats_program_->is_valid() || !vis_memo || !vis_memo->is_valid())
+    {
+        return;
+    }
+    const auto width = static_cast<uint16_t>(global_sdf_clipmap::level_count);
+    const uint16_t height = 2;
+    if(!stats_texture_ || !stats_texture_->is_valid())
+    {
+        stats_texture_ = std::make_shared<gfx::texture>(width,
+                                                        height,
+                                                        false,
+                                                        1,
+                                                        gfx::texture_format::R32U,
+                                                        BGFX_TEXTURE_COMPUTE_WRITE);
+        for(auto& slot : stats_slots_)
+        {
+            slot.texture = std::make_shared<gfx::texture>(width,
+                                                          height,
+                                                          false,
+                                                          1,
+                                                          gfx::texture_format::R32U,
+                                                          BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK);
+            slot.pending = false;
+        }
+    }
+    if(stats_source_ != vis_memo.get())
+    {
+        stats_source_ = vis_memo.get();
+        stats_primed_ = false;
+    }
+    // Completed readbacks, oldest first (the cursor is the oldest slot in flight).
+    const uint32_t frame = gfx::get_render_frame();
+    for(uint32_t i = 0; i < stats_slots_.size(); ++i)
+    {
+        auto& slot = stats_slots_[(stats_slot_cursor_ + i) % stats_slots_.size()];
+        if(!slot.pending || frame < slot.ready_frame)
+        {
+            continue;
+        }
+        slot.pending = false;
+        if(!stats_primed_)
+        {
+            // The slice's first content is whatever the allocation held.
+            stats_primed_ = true;
+            continue;
+        }
+        float change = 0.0f;
+        float faces = 0.0f;
+        for(uint32_t level = 0; level < global_sdf_clipmap::level_count; ++level)
+        {
+            change += float(slot.data[level]) / float(gi::GI_QUIESCENCE_STATS_SCALE);
+            faces += float(slot.data[global_sdf_clipmap::level_count + level]);
+        }
+        ++relight_sample_.index;
+        relight_sample_.mean_change = faces > 0.0f ? change / faces : 0.0f;
+    }
+    // Copy and zero this frame's sums (a view of its own: a blit executes before the
+    // dispatches of its view, so the staging copy needs the next one).
+    gfx::render_pass copy_pass("GI/Light Voxel Stats");
+    stats_program_->begin();
+    gfx::set_image_3d(0, vis_memo->native_handle(), 0, gfx::access::ReadWrite, gfx::texture_format::R32U);
+    gfx::set_image(1, stats_texture_->native_handle(), 0, gfx::access::Write, gfx::texture_format::R32U);
+    const float voxel_params[4] = {float(attr_resolution), 0.0f, 0.0f, 0.0f};
+    gfx::set_uniform(program_.u_gi_light_voxel_params, voxel_params);
+    gfx::dispatch(copy_pass.id, stats_program_->native_handle(), 1, 1, 1);
+    stats_program_->end();
+    auto& slot = stats_slots_[stats_slot_cursor_];
+    if(slot.pending)
+    {
+        // Every staging texture in flight: this frame's sample is dropped, not awaited.
+        return;
+    }
+    stats_slot_cursor_ = (stats_slot_cursor_ + 1) % uint32_t(stats_slots_.size());
+    gfx::render_pass readback_pass("GI/Light Voxel Stats Readback");
+    gfx::blit(readback_pass.id, slot.texture->native_handle(), 0, 0, stats_texture_->native_handle(), 0, 0, width, height);
+    slot.ready_frame = gfx::read_texture(slot.texture->native_handle(), slot.data.data());
+    slot.pending = true;
 }
 
 } // namespace unravel

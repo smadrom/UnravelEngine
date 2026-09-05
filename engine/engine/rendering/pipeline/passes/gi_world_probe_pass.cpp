@@ -66,26 +66,43 @@ auto gi_world_probe_pass::run(gfx::render_view& rview, const run_params& params)
     const float base_spacing =
         clipmap.get_level(0).voxel_size * float(gi::GI_WORLD_PROBE_DIVISOR);
     // Change fast window (plan section 8): a changed light set OR changed scene content
-    // doubles the strata per frame for one full window, so the bounce chain reacts at twice
-    // the speed exactly while something is changing and costs nothing while the scene is
-    // still. The content epoch fires on geometry/material changes (a door closing) and is
-    // scroll-suppressed, so camera motion alone never pins the fast path.
+    // quadruples the strata per frame for one full window, so the whole atlas re-measures
+    // within 4 frames exactly while something is changing and costs nothing while the scene
+    // is still. x4 rather than the original x2 because the world probes sit mid-chain in the
+    // reactivity path (recompose -> relight -> HERE -> screen probes -> resolve temporal)
+    // and every stage's latency SERIALIZES - an 8-frame refresh here was a third of the
+    // measured emissive-drag trail on its own. The stratum count must divide
+    // GI_WORLD_PROBE_WINDOW so the per-frame coverage stays exhaustive. The content epoch
+    // fires on geometry/material changes (a door closing) and is scroll-suppressed, so
+    // camera motion alone never pins the fast path.
     if(params.light_hash != last_light_hash_)
     {
         last_light_hash_ = params.light_hash;
         fast_frames_ = gi::GI_WORLD_PROBE_WINDOW;
     }
-    if(clipmap.get_content_epoch() != last_content_epoch_)
+    // COMPOSED epoch: the probes trace the composed field and read the light voxels, so the
+    // fast window keys on content actually landing - during an edit drag the target epoch
+    // churns every frame while recomposes coalesce, and each landing re-arms the window.
+    if(clipmap.get_composed_content_epoch() != last_content_epoch_)
     {
-        last_content_epoch_ = clipmap.get_content_epoch();
+        last_content_epoch_ = clipmap.get_composed_content_epoch();
         fast_frames_ = gi::GI_WORLD_PROBE_WINDOW;
     }
-    const uint32_t strata_per_frame = fast_frames_ > 0 ? 2u : 1u;
+    const uint32_t strata_per_frame = fast_frames_ > 0 ? 4u : 1u;
+    static_assert(gi::GI_WORLD_PROBE_WINDOW % 4 == 0,
+                  "fast-window strata must divide the probe window (exhaustive coverage)");
     if(fast_frames_ > 0)
     {
         --fast_frames_;
     }
-    const float probe_params[4] = {base_spacing, float(params.frame), 1.0f, float(strata_per_frame)};
+    // w carries the cage-visibility variance gate, its documented meaning for every reading
+    // consumer. The trace's strata-per-frame rides the trace-only seed-atlas uniform's z lane
+    // instead (see cs_gi_world_probe_trace.sc) - the old aliasing was one #define away from
+    // the gate silently becoming the stratum count.
+    const float probe_params[4] = {base_spacing,
+                                   float(params.frame),
+                                   1.0f,
+                                   gi::GI_WORLD_PROBE_CAGE_VIS_VARIANCE_GATE};
     const auto env_sh =
         params.irradiance_sh ? params.irradiance_sh : default_textures::get().black_texture();
     {
@@ -96,25 +113,39 @@ auto gi_world_probe_pass::run(gfx::render_view& rview, const run_params& params)
         gfx::set_buffer(2, atlas.get_indirection_buffer(), gfx::access::Read);
         gfx::set_buffer(3, surface_cache.get_instance_buffer(), gfx::access::Read);
         gfx::set_texture(trace_program_.s_sdf_clipmap, 4, clipmap_gpu.get_texture());
+        // ReadWrite: the trace folds each window's sample into the texel's running mean.
         gfx::set_image(5,
                        clipmap_gpu.get_world_probe_radiance()->native_handle(),
                        0,
-                       gfx::access::Write,
+                       gfx::access::ReadWrite,
                        gfx::texture_format::RGBA16F);
         gfx::set_buffer(6, clipmap_gpu.get_world_probe_cells(), gfx::access::ReadWrite);
+        gfx::set_buffer(7, clipmap_gpu.get_world_probe_counts(), gfx::access::ReadWrite);
+        // The window index's R2 offset in double (a float(frame) product loses the jitter
+        // over a long session); the fast window advances windows four times faster.
+        const double window_index =
+            std::floor(double(params.frame) * double(strata_per_frame) / double(gi::GI_WORLD_PROBE_WINDOW));
+        // z = the jitter/mean enable (the settings knob); 0 keeps texel centres at write-through.
+        const float jitter[4] = {float(std::fmod(0.754877666 * window_index, 1.0)),
+                                 float(std::fmod(0.569840291 * window_index, 1.0)),
+                                 params.jitter_directions ? 1.0f : 0.0f,
+                                 0.0f};
+        gfx::set_uniform(trace_program_.u_gi_world_probe_jitter, jitter);
         gfx::set_texture(trace_program_.s_light_voxels, 10, clipmap_gpu.get_light_voxel_texture());
         gfx::set_texture(trace_program_.s_world_probe_irradiance_seed,
                          11,
                          clipmap_gpu.get_world_probe_irradiance());
-        gfx::set_uniform(trace_program_.u_gi_world_probe_seed_atlas,
-                         clipmap_gpu.get_world_probe_atlas_params());
+        float seed_atlas[4] = {};
+        std::memcpy(seed_atlas, clipmap_gpu.get_world_probe_atlas_params(), sizeof(seed_atlas));
+        seed_atlas[2] = float(strata_per_frame);
+        gfx::set_uniform(trace_program_.u_gi_world_probe_seed_atlas, seed_atlas);
         gfx::set_buffer(12, surface_cache.get_grid_offset_buffer(), gfx::access::Read);
         gfx::set_buffer(13, surface_cache.get_grid_instance_buffer(), gfx::access::Read);
         gfx::set_texture(trace_program_.s_gi_env_sh, 14, env_sh);
         const float sdf_params[4] = {float(atlas.get_atlas_brick_dim()),
                                      float(atlas.get_atlas_voxel_dim()),
                                      float(instances.size()),
-                                     0.0f};
+                                     float(surface_cache.get_emitters().size())};
         gfx::set_uniform(trace_program_.u_sdf_params, sdf_params);
         gfx::set_uniform(trace_program_.u_sdf_grid_params, surface_cache.get_grid_params(), 2);
         gfx::set_uniform(trace_program_.u_sdf_clipmap_params, clipmap_gpu.get_sampling_params());
@@ -125,7 +156,14 @@ auto gi_world_probe_pass::run(gfx::render_view& rview, const run_params& params)
         gfx::set_uniform(trace_program_.u_gi_light_voxel_params, light_voxel_params);
         gfx::set_uniform(trace_program_.u_gi_world_probe_params, probe_params);
         gfx::set_uniform(trace_program_.u_gi_world_probe_window, window, global_sdf_clipmap::level_count);
-        gfx::dispatch(pass.id, trace_program_.program->native_handle(), probe_count, 1, 1);
+        // Four probes per 64-lane group (PROBE_TRACE_SLOTS in the kernel): a 16-lane group
+        // left half or three quarters of every wave idle.
+        constexpr uint32_t probes_per_group = 4u;
+        gfx::dispatch(pass.id,
+                      trace_program_.program->native_handle(),
+                      (probe_count + probes_per_group - 1u) / probes_per_group,
+                      1,
+                      1);
         trace_program_.program->end();
     }
     {

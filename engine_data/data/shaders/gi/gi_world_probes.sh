@@ -187,11 +187,55 @@ float GiWorldProbeCageVisibility(vec3 from, vec3 to, float spacing)
 		return 1.0;
 	}
 	float accept = GI_WORLD_PROBE_CAGE_VIS_ACCEPT_VOXELS * field_voxel;
+	/*
+	 * CROSSING conviction, alongside the negative-core one above.
+	 *
+	 * The negative test asks the field for a NEGATIVE INTERIOR, which a wall thinner than one
+	 * voxel of the level answering the sample simply does not have: the trilinear
+	 * reconstruction smooths its two faces into a dip that never reaches zero, so the march
+	 * walks straight through a wall the probe rays themselves stop dead on (they convict at
+	 * d < accept + expand = about +1.9 voxels - the two conventions disagree by ~19x AND by
+	 * sign). Raising this threshold to a positive proximity is what cannot be done: legitimate
+	 * cage segments run PARALLEL to the query's own surface by construction - on flat ground
+	 * four of the eight cage probes lie in the floor plane and the biased query clears it by
+	 * ~0.4 voxel - and a proximity test blocked those whole cages, painting the black
+	 * rings/donuts on open ground that ACCEPT_VOXELS is negative to avoid.
+	 *
+	 * Proximity is the wrong question; the field's SHAPE along the segment separates the two
+	 * cases outright. Because the field is 1-Lipschitz and a sphere trace steps by its own
+	 * reading, the measured rate d(d)/dt along the walk is exactly the sine of the segment's
+	 * incidence on the surface: a segment CROSSING a wall descends into a minimum and climbs
+	 * out the other side at that rate, while a segment GRAZING one runs at near-constant
+	 * clearance (rate ~0) and a segment ENDING on one (the flat-ground cage) descends
+	 * monotonically and never climbs. So conviction takes a V: a minimum inside the surface
+	 * band, followed by a rise at crossing rate. Grazes have no V, floor cages have no rise,
+	 * and no threshold has to be calibrated against a wall thickness.
+	 *
+	 * Strictly additive - the negative core still convicts on its own - so the verdict can
+	 * only ever get MORE conservative, which is the direction this reader must fail in. Costs
+	 * nothing: the discriminator is arithmetic over samples the march already takes.
+	 */
+	float band = GI_WORLD_PROBE_CAGE_VIS_CROSS_VOXELS * field_voxel;
+	float minimum_d = SDF_CLIPMAP_OUTSIDE;
+	float minimum_t = t;
 	float base_step = (t_end - t) / float(GI_WORLD_PROBE_CAGE_VIS_STEPS);
 	LOOP for(int i = 0; i < GI_WORLD_PROBE_CAGE_VIS_STEPS; ++i)
 	{
 		float d = GiCageVisibilitySample(from + direction * t);
 		if(d < accept)
+		{
+			return 0.0;
+		}
+		if(d < minimum_d)
+		{
+			minimum_d = d;
+			minimum_t = t;
+		}
+		// Climbing away from a minimum that reached the surface band, at crossing rate: the
+		// segment went through. Tested BEFORE the clearance break, which the far side of a
+		// crossed wall would otherwise satisfy first.
+		else if(minimum_d < band &&
+		        (d - minimum_d) >= GI_WORLD_PROBE_CAGE_VIS_CROSS_SLOPE * (t - minimum_t))
 		{
 			return 0.0;
 		}
@@ -254,14 +298,57 @@ uint GiWorldProbeCageMask(vec3 position, vec3 normal, vec3 view_direction, int l
 	return mask;
 }
 
-/// Bounce visibility-memo texel layout (stored in an R32U volume, low 16 bits used): low
-/// byte = the 8-bit cage mask above, bits 8-13 = a wrapping generation tag (0 reserved as
-/// "never stamped" - the volume clears to 0 and the CPU hands out generations 1..63), bits
-/// 14-15 = the probe LEVEL the mask was computed for. These four functions are the layout's
-/// single source of truth; the CPU transcriptions in gi_tests.cpp pin them by hand.
-uint GiWorldProbeVisMemoPack(uint mask, uint generation, int level)
+/// Bounce visibility-memo texel layout (an R32U volume, all 32 bits now spoken for):
+///   bits  0-7  = the 8-bit NEAR cage mask above,
+///   bits  8-13 = a wrapping generation tag shared by both halves (0 reserved as "never
+///                stamped" - the volume clears to 0 and the CPU hands out generations 1..63),
+///   bits 14-15 = the probe LEVEL the near mask was computed for,
+///   bits 16-21 = the face's cavity visibility quantised to 6 bits (error <= 1/126, consumed
+///                only as the bounce attenuator and to skip the cavity march). Quantised 0
+///                doubles as the CULLED sentinel: a stored non-culled face passed the
+///                GI_LIGHT_VOXEL_VISIBILITY_MIN (0.25) gate, so its quantised value is >= 16
+///                and the encodings can never collide.
+///   bit  22    = the FAR mask (below) is filled. Filled LAZILY, on the first probe-half HIT
+///                whose blend band is open - never on a miss: a miss marches enough already
+///                (the near cage), and on churning generations (camera motion re-snapping
+///                windows every few frames) an eager ungated far march on every miss cost
+///                MORE than the gated read it replaced. A generation that survives to its
+///                first hit has proven stable enough to amortise.
+///   bit  23    = the PROBE half (near mask, level) is populated. A culled or zero-radiance
+///                face stamps only the face half; fabricating mask 0 + level 0 instead would
+///                decode as a valid "all-dead level 0" verdict and pin the texel's cage
+///                fall-through to the wrong level for the whole generation.
+///   bits 24-31 = the FAR-blend cage mask, always for level + 1 of the near tag. Whether the
+///                blend band is open is a pure function of the texel's position and the
+///                window, both frozen within a generation.
+/// Every store writes the whole word (both halves share the one generation), and validity is
+/// generation match + the half's own populated semantics. These functions are the layout's
+/// single source of truth; the CPU transcriptions in gi_oracle.cpp pin them by hand.
+#define GI_VIS_MEMO_FACE_HALF_BITS 0x003F0000u
+
+/// The probe half of a full stamp: near mask + level, marked populated; the far mask and its
+/// filled bit only when the caller actually marched it (the lazy fill). OR the preserved (or
+/// freshly packed) face half on top - the caller owns that half.
+uint GiWorldProbeVisMemoPackProbe(uint mask, uint generation, int level, uint far_mask,
+                                  bool far_filled)
 {
-	return (mask & 0xFFu) | ((generation & 0x3Fu) << 8u) | (uint(level) << 14u);
+	return (mask & 0xFFu) | ((generation & 0x3Fu) << 8u) | (uint(level) << 14u) |
+	       (1u << 23u) | (far_filled ? (1u << 22u) : 0u) | ((far_mask & 0xFFu) << 24u);
+}
+
+/// The face half's payload bits (16-21) alone - combine with PackProbe or PackFaceOnly.
+/// Culled faces store quantised visibility 0 (see the sentinel note above).
+uint GiWorldProbeVisMemoPackFace(float visibility, bool culled)
+{
+	uint quantised = culled ? 0u : uint(saturate(visibility) * 63.0 + 0.5);
+	return quantised << 16u;
+}
+
+/// A face-half-only stamp (culled and zero-radiance faces, and the no-cage-answered
+/// fall-out): generation + face payload, probe half left unpopulated.
+uint GiWorldProbeVisMemoPackFaceOnly(uint face_half, uint generation)
+{
+	return face_half | ((generation & 0x3Fu) << 8u);
 }
 
 uint GiWorldProbeVisMemoMask(uint texel_value)
@@ -277,6 +364,31 @@ uint GiWorldProbeVisMemoGeneration(uint texel_value)
 int GiWorldProbeVisMemoLevel(uint texel_value)
 {
 	return int((texel_value >> 14u) & 0x3u);
+}
+
+float GiWorldProbeVisMemoFaceVisibility(uint texel_value)
+{
+	return float((texel_value >> 16u) & 0x3Fu) * (1.0 / 63.0);
+}
+
+bool GiWorldProbeVisMemoFaceCulled(uint texel_value)
+{
+	return ((texel_value >> 16u) & 0x3Fu) == 0u;
+}
+
+bool GiWorldProbeVisMemoFarFilled(uint texel_value)
+{
+	return (texel_value & (1u << 22u)) != 0u;
+}
+
+bool GiWorldProbeVisMemoProbeValid(uint texel_value)
+{
+	return (texel_value & (1u << 23u)) != 0u;
+}
+
+uint GiWorldProbeVisMemoFarMask(uint texel_value)
+{
+	return (texel_value >> 24u) & 0xFFu;
 }
 
 #ifndef GI_WORLD_PROBE_SKIP_IRRADIANCE
@@ -299,10 +411,16 @@ int GiWorldProbeVisMemoLevel(uint texel_value)
  */
 bool GiWorldProbeIrradianceInternal(vec3 position, vec3 normal, vec3 view_direction, int level,
                                     bool use_mask, uint visibility_mask,
-                                    out vec3 out_irradiance, out float out_sky_fraction)
+                                    out vec3 out_irradiance, out float out_sky_fraction, out float out_visible)
 {
 	out_irradiance = vec3_splat(0.0);
 	out_sky_fraction = 0.0;
+	// The cage's VISIBLE fraction: the weight that survived the field's verdict over the weight
+	// the statistical chain granted. 0 for a sealed cage. The cascade readers scale their
+	// blend toward the coarser cage by it, so a fine cage the field sealed never admits a
+	// coarse cage that straddles the wall (measured: the completion blend lit a thin-walled
+	// sealed room and a narrow corridor from the level-1 cages outside them).
+	out_visible = 0.0;
 	float spacing = GiWorldProbeSpacing(level);
 	vec3 biased = GiWorldProbeBiasedQuery(position, normal, view_direction, spacing);
 	vec3 grid = biased / spacing;
@@ -317,6 +435,9 @@ bool GiWorldProbeIrradianceInternal(vec3 position, vec3 normal, vec3 view_direct
 	// through the field-visibility term below, it distinguishes "no cage here" from "the cage
 	// is here and every probe of it is behind a wall" - two failures with opposite answers.
 	float covered_sum = 0.0;
+	// LOOP: the body carries the (gated) cage-visibility march; unrolled it multiplies the
+	// largest instruction footprint of every caller by eight.
+	LOOP
 	for(int corner = 0; corner < 8; ++corner)
 	{
 		ivec3 offset = ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1);
@@ -398,9 +519,18 @@ bool GiWorldProbeIrradianceInternal(vec3 position, vec3 normal, vec3 view_direct
 				continue;
 			}
 		}
-		else if(moments_ambiguous && GiWorldProbeCageVisibility(biased, probe_position, spacing) <= 0.0)
+		else
 		{
-			continue;
+			// Nested, never an && chain: HLSL && may evaluate both operands (FXC does), and
+			// the right operand is the 40-step field march the variance gate exists to skip.
+			BRANCH
+			if(moments_ambiguous)
+			{
+				if(GiWorldProbeCageVisibility(biased, probe_position, spacing) <= 0.0)
+				{
+					continue;
+				}
+			}
 		}
 		vec2 irradiance_uv =
 		    (vec2(tile) + vec2_splat(1.0) + oct_uv * float(GI_WORLD_PROBE_OCT_IRRADIANCE)) *
@@ -420,25 +550,27 @@ bool GiWorldProbeIrradianceInternal(vec3 position, vec3 normal, vec3 view_direct
 	}
 	out_irradiance = sum / weight_sum;
 	out_sky_fraction = sky_sum / weight_sum;
+	out_visible = covered_sum > 1e-5 ? saturate(weight_sum / covered_sum) : 1.0;
 	return true;
 }
 
 /// The default cage read: field verdicts marched here, gated to the Chebyshev-ambiguous band.
 bool GiWorldProbeIrradiance(vec3 position, vec3 normal, vec3 view_direction, int level,
-                            out vec3 out_irradiance, out float out_sky_fraction)
+                            out vec3 out_irradiance, out float out_sky_fraction, out float out_visible)
 {
 	return GiWorldProbeIrradianceInternal(position, normal, view_direction, level, false, 0u,
-	                                      out_irradiance, out_sky_fraction);
+	                                      out_irradiance, out_sky_fraction, out_visible);
 }
 
 /// The memoised cage read (light-voxel bounce): field verdicts supplied as the per-corner
 /// bitmask GiWorldProbeCageMask filled, applied to every probe in place of the gated march.
 bool GiWorldProbeIrradianceMasked(vec3 position, vec3 normal, vec3 view_direction, int level,
                                   uint visibility_mask,
-                                  out vec3 out_irradiance, out float out_sky_fraction)
+                                  out vec3 out_irradiance, out float out_sky_fraction, out float out_visible)
 {
 	return GiWorldProbeIrradianceInternal(position, normal, view_direction, level, true,
-	                                      visibility_mask, out_irradiance, out_sky_fraction);
+	                                      visibility_mask, out_irradiance, out_sky_fraction,
+	                                      out_visible);
 }
 
 /**
@@ -466,21 +598,28 @@ bool GiWorldProbeIrradianceCascade(vec3 position, vec3 normal, vec3 view_directi
 		}
 		vec3 near_irradiance;
 		float near_sky;
-		if(!GiWorldProbeIrradiance(position, normal, view_direction, level, near_irradiance, near_sky))
+		float near_visible;
+		if(!GiWorldProbeIrradiance(position, normal, view_direction, level, near_irradiance, near_sky,
+		                           near_visible))
 		{
 			continue;
 		}
 		// Blend toward the next level over the outer half of the last usable cell.
-		float band = 0.5 * spacing;
+		float band = GI_WORLD_PROBE_BLEND_BAND * spacing;
 		float blend = saturate((largest - (half_extent - band)) / band);
 		if(blend > 0.0 && level + 1 < SDF_CLIPMAP_LEVEL_COUNT)
 		{
 			vec3 far_irradiance;
 			float far_sky;
-			if(GiWorldProbeIrradiance(position, normal, view_direction, level + 1, far_irradiance, far_sky))
+			float far_visible;
+			if(GiWorldProbeIrradiance(position, normal, view_direction, level + 1, far_irradiance, far_sky,
+			                          far_visible))
 			{
-				near_irradiance = mix(near_irradiance, far_irradiance, blend);
-				near_sky = mix(near_sky, far_sky, blend);
+				// Scaled by the NEAR cage's visible fraction: the finer field is the authority, so
+				// a sealed fine cage admits nothing from a coarse one that straddles the wall.
+				float far_mix = blend * near_visible;
+				near_irradiance = mix(near_irradiance, far_irradiance, far_mix);
+				near_sky = mix(near_sky, far_sky, far_mix);
 			}
 		}
 		out_irradiance = GiFiniteOrZero(near_irradiance);
@@ -518,118 +657,174 @@ uniform vec4 u_gi_world_probe_radiance_atlas;
 bool GiWorldProbeRadiance(vec3 position, vec3 direction, vec3 window_center, out vec3 out_radiance)
 {
 	out_radiance = vec3_splat(0.0);
+	// LOOP on levels, cages and corners, exactly as the irradiance cage: the corner body
+	// carries the (gated) cage-visibility march, and unrolled it multiplied the largest
+	// instruction footprint of every completing trace kernel by eight per level.
+	LOOP
 	for(int level = 0; level < SDF_CLIPMAP_LEVEL_COUNT; ++level)
 	{
-		float spacing = GiWorldProbeSpacing(level);
-		float half_extent = (float(GI_WORLD_PROBE_AXIS - 1) * 0.5 - 1.0) * spacing;
+		float level_spacing = GiWorldProbeSpacing(level);
+		float half_extent = (float(GI_WORLD_PROBE_AXIS - 1) * 0.5 - 1.0) * level_spacing;
 		vec3 delta = abs(position - window_center);
-		if(max(delta.x, max(delta.y, delta.z)) > half_extent)
+		float largest = max(delta.x, max(delta.y, delta.z));
+		if(largest > half_extent)
 		{
 			continue;
 		}
-		vec3 grid = position / spacing;
-		ivec3 base_cell = ivec3(floor(grid));
-		vec3 frac = grid - vec3(base_cell);
-		vec3 sum = vec3_splat(0.0);
-		float weight_sum = 0.0;
-		// Same bookkeeping as the irradiance cage: the weight the statistical chain granted,
-		// before the field's verdict, so an all-blocked cage can answer darkness instead of
-		// falling through to the environment term.
-		float covered_sum = 0.0;
-		for(int corner = 0; corner < 8; ++corner)
+		// CASCADE BLEND, the irradiance cascade's band (GiWorldProbeIrradianceCascade): the
+		// completion used to take the finest covering level outright, so every gather ray's far
+		// energy switched cages at a knife edge 6 / 12 / 24 m from the camera cell - an edge the
+		// camera drags across every surface (measured as brightness pops on translation). The
+		// far cage is evaluated by the SAME loop body (k = 1) so fxc instantiates the corner
+		// walk once (the one-call-site contract of the trace mega-bodies).
+		float band = GI_WORLD_PROBE_BLEND_BAND * level_spacing;
+		float blend = saturate((largest - (half_extent - band)) / band);
+		bool wants_far = blend > 0.0 && level + 1 < SDF_CLIPMAP_LEVEL_COUNT;
+		vec3 near_radiance = vec3_splat(0.0);
+		vec3 far_radiance = vec3_splat(0.0);
+		bool near_answered = false;
+		bool far_answered = false;
+		float near_visible = 0.0;
+		LOOP
+		for(int k = 0; k < 2; ++k)
 		{
-			ivec3 offset = ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1);
-			ivec3 cell = base_cell + offset;
-			vec3 probe_position = GiWorldProbeCellPosition(cell, level);
-			vec3 tri = mix(vec3_splat(1.0) - frac, frac, vec3(offset));
-			float weight = max(tri.x, 0.001) * max(tri.y, 0.001) * max(tri.z, 0.001);
-			ivec3 slot = GiWorldProbeSlot(cell);
-			// Chebyshev visibility of the QUERY POINT from the probe, exactly as the
-			// irradiance read tests it - a probe behind a wall must not complete rays through
-			// it.
-			vec3 to_query = position - probe_position;
-			float query_distance = max(length(to_query), 1e-4);
-			ivec2 depth_tile = GiWorldProbeTileBase(slot, level, GI_WORLD_PROBE_OCT_IRRADIANCE + 2);
-			vec2 depth_uv = (vec2(depth_tile) + vec2_splat(1.0) +
-			                 GiOctEncode(to_query / query_distance) * float(GI_WORLD_PROBE_OCT_DEPTH)) *
-			                u_gi_world_probe_atlas.xy;
-			vec2 moments = texture2DLod(s_world_probe_depth, depth_uv, 0.0).xy;
-			// DEAD probe: no data, not a verdict - and no covered_sum, so all-dead cages fall
-			// through to the coarser level (see the irradiance cage).
-			if(moments.x <= 1e-4)
+			if(k == 1 && !wants_far)
 			{
-				continue;
+				break;
 			}
-			float variance = abs(moments.y - moments.x * moments.x);
-			bool moments_ambiguous = variance > u_world_probe_cage_vis_gate *
-			                                        u_world_probe_cage_vis_gate * spacing * spacing;
-			if(query_distance > moments.x)
+			int cage_level = level + k;
+			float spacing = GiWorldProbeSpacing(cage_level);
+			vec3 grid = position / spacing;
+			ivec3 base_cell = ivec3(floor(grid));
+			vec3 frac = grid - vec3(base_cell);
+			vec3 sum = vec3_splat(0.0);
+			float weight_sum = 0.0;
+			// Same bookkeeping as the irradiance cage: the weight the statistical chain
+			// granted, before the field's verdict, so an all-blocked cage can answer darkness
+			// instead of falling through to the environment term.
+			float covered_sum = 0.0;
+			LOOP
+			for(int corner = 0; corner < 8; ++corner)
 			{
-				float difference = query_distance - moments.x;
-				float chebyshev = variance / (variance + difference * difference);
-				chebyshev = chebyshev * chebyshev * chebyshev;
-				// CONFIDENTLY blocked - zero, never floored: this reader has no perception
-				// crush, so floored probes renormalise to FULL amplitude when the whole cage
-				// is blocked, completing interior rays with the sunlit far side of the wall.
-				if(!moments_ambiguous && chebyshev < GI_CHEBYSHEV_WEIGHT_FLOOR)
+				ivec3 offset = ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1);
+				ivec3 cell = base_cell + offset;
+				vec3 probe_position = GiWorldProbeCellPosition(cell, cage_level);
+				vec3 tri = mix(vec3_splat(1.0) - frac, frac, vec3(offset));
+				float weight = max(tri.x, 0.001) * max(tri.y, 0.001) * max(tri.z, 0.001);
+				ivec3 slot = GiWorldProbeSlot(cell);
+				// Chebyshev visibility of the QUERY POINT from the probe, exactly as the
+				// irradiance read tests it - a probe behind a wall must not complete rays
+				// through it.
+				vec3 to_query = position - probe_position;
+				float query_distance = max(length(to_query), 1e-4);
+				ivec2 depth_tile =
+				    GiWorldProbeTileBase(slot, cage_level, GI_WORLD_PROBE_OCT_IRRADIANCE + 2);
+				vec2 depth_uv = (vec2(depth_tile) + vec2_splat(1.0) +
+				                 GiOctEncode(to_query / query_distance) * float(GI_WORLD_PROBE_OCT_DEPTH)) *
+				                u_gi_world_probe_atlas.xy;
+				vec2 moments = texture2DLod(s_world_probe_depth, depth_uv, 0.0).xy;
+				// DEAD probe: no data, not a verdict - and no covered_sum, so all-dead cages
+				// fall through to the coarser level (see the irradiance cage).
+				if(moments.x <= 1e-4)
 				{
-					covered_sum += weight;
 					continue;
 				}
-				weight *= max(chebyshev, GI_CHEBYSHEV_WEIGHT_FLOOR);
+				float variance = abs(moments.y - moments.x * moments.x);
+				bool moments_ambiguous = variance > u_world_probe_cage_vis_gate *
+				                                        u_world_probe_cage_vis_gate * spacing * spacing;
+				if(query_distance > moments.x)
+				{
+					float difference = query_distance - moments.x;
+					float chebyshev = variance / (variance + difference * difference);
+					chebyshev = chebyshev * chebyshev * chebyshev;
+					// CONFIDENTLY blocked - zero, never floored: this reader has no
+					// perception crush, so floored probes renormalise to FULL amplitude when
+					// the whole cage is blocked, completing interior rays with the sunlit far
+					// side of the wall.
+					if(!moments_ambiguous && chebyshev < GI_CHEBYSHEV_WEIGHT_FLOOR)
+					{
+						covered_sum += weight;
+						continue;
+					}
+					weight *= max(chebyshev, GI_CHEBYSHEV_WEIGHT_FLOOR);
+				}
+				if(weight <= 1e-5)
+				{
+					continue;
+				}
+				covered_sum += weight;
+				// Field visibility for the AMBIGUOUS band only, unfloored (see the irradiance
+				// cage): the depth moments blur silhouettes into ~22-degree wedges that pass
+				// exterior probes at full weight, and a completed ray carries that import into
+				// every gather cone - the dominant sealed-room leak once the trace side was
+				// watertight. The gate keeps completions affordable: most miss-ray cages are
+				// open-lobe or flat-wall cases the moments already answer.
+				//
+				// Nested, never an && chain: HLSL && may evaluate both operands (FXC does),
+				// and the right operand is the 40-step field march the gate exists to skip.
+				BRANCH
+				if(moments_ambiguous)
+				{
+					if(GiWorldProbeCageVisibility(position, probe_position, spacing) <= 0.0)
+					{
+						continue;
+					}
+				}
+				// Sphere parallax: read toward where the ray meets the probe's visibility
+				// sphere. The stored mean depth toward the RAY direction is the sphere radius
+				// estimate.
+				ivec2 tile = GiWorldProbeTileBase(slot, cage_level, GI_WORLD_PROBE_OCT_RADIANCE);
+				vec2 radius_uv = (vec2(depth_tile) + vec2_splat(1.0) +
+				                  GiOctEncode(direction) * float(GI_WORLD_PROBE_OCT_DEPTH)) *
+				                 u_gi_world_probe_atlas.xy;
+				float radius = max(texture2DLod(s_world_probe_depth, radius_uv, 0.0).x, 0.25 * spacing);
+				vec3 corrected = normalize(position + direction * radius - probe_position);
+				vec2 radiance_uv =
+				    (vec2(tile) + (GiOctEncode(corrected) * float(GI_WORLD_PROBE_OCT_RADIANCE))) *
+				    u_gi_world_probe_radiance_atlas.xy;
+				// Manual clamp inside the tile: the radiance atlas has no gutter, and a
+				// bilinear tap crossing into a neighbour probe's tile would mix unrelated
+				// probes.
+				vec2 tile_min = (vec2(tile) + vec2_splat(0.5)) * u_gi_world_probe_radiance_atlas.xy;
+				vec2 tile_max = (vec2(tile) + vec2_splat(float(GI_WORLD_PROBE_OCT_RADIANCE) - 0.5)) *
+				                u_gi_world_probe_radiance_atlas.xy;
+				radiance_uv = clamp(radiance_uv, tile_min, tile_max);
+				vec3 sample_radiance = texture2DLod(s_world_probe_radiance_read, radiance_uv, 0.0).xyz;
+				sum += sample_radiance * weight;
+				weight_sum += weight;
 			}
-			if(weight <= 1e-5)
-			{
-				continue;
-			}
-			covered_sum += weight;
-			// Field visibility for the AMBIGUOUS band only, unfloored (see the irradiance
-			// cage): the depth moments blur silhouettes into ~22-degree wedges that pass
-			// exterior probes at full weight, and a completed ray carries that import into
-			// every gather cone - the dominant sealed-room leak once the trace side was
-			// watertight. The gate keeps completions affordable: most miss-ray cages are
-			// open-lobe or flat-wall cases the moments already answer.
-			if(moments_ambiguous && GiWorldProbeCageVisibility(position, probe_position, spacing) <= 0.0)
-			{
-				continue;
-			}
-			// Sphere parallax: read toward where the ray meets the probe's visibility sphere.
-			// The stored mean depth toward the RAY direction is the sphere radius estimate.
-			ivec2 tile = GiWorldProbeTileBase(slot, level, GI_WORLD_PROBE_OCT_RADIANCE);
-			vec2 radius_uv = (vec2(depth_tile) + vec2_splat(1.0) +
-			                  GiOctEncode(direction) * float(GI_WORLD_PROBE_OCT_DEPTH)) *
-			                 u_gi_world_probe_atlas.xy;
-			float radius = max(texture2DLod(s_world_probe_depth, radius_uv, 0.0).x, 0.25 * spacing);
-			vec3 corrected = normalize(position + direction * radius - probe_position);
-			vec2 radiance_uv = (vec2(tile) + (GiOctEncode(corrected) * float(GI_WORLD_PROBE_OCT_RADIANCE))) *
-			                   u_gi_world_probe_radiance_atlas.xy;
-			// Manual clamp inside the tile: the radiance atlas has no gutter, and a bilinear tap
-			// crossing into a neighbour probe's tile would mix unrelated probes.
-			vec2 tile_min = (vec2(tile) + vec2_splat(0.5)) * u_gi_world_probe_radiance_atlas.xy;
-			vec2 tile_max = (vec2(tile) + vec2_splat(float(GI_WORLD_PROBE_OCT_RADIANCE) - 0.5)) *
-			                u_gi_world_probe_radiance_atlas.xy;
-			radiance_uv = clamp(radiance_uv, tile_min, tile_max);
-			vec3 sample_radiance = texture2DLod(s_world_probe_radiance_read, radiance_uv, 0.0).xyz;
-			sum += sample_radiance * weight;
-			weight_sum += weight;
-		}
-		if(weight_sum <= 1e-5)
-		{
 			// Cage present but field-blocked in every direction: the completion is darkness
-			// (out_radiance stays zero), never the environment fallback - the ray is INSIDE
-			// something sealed.
-			if(covered_sum > 1e-5)
+			// (zero radiance), never the environment fallback - the ray is INSIDE something
+			// sealed. A cage that never carried weight at all (every probe DEAD) is no answer.
+			bool answered = weight_sum > 1e-5 || covered_sum > 1e-5;
+			vec3 cage_radiance = weight_sum > 1e-5 ? sum / weight_sum : vec3_splat(0.0);
+			if(k == 0)
 			{
-				return true;
+				near_answered = answered;
+				near_radiance = cage_radiance;
+				// The fine cage's visible fraction gates the far blend (see the irradiance cascade).
+				near_visible = covered_sum > 1e-5 ? saturate(weight_sum / covered_sum) : 0.0;
 			}
-			// The cage never carried weight at all - every probe DEAD (buried lattice points
-			// near dense geometry). No data is not an answer: let the next level's cage try,
-			// marched and sealed like this one. Returning false here handed these queries to
-			// the environment SH - measured as sky patches inside sealed rooms wherever the
-			// finest covering cage was fully buried.
+			else
+			{
+				far_answered = answered;
+				far_radiance = cage_radiance;
+			}
+		}
+		if(!near_answered)
+		{
+			// Every probe of the near cage DEAD (buried lattice points near dense geometry).
+			// No data is not an answer: let the next level's cage try, marched and sealed like
+			// this one. Returning false here handed these queries to the environment SH -
+			// measured as sky patches inside sealed rooms wherever the finest covering cage
+			// was fully buried.
 			continue;
 		}
-		out_radiance = GiFiniteOrZero(sum / weight_sum);
+		if(far_answered)
+		{
+			near_radiance = mix(near_radiance, far_radiance, blend * near_visible);
+		}
+		out_radiance = GiFiniteOrZero(near_radiance);
 		return true;
 	}
 	return false;

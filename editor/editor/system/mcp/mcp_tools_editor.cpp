@@ -2,7 +2,7 @@
 
 #include <editor/editing/editor_actions.h>
 #include <editor/system/project_manager.h>
-#include <filesystem/filesystem.h>
+#include <graphics/graphics.h>
 
 #include <algorithm>
 #include <logging/logging.h>
@@ -73,10 +73,10 @@ auto play_state_to_json(const play_state_info& info) -> std::string
     return fmt::format(
         R"({{"phase":{},"is_active":{},"is_paused":{},"is_splash":{},"is_simulation_running":{},"frames_running":{}}})",
         make_json_string(info.phase),
-        info.is_active ? "true" : "false",
-        info.is_paused ? "true" : "false",
-        info.is_splash ? "true" : "false",
-        info.is_simulation_running ? "true" : "false",
+        bool_to_json(info.is_active),
+        bool_to_json(info.is_paused),
+        bool_to_json(info.is_splash),
+        bool_to_json(info.is_simulation_running),
         info.frames_running);
 }
 
@@ -93,59 +93,10 @@ void register_editor_tools(mcp_tool_registry& registry)
          .handler =
              [](rtti::context& ctx, const simdjson::dom::object&) -> tool_result
              {
-                 std::string project_json = R"({"open":false})";
-                 if(ctx.has<project_manager>())
-                 {
-                     auto& pm = ctx.get_cached<project_manager>();
-                     if(pm.has_open_project())
-                     {
-                         const auto& info = pm.get_project_info();
-                         const auto path = fs::resolve_protocol("app:/").generic_string();
-                         project_json = fmt::format(R"({{"open":true,"name":{},"path":{},"guid":{}}})",
-                                                    make_json_string(pm.get_name()),
-                                                    make_json_string(path),
-                                                    make_json_string(info.project_guid));
-                     }
-                 }
-
-                 std::string phase = "inactive";
-                 if(ctx.has<play_mode>())
-                 {
-                     auto& play = ctx.get_cached<play_mode>();
-                     if(play.is_splash())
-                     {
-                         phase = "splash";
-                     }
-                     else if(play.is_simulation_running())
-                     {
-                         phase = "running";
-                     }
-                     else if(play.is_active())
-                     {
-                         phase = "active";
-                     }
-                 }
-
-                 std::string scene_json = fmt::format(R"({{"has_scene":false,"play_phase":{}}})",
-                                                      make_json_string(phase));
-                 auto& em = ctx.get_cached<editing_manager>();
-                 auto* scn = em.get_active_scene(ctx);
-                 if(scn && scn->registry)
-                 {
-                     const auto entity_count = scn->registry->storage<entt::entity>().size();
-                     const auto source = scn->source ? scn->source.id() : std::string{};
-                     scene_json =
-                         fmt::format(R"({{"has_scene":true,"tag":{},"source":{},"entity_count":{},"play_phase":{}}})",
-                                     make_json_string(scn->tag),
-                                     make_json_string(source),
-                                     entity_count,
-                                     make_json_string(phase));
-                 }
-
                  const auto play_json = play_state_to_json(editor_actions::get_play_state(ctx));
                  return {.text = fmt::format(R"({{"project":{},"scene":{},"play":{}}})",
-                                             project_json,
-                                             scene_json,
+                                             project_info_json(ctx),
+                                             active_scene_status_json(ctx),
                                              play_json),
                          .is_error = false};
              },
@@ -183,7 +134,7 @@ void register_editor_tools(mcp_tool_registry& registry)
                  {
                      return {.text = error, .is_error = true};
                  }
-                 return {.text = fmt::format(R"({{"ok":true,"active":{}}})", active ? "true" : "false"),
+                 return {.text = fmt::format(R"({{"ok":true,"active":{}}})", bool_to_json(active)),
                          .is_error = false};
              },
          .mutates_scene = false});
@@ -206,7 +157,7 @@ void register_editor_tools(mcp_tool_registry& registry)
                  {
                      return {.text = error, .is_error = true};
                  }
-                 return {.text = fmt::format(R"({{"ok":true,"paused":{}}})", paused ? "true" : "false"),
+                 return {.text = fmt::format(R"({{"ok":true,"paused":{}}})", bool_to_json(paused)),
                          .is_error = false};
              },
          .mutates_scene = false});
@@ -235,21 +186,7 @@ void register_editor_tools(mcp_tool_registry& registry)
              [](rtti::context& ctx, const simdjson::dom::object&) -> tool_result
              {
                  const auto sel = editor_actions::get_selection(ctx);
-                 std::string ids = "[";
-                 for(size_t i = 0; i < sel.entity_ids.size(); ++i)
-                 {
-                     if(i > 0)
-                     {
-                         ids += ",";
-                     }
-                     ids += make_json_string(sel.entity_ids[i]);
-                 }
-                 ids += "]";
-                 return {.text = fmt::format(R"({{"active_entity_id":{},"entity_ids":{}}})",
-                                             sel.active_entity_id.empty() ? "null"
-                                                                          : make_json_string(sel.active_entity_id),
-                                             ids),
-                         .is_error = false};
+                 return {.text = selection_to_json(sel.active_entity_id, sel.entity_ids), .is_error = false};
              },
          .mutates_scene = false});
 
@@ -263,20 +200,11 @@ void register_editor_tools(mcp_tool_registry& registry)
          .handler =
              [](rtti::context& ctx, const simdjson::dom::object& args) -> tool_result
              {
-                 simdjson::dom::array arr;
-                 if(args["entity_ids"].get(arr))
-                 {
-                     return {.text = "Missing entity_ids", .is_error = true};
-                 }
                  std::vector<std::string> ids;
-                 for(auto el : arr)
+                 std::string error;
+                 if(!read_string_array(args, "entity_ids", ids, error))
                  {
-                     std::string_view view;
-                     if(el.get(view))
-                     {
-                         return {.text = "entity_ids must be strings", .is_error = true};
-                     }
-                     ids.emplace_back(view);
+                     return {.text = error, .is_error = true};
                  }
                  bool add = false;
                  std::string mode;
@@ -284,27 +212,12 @@ void register_editor_tools(mcp_tool_registry& registry)
                  {
                      add = true;
                  }
-                 std::string error;
                  if(!editor_actions::set_selection(ctx, ids, add, &error))
                  {
                      return {.text = error, .is_error = true};
                  }
                  const auto sel = editor_actions::get_selection(ctx);
-                 std::string out_ids = "[";
-                 for(size_t i = 0; i < sel.entity_ids.size(); ++i)
-                 {
-                     if(i > 0)
-                     {
-                         out_ids += ",";
-                     }
-                     out_ids += make_json_string(sel.entity_ids[i]);
-                 }
-                 out_ids += "]";
-                 return {.text = fmt::format(R"({{"active_entity_id":{},"entity_ids":{}}})",
-                                             sel.active_entity_id.empty() ? "null"
-                                                                          : make_json_string(sel.active_entity_id),
-                                             out_ids),
-                         .is_error = false};
+                 return {.text = selection_to_json(sel.active_entity_id, sel.entity_ids), .is_error = false};
              },
          .mutates_scene = false});
 
@@ -466,6 +379,61 @@ void register_editor_tools(mcp_tool_registry& registry)
                          .is_error = false};
              },
          .mutates_scene = true});
+
+    registry.add(
+        {.name = "profiler_get_passes",
+         .description =
+             "Per-render-pass CPU/GPU timings of the last frame (bgfx view stats, ms). Optional "
+             "prefix filters pass names (e.g. \"Atmospherics\"). One frame is noisy: sample it "
+             "several times and average. Pass enable:true once to switch the GPU profiler on.",
+         .input_schema_json = R"({"type":"object","properties":{"prefix":{"type":"string"},"enable":{"type":"boolean"}}})",
+         .handler =
+             [](rtti::context&, const simdjson::dom::object& args) -> tool_result
+             {
+                 std::string prefix;
+                 std::string_view prefix_view;
+                 if(!args["prefix"].get(prefix_view))
+                 {
+                     prefix = std::string(prefix_view);
+                 }
+                 // The GPU view timings only exist while the bgfx profiler is on (same switch
+                 // as the profiler panel's Enable checkbox).
+                 bool enable = false;
+                 if(!args["enable"].get(enable))
+                 {
+                     gfx::set_debug(enable ? BGFX_DEBUG_PROFILER : BGFX_DEBUG_NONE);
+                 }
+                 const auto* stats = gfx::get_stats();
+                 if(!stats)
+                 {
+                     return {.text = "No stats available", .is_error = true};
+                 }
+                 const double cpu_to_ms = 1000.0 / static_cast<double>(stats->cpuTimerFreq);
+                 const double gpu_to_ms = 1000.0 / static_cast<double>(stats->gpuTimerFreq);
+                 std::string json = "[";
+                 bool first = true;
+                 for(uint16_t pos = 0; pos < stats->numViews; ++pos)
+                 {
+                     const auto& view = stats->viewStats[pos];
+                     const std::string name(view.name);
+                     if(!prefix.empty() && name.rfind(prefix, 0) != 0)
+                     {
+                         continue;
+                     }
+                     const double cpu_ms = static_cast<double>(view.cpuTimeEnd - view.cpuTimeBegin) * cpu_to_ms;
+                     const double gpu_ms = static_cast<double>(view.gpuTimeEnd - view.gpuTimeBegin) * gpu_to_ms;
+                     json += fmt::format(R"({}{{"view":{},"name":{},"cpu_ms":{:.4f},"gpu_ms":{:.4f}}})",
+                                         first ? "" : ",",
+                                         int(view.view),
+                                         make_json_string(name),
+                                         cpu_ms,
+                                         gpu_ms);
+                     first = false;
+                 }
+                 json += "]";
+                 return {.text = json, .is_error = false};
+             },
+         .mutates_scene = false});
 }
 
 } // namespace unravel::mcp

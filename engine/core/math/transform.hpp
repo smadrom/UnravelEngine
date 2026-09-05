@@ -9,13 +9,41 @@ namespace math
 {
 using namespace glm;
 
+// The `inline` keyword matters here: transform_t is explicitly instantiated
+// (extern template below), which suppresses implicit instantiation - without
+// `inline` every call from other TUs must go through the out-of-line symbols in
+// transform.cpp and small hot getters cannot be inlined (short of LTO).
 #ifdef _MSC_VER
-#define TRANSFORM_INLINE //__forceinline
+#define TRANSFORM_INLINE inline
 #elif defined(__GNUC__) || defined(__clang__)
-#define TRANSFORM_INLINE //inline
+#define TRANSFORM_INLINE inline
 #else
-#define TRANSFORM_INLINE //inline
+#define TRANSFORM_INLINE inline
 #endif
+
+// Big cold bodies (the WebKit matrix decompose, general-path normal math) are
+// pinned out of line: letting them inline into hot loops measurably regressed
+// RelWithDebInfo (decompose 66 -> 93 ns/op in the transform suite bench), while
+// the thin dirty-flag checks around them benefit from inlining.
+#if defined(_MSC_VER) && !defined(__clang__)
+#define TRANSFORM_NOINLINE __declspec(noinline)
+#else
+#define TRANSFORM_NOINLINE __attribute__((noinline))
+#endif
+
+/// Absolute tolerance for treating decomposed skew as zero. Float decompose of a
+/// genuine TRS matrix leaves skew residue up to ~1e-6; glm::epsilon (~1.19e-7) sits
+/// below that noise floor, which permanently knocked every matrix-roundtripped
+/// transform off the simplified fast paths and made recompose multiply noise shear
+/// matrices back in.
+template<typename T>
+inline constexpr T k_skew_zero_tolerance = static_cast<T>(1e-5);
+
+/// Relative tolerance for scale uniformity. Decompose noise on the extracted scale
+/// grows with its magnitude, so an absolute epsilon misclassifies large scales;
+/// the comparison floors the reference at 1 so tiny scales use it absolutely.
+template<typename T>
+inline constexpr T k_scale_uniform_tolerance = static_cast<T>(1e-5);
 
 /**
  * @brief General purpose transformation class designed to maintain each component of
@@ -439,15 +467,15 @@ public:
     /**
      * @brief Compare this transform with another.
      * @param t The transform to compare with.
-     * @return -1, 0, or 1 based on comparison.
+     * @return 0 if equal within the default epsilon, 1 otherwise.
      */
     auto compare(const transform_t& rhs) const noexcept -> int;
 
     /**
      * @brief Compare this transform with another within a tolerance.
      * @param t The transform to compare with.
-     * @param tolerance The tolerance value.
-     * @return -1, 0, or 1 based on comparison.
+     * @param tolerance The per-element tolerance value.
+     * @return 0 if equal within the tolerance, 1 otherwise.
      */
     auto compare(const transform_t& rhs, T tolerance) const noexcept -> int;
 
@@ -665,6 +693,22 @@ private:
     void make_matrix_dirty() noexcept;
     void make_components_dirty() noexcept;
 
+    /**
+     * @brief Out-of-line body of update_components: full matrix decompose plus
+     * cache/hint bookkeeping. Only ever called with components_need_recompute_ set.
+     */
+    void decompose_matrix() const noexcept;
+
+    /**
+     * @brief Out-of-line general (skew/perspective/non-uniform) branch of transform_normal.
+     */
+    auto transform_normal_general(const vec3_t& v) const noexcept -> vec3_t;
+
+    /**
+     * @brief Out-of-line general branch of inverse_transform_normal.
+     */
+    auto inverse_transform_normal_general(const vec3_t& v) const noexcept -> vec3_t;
+
     // Helper functions to check if skew and perspective are zero/identity
     auto is_skew_zero() const noexcept -> bool;
     auto is_perspective_identity() const noexcept -> bool;
@@ -767,12 +811,35 @@ private:
      * @brief Marks the Euler hint invalid so the next get recomputes from the quaternion.
      */
     void make_euler_hint_dirty() const noexcept;
+
+    // inverse() builds the component-space inverse directly for uniform TRS
+    // transforms, which needs member access.
+    template<typename T2, precision Q2>
+    friend auto inverse(transform_t<T2, Q2> const& t) noexcept -> transform_t<T2, Q2>;
 };
 
 template<typename T, precision Q>
 auto inverse(transform_t<T, Q> const& t) noexcept -> transform_t<T, Q>
 {
+    // Uniform TRS: exact component inverse. No 4x4 inverse, and the result's
+    // components are already valid, so no decompose is deferred onto the caller.
+    if(t.can_use_simplified_calculations())
+    {
+        transform_t<T, Q> result;
+        const T inv_scale = T(1) / detail::scale_fix(t.scale_.x);
+        result.rotation_ = glm::conjugate(t.rotation_);
+        result.scale_ = typename transform_t<T, Q>::vec3_t(inv_scale, inv_scale, inv_scale);
+        result.position_ = -(result.rotation_ * (t.position_ * inv_scale));
+        result.matrix_needs_recompute_ = true;
+        return result;
+    }
+
     const auto& m = t.get_matrix();
+    if(!t.components_need_recompute_ && t.is_perspective_identity_cached_)
+    {
+        // Affine: cheaper and better conditioned than the general inverse.
+        return glm::affineInverse(m);
+    }
     return glm::inverse(m);
 }
 
@@ -1037,10 +1104,17 @@ TRANSFORM_INLINE void transform_t<T, Q>::set_rotation(const quat_t& rotation) no
     update_components();
     const quat_t normalized = glm::normalize(rotation);
     // Undo/property actions re-apply the same orientation via set_rotation after
-    // set_rotation_euler*. Keep the typed Euler hint unless orientation actually changed.
-    if(!rotations_equivalent(normalized, rotation_))
+    // set_rotation_euler*. Keep the typed Euler hint only while it still maps to the
+    // NEW orientation. Comparing new-vs-previous instead would let many small
+    // incremental rotations (each within tolerance of the last) drift arbitrarily
+    // far from a hint that is never invalidated.
+    if(!euler_hint_dirty_)
     {
-        make_euler_hint_dirty();
+        const quat_t from_hint = glm::normalize(quat_t(radians(euler_angles_hint_)));
+        if(!rotations_equivalent(from_hint, normalized))
+        {
+            make_euler_hint_dirty();
+        }
     }
     rotation_ = normalized;
     make_matrix_dirty();
@@ -1094,8 +1168,13 @@ TRANSFORM_INLINE auto transform_t<T, Q>::x_axis() const noexcept -> typename tra
 {
     if(can_use_simplified_calculations_without_uniform_scale())
     {
-        // X axis is the first column of the rotation matrix scaled
-        return get_rotation() * vec3_t(get_scale().x, 0, 0);
+        // First column of mat3_cast(rotation), scaled: ~12 flops instead of a
+        // generic ~30-flop quat * vec3 rotation of a sparse vector.
+        const quat_t& q = rotation_;
+        return vec3_t(T(1) - T(2) * (q.y * q.y + q.z * q.z),
+                      T(2) * (q.x * q.y + q.w * q.z),
+                      T(2) * (q.x * q.z - q.w * q.y)) *
+               scale_.x;
     }
 
     return get_matrix()[0];
@@ -1106,8 +1185,12 @@ TRANSFORM_INLINE auto transform_t<T, Q>::y_axis() const noexcept -> typename tra
 {
     if(can_use_simplified_calculations_without_uniform_scale())
     {
-        // Y axis is the second column of the rotation matrix scaled
-        return get_rotation() * vec3_t(0, get_scale().y, 0);
+        // Second column of mat3_cast(rotation), scaled.
+        const quat_t& q = rotation_;
+        return vec3_t(T(2) * (q.x * q.y - q.w * q.z),
+                      T(1) - T(2) * (q.x * q.x + q.z * q.z),
+                      T(2) * (q.y * q.z + q.w * q.x)) *
+               scale_.y;
     }
 
     return get_matrix()[1];
@@ -1118,8 +1201,12 @@ TRANSFORM_INLINE auto transform_t<T, Q>::z_axis() const noexcept -> typename tra
 {
     if(can_use_simplified_calculations_without_uniform_scale())
     {
-        // Z axis is the third column of the rotation matrix scaled
-        return get_rotation() * vec3_t(0, 0, get_scale().z);
+        // Third column of mat3_cast(rotation), scaled.
+        const quat_t& q = rotation_;
+        return vec3_t(T(2) * (q.x * q.z + q.w * q.y),
+                      T(2) * (q.y * q.z - q.w * q.x),
+                      T(1) - T(2) * (q.x * q.x + q.y * q.y)) *
+               scale_.z;
     }
 
     return get_matrix()[2];
@@ -1153,7 +1240,15 @@ TRANSFORM_INLINE void transform_t<T, Q>::rotate(const quat_t& q) noexcept
 template<typename T, precision Q>
 TRANSFORM_INLINE void transform_t<T, Q>::rotate_axis(T a, const vec3_t& v) noexcept
 {
-    quat_t q = glm::angleAxis(a, v) * get_rotation();
+    // glm::angleAxis requires a unit axis; normalize so arbitrary caller input rotates
+    // by the requested angle. A degenerate axis has no defined rotation - do nothing
+    // rather than poison the quaternion with NaNs.
+    const T axis_len2 = dot(v, v);
+    if(axis_len2 <= epsilon<T>())
+    {
+        return;
+    }
+    quat_t q = glm::angleAxis(a, v / sqrt(axis_len2)) * get_rotation();
     set_rotation(q);
 }
 
@@ -1270,21 +1365,10 @@ TRANSFORM_INLINE auto transform_t<T, Q>::compare(const transform_t& rhs, T toler
     const auto& m1 = get_matrix();
     const auto& m2 = rhs.get_matrix();
 
-    // Compare matrices
-    for(int i = 0; i < 4; ++i)
+    // Compare matrices; every element honors the caller's tolerance.
+    for(length_t i = 0; i < 4; ++i)
     {
-        vec4_t diff = m1[i] - m2[i];
-
-        if(i == 3)
-        {
-            diff.w = 0.0f;
-
-            if(!glm::epsilonEqual(m1[i].w, m2[i].w, T(0.001)))
-            {
-                return 1;
-            }
-        }
-
+        const vec4_t diff = m1[i] - m2[i];
         if(!glm::all(glm::epsilonEqual(diff, glm::zero<vec4_t>(), tolerance)))
         {
             return 1;
@@ -1334,6 +1418,16 @@ TRANSFORM_INLINE auto transform_t<T, Q>::transform_coord(const vec3_t& v) const 
 
     // Use matrix multiplication
     vec4_t result = get_matrix() * vec4_t(v, T(1));
+    if(!components_need_recompute_ && is_perspective_identity_cached_)
+    {
+        // Affine matrix: w is exactly 1, skip the divide.
+        return vec3_t(result);
+    }
+    if(abs(result.w) <= epsilon<T>())
+    {
+        // Point on the eye plane of a perspective transform: no finite projection.
+        return vec3_t(result);
+    }
     return vec3_t(result) / result.w;
 }
 
@@ -1362,7 +1456,18 @@ TRANSFORM_INLINE auto transform_t<T, Q>::inverse_transform_coord(const vec3_t& v
     }
 
     // Use matrix multiplication
+    if(!components_need_recompute_ && is_perspective_identity_cached_)
+    {
+        // Affine matrix: the affine inverse is cheaper and w stays exactly 1.
+        vec4_t result = glm::affineInverse(get_matrix()) * vec4_t(v, T(1));
+        return vec3_t(result);
+    }
     vec4_t result = glm::inverse(get_matrix()) * vec4_t(v, T(1));
+    if(abs(result.w) <= epsilon<T>())
+    {
+        // Point on the eye plane of a perspective transform: no finite projection.
+        return vec3_t(result);
+    }
     return vec3_t(result) / result.w;
 }
 
@@ -1370,13 +1475,24 @@ template<typename T, precision Q>
 TRANSFORM_INLINE auto transform_t<T, Q>::transform_normal(const vec3_t& v) const noexcept ->
     typename transform_t<T, Q>::vec3_t
 {
-    // here skew can affect the direction of the normal
+    // Contract: the direction of the inverse-transpose (normal matrix) with the input's
+    // length preserved. Backs Unity-style TransformDirection, so length must not pick up
+    // the object's scale, and both branches must agree.
     if(can_use_simplified_calculations())
     {
-        // Direct transformation using components (normals are not affected by translation)
-        return get_rotation() * v;
+        // Uniform scale s: the normal matrix is (1/s) * R, so the direction is
+        // sign(s) * (R * v) and the length of v is already preserved.
+        const vec3_t rotated = get_rotation() * v;
+        return get_scale().x < T(0) ? -rotated : rotated;
     }
 
+    return transform_normal_general(v);
+}
+
+template<typename T, precision Q>
+TRANSFORM_NOINLINE auto transform_t<T, Q>::transform_normal_general(const vec3_t& v) const noexcept ->
+    typename transform_t<T, Q>::vec3_t
+{
     // Use matrix multiplication
     // Extract the linear (rotation, scaling, skew) part of the transformation matrix
     mat3_t linear_matrix = mat3_t(get_matrix());
@@ -1385,25 +1501,55 @@ TRANSFORM_INLINE auto transform_t<T, Q>::transform_normal(const vec3_t& v) const
     mat3_t normal_matrix = glm::transpose(glm::inverse(linear_matrix));
 
     // Transform the normal vector using the normal matrix
-    return normal_matrix * v;
+    vec3_t result = normal_matrix * v;
+
+    // Rescale to the input length so both branches share one magnitude contract.
+    const T result_len2 = dot(result, result);
+    const T input_len2 = dot(v, v);
+    if(result_len2 > T(0) && input_len2 > T(0))
+    {
+        result *= sqrt(input_len2 / result_len2);
+    }
+    return result;
 }
 
 template<typename T, precision Q>
 TRANSFORM_INLINE auto transform_t<T, Q>::inverse_transform_normal(const vec3_t& v) const noexcept ->
     typename transform_t<T, Q>::vec3_t
 {
+    // Exact directional inverse of transform_normal (the transpose of the linear part
+    // inverts the inverse-transpose), with the input's length preserved - see the
+    // contract note in transform_normal.
     if(can_use_simplified_calculations())
     {
-        // Uniform scaling and no skew/perspective; inverse rotate the normal
-        return glm::conjugate(get_rotation()) * v;
+        // Uniform scale s: the transpose is s * R^T, so the direction is
+        // sign(s) * (R^T * v) and the length of v is already preserved.
+        const vec3_t rotated = glm::conjugate(get_rotation()) * v;
+        return get_scale().x < T(0) ? -rotated : rotated;
     }
 
+    return inverse_transform_normal_general(v);
+}
+
+template<typename T, precision Q>
+TRANSFORM_NOINLINE auto transform_t<T, Q>::inverse_transform_normal_general(const vec3_t& v) const noexcept ->
+    typename transform_t<T, Q>::vec3_t
+{
     // Use transpose of the linear transformation matrix
     mat3_t linear_matrix = mat3_t(get_matrix());
     mat3_t normal_matrix = glm::transpose(linear_matrix);
 
     // Transform the normal vector using the normal matrix
-    return normal_matrix * v;
+    vec3_t result = normal_matrix * v;
+
+    // Rescale to the input length so both branches share one magnitude contract.
+    const T result_len2 = dot(result, result);
+    const T input_len2 = dot(v, v);
+    if(result_len2 > T(0) && input_len2 > T(0))
+    {
+        result *= sqrt(input_len2 / result_len2);
+    }
+    return result;
 }
 
 template<typename T, precision Q>
@@ -1460,27 +1606,36 @@ TRANSFORM_INLINE auto transform_t<T, Q>::translation(const vec3_t& trans) noexce
 template<typename T, precision Q>
 TRANSFORM_INLINE auto transform_t<T, Q>::operator*(const transform_t& t) const noexcept -> transform_t<T, Q>
 {
-    // if(!matrix_needs_recompute_ && !t.matrix_needs_recompute_)
-    // {
-    //     return get_matrix() * t.get_matrix();
-    // }
-
-    // // Check if skew and perspective components are zero for both transforms
-    // if(can_use_simplified_calculations() && t.can_use_simplified_calculations())
-    // {
-    //     // Perform component-wise multiplication
-    //     transform_t result;
-    //     // Component-wise multiplication
-    //     result.scale_ = get_scale() * t.get_scale();
-    //     result.is_scale_uniform_cached_ = result.is_scale_uniform();
-    //     // Quaternion multiplication
-    //     result.rotation_ = get_rotation() * t.get_rotation();
-    //     // Position calculation
-    //     result.position_ = get_position() + get_rotation() * (get_scale() * t.get_position());
-    //     result.make_matrix_dirty();
-
-    //     return result;
-    // }
+    // Hottest path in the engine (scene-graph world = parent * local).
+    //
+    // Component-space compose is legal when both operands are skew/perspective
+    // free with valid components and OUR scale is uniform: S1 = s*I commutes
+    // with R2, so T1 R1 S1 T2 R2 S2 = T(p1 + R1 s p2) (R1 R2) (s * S2). The
+    // right-hand scale may be non-uniform. This keeps the result's components
+    // exact, so a later get_position()/get_rotation() costs nothing - the
+    // matrix fallback instead defers a full WebKit decompose (~10x the cost of
+    // the multiply) to the first component read.
+    if(can_use_simplified_calculations() && t.can_use_simplified_calculations_without_uniform_scale())
+    {
+        transform_t result;
+        result.position_ = position_ + rotation_ * (scale_ * t.position_);
+        result.rotation_ = glm::normalize(rotation_ * t.rotation_);
+        result.scale_ = scale_ * t.scale_;
+        // Our scale is uniform, so the product's uniformity is the right-hand's.
+        result.is_scale_uniform_cached_ = t.is_scale_uniform_cached_;
+        // Skew/perspective stay identity-initialized; the euler hint stays dirty.
+        if(!matrix_needs_recompute_ && !t.matrix_needs_recompute_)
+        {
+            // Both operand matrices are already resolved (steady-state scene
+            // graph): the SIMD multiply is cheaper than a deferred recompose.
+            result.matrix_ = matrix_ * t.matrix_;
+        }
+        else
+        {
+            result.matrix_needs_recompute_ = true;
+        }
+        return result;
+    }
 
     // Fallback to matrix multiplication and decomposition
     return get_matrix() * t.get_matrix();
@@ -1510,27 +1665,33 @@ TRANSFORM_INLINE void transform_t<T, Q>::update_components() const noexcept
 {
     if(components_need_recompute_)
     {
-        const bool had_euler_hint = !euler_hint_dirty_;
-        const vec3_t saved_euler_hint = euler_angles_hint_;
-        glm_decompose(get_matrix(), scale_, rotation_, position_, skew_, perspective_);
-
-        components_need_recompute_ = false;
-        // Keep authored Euler across matrix decompose. Re-validating hint->quat near
-        // gimbal lock is unstable and is exactly what makes inspector XYZ jump after edit.
-        if(had_euler_hint)
-        {
-            euler_angles_hint_ = saved_euler_hint;
-            euler_hint_dirty_ = false;
-        }
-        else
-        {
-            make_euler_hint_dirty();
-        }
-
-        is_perspective_identity_cached_ = is_perspective_identity();
-        is_skew_zero_cached_ = is_skew_zero();
-        is_scale_uniform_cached_ = is_scale_uniform();
+        decompose_matrix();
     }
+}
+
+template<typename T, precision Q>
+TRANSFORM_NOINLINE void transform_t<T, Q>::decompose_matrix() const noexcept
+{
+    const bool had_euler_hint = !euler_hint_dirty_;
+    const vec3_t saved_euler_hint = euler_angles_hint_;
+    glm_decompose(get_matrix(), scale_, rotation_, position_, skew_, perspective_);
+
+    components_need_recompute_ = false;
+    // Keep authored Euler across matrix decompose. Re-validating hint->quat near
+    // gimbal lock is unstable and is exactly what makes inspector XYZ jump after edit.
+    if(had_euler_hint)
+    {
+        euler_angles_hint_ = saved_euler_hint;
+        euler_hint_dirty_ = false;
+    }
+    else
+    {
+        make_euler_hint_dirty();
+    }
+
+    is_perspective_identity_cached_ = is_perspective_identity();
+    is_skew_zero_cached_ = is_skew_zero();
+    is_scale_uniform_cached_ = is_scale_uniform();
 }
 
 template<typename T, precision Q>
@@ -1540,18 +1701,14 @@ TRANSFORM_INLINE void transform_t<T, Q>::update_matrix() const noexcept
     {
         if(can_use_simplified_calculations())
         {
-            // Simplified recomposition without skew and perspective
-            const auto identity_matrix = glm::identity<mat4_t>();
-            matrix_ = glm::translate(identity_matrix, get_position()) * glm::mat4_cast(get_rotation()) *
-                      glm::scale(identity_matrix, get_scale());
-
-            // // Set the upper-left 3x3 part of the matrix using the transformed axes
-            // matrix_[0] = vec4_t(x_axis(), T(0)); // First column
-            // matrix_[1] = vec4_t(y_axis(), T(0)); // Second column
-            // matrix_[2] = vec4_t(z_axis(), T(0)); // Third column
-
-            // // Set the translation component
-            // matrix_[3] = vec4_t(get_position(), T(1)); // Fourth column
+            // Direct T*R*S compose: write the scaled rotation columns straight into
+            // the matrix. The previous translate(I) * mat4_cast(q) * scale(I) form
+            // paid two full mat4 multiplies for the same result.
+            const mat3_t rotation_matrix = glm::mat3_cast(rotation_);
+            matrix_[0] = vec4_t(rotation_matrix[0] * scale_.x, T(0));
+            matrix_[1] = vec4_t(rotation_matrix[1] * scale_.y, T(0));
+            matrix_[2] = vec4_t(rotation_matrix[2] * scale_.z, T(0));
+            matrix_[3] = vec4_t(position_, T(1));
         }
         else
         {
@@ -1577,7 +1734,7 @@ TRANSFORM_INLINE void transform_t<T, Q>::make_components_dirty() noexcept
 template<typename T, precision Q>
 TRANSFORM_INLINE auto transform_t<T, Q>::is_skew_zero() const noexcept -> bool
 {
-    return glm::all(glm::epsilonEqual(get_skew(), glm::zero<vec3_t>(), glm::epsilon<T>()));
+    return glm::all(glm::epsilonEqual(get_skew(), glm::zero<vec3_t>(), k_skew_zero_tolerance<T>));
 }
 
 template<typename T, precision Q>
@@ -1589,9 +1746,11 @@ TRANSFORM_INLINE auto transform_t<T, Q>::is_perspective_identity() const noexcep
 template<typename T, precision Q>
 TRANSFORM_INLINE auto transform_t<T, Q>::is_scale_uniform() const noexcept -> bool
 {
-    const T epsilon = glm::epsilon<T>();
     const auto& scale = get_scale();
-    return glm::abs(scale.x - scale.y) < epsilon && glm::abs(scale.y - scale.z) < epsilon;
+    const T max_axis = max(max(abs(scale.x), abs(scale.y)), abs(scale.z));
+    const T tolerance = k_scale_uniform_tolerance<T> * max(max_axis, T(1));
+    return abs(scale.x - scale.y) <= tolerance && abs(scale.y - scale.z) <= tolerance &&
+           abs(scale.x - scale.z) <= tolerance;
 }
 
 template<typename T, precision Q>
@@ -1673,61 +1832,62 @@ struct compute_to_string<math::transform_t<T, Q>>
 // Unity-like LookRotation: +Z = forward, +Y = upwards (approx).
 inline auto look_rotation(const glm::vec3& forward, const glm::vec3& upwards) -> glm::quat
 {
-    auto view = glm::lookAt(
-        math::zero<math::vec3>(),
-        forward,
-        upwards
-        );
-
-    glm::mat4 model = glm::inverse(view);
-    return glm::quat_cast(model);
+    // Build the basis directly: +Z = forward by construction, independent of the
+    // GLM_FORCE_LEFT_HANDED configuration that glm::lookAt depends on, and safe for
+    // the degenerate inputs (zero forward, forward parallel to upwards) that made
+    // the lookAt-based version produce NaNs.
+    constexpr float k_degenerate_len2 = 1e-12f;
+    const float forward_len2 = glm::dot(forward, forward);
+    if(forward_len2 < k_degenerate_len2)
+    {
+        return glm::identity<glm::quat>();
+    }
+    const glm::vec3 f = forward / glm::sqrt(forward_len2);
+    glm::vec3 right = glm::cross(upwards, f);
+    float right_len2 = glm::dot(right, right);
+    if(right_len2 < k_degenerate_len2)
+    {
+        // upwards is collinear with forward (or zero): substitute any axis
+        // orthogonal to f so the basis stays well defined.
+        const glm::vec3 orth =
+            glm::abs(f.x) > glm::abs(f.z) ? glm::vec3(-f.y, f.x, 0.0f) : glm::vec3(0.0f, -f.z, f.y);
+        right = glm::cross(orth, f);
+        right_len2 = glm::dot(right, right);
+    }
+    right /= glm::sqrt(right_len2);
+    const glm::vec3 up = glm::cross(f, right);
+    return glm::quat_cast(glm::mat3(right, up, f));
 }
 
 inline auto from_to_rotation(const glm::vec3& from, const glm::vec3& to) -> glm::quat
 {
-    // 1. Normalize inputs
-    glm::vec3 f = glm::normalize(from);
-    glm::vec3 t = glm::normalize(to);
-
-    // 2. Dot product -> angle
-    float dot_product = glm::dot(f, t);
-    dot_product = glm::clamp(dot_product, -1.0f, 1.0f);
-    float angle = glm::acos(dot_product);
-
-    // 3. If vectors are nearly the same, return identity
-    if(glm::epsilonEqual(dot_product, 1.0f, 1e-5f))
+    // 1. Guard degenerate inputs (a zero vector has no direction) and normalize.
+    constexpr float k_degenerate_len2 = 1e-12f;
+    const float from_len2 = glm::dot(from, from);
+    const float to_len2 = glm::dot(to, to);
+    if(from_len2 < k_degenerate_len2 || to_len2 < k_degenerate_len2)
     {
-        // Angle is 0 -> no rotation needed
-        return glm::identity<glm::quat>(); // Identity
+        return glm::identity<glm::quat>();
     }
+    const glm::vec3 f = from / glm::sqrt(from_len2);
+    const glm::vec3 t = to / glm::sqrt(to_len2);
 
-    // 4. If vectors are nearly opposite
-    if(glm::epsilonEqual(dot_product, -1.0f, 1e-5f))
+    const float dot_product = glm::dot(f, t);
+
+    // 2. Nearly opposite: a 180-degree turn about any axis orthogonal to 'from'.
+    // The half-vector construction below degenerates to a zero quaternion here.
+    if(dot_product <= -1.0f + 1e-6f)
     {
-        // Angle is pi -> pick an orthonormal axis
-        // The axis must be perpendicular to 'from'
-        // Choose any vector orthonormal to 'f'
         glm::vec3 orth = glm::abs(f.x) > glm::abs(f.z) ? glm::vec3(-f.y, f.x, 0.0f) : glm::vec3(0.0f, -f.z, f.y);
         orth = glm::normalize(orth);
         return glm::angleAxis(glm::pi<float>(), orth);
     }
 
-    // 5. Otherwise, use cross product for the axis
-    glm::vec3 axis = glm::cross(f, t);
-
-    // If numerical drift caused near-zero cross magnitude, safe-guard:
-    float len_sq = glm::dot(axis, axis);
-    if(len_sq < 1e-12f)
-    {
-        // 'from' and 'to' differ by a small angle, but cross is near zero
-        // fallback: identity or very small rotation
-        return glm::identity<glm::quat>(); // Identity
-    }
-
-    axis = glm::normalize(axis);
-
-    // 6. Convert angle/axis to a quaternion
-    return glm::angleAxis(angle, axis);
+    // 3. Half-vector construction: normalize(w = 1 + dot, xyz = cross(f, t)) rotates
+    // f onto t. Trig-free and more accurate near dot = +/-1 than acos + angleAxis
+    // (also exact for the nearly-parallel case, which needs no special handling).
+    const glm::quat q(1.0f + dot_product, glm::cross(f, t));
+    return glm::normalize(q);
 }
 
 inline void set_position_relative(glm::mat4& matrix, const glm::vec3& camera_position)

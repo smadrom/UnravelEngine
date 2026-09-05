@@ -80,6 +80,244 @@ void internal_m2n_skylight_set_cloud_coverage(entt::entity id, float coverage)
     }
 }
 
+auto internal_m2n_skylight_get_cloud_macro_variation(entt::entity id) -> float
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        return comp->get_cloud_macro_variation();
+    }
+    return 0.0f;
+}
+
+void internal_m2n_skylight_set_cloud_macro_variation(entt::entity id, float value)
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        comp->set_cloud_macro_variation(value);
+    }
+}
+
+auto internal_m2n_skylight_get_cloud_base_altitude(entt::entity id) -> float
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        return comp->get_cloud_base_altitude();
+    }
+    return 0.0f;
+}
+
+void internal_m2n_skylight_set_cloud_base_altitude(entt::entity id, float value)
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        comp->set_cloud_base_altitude(value);
+    }
+}
+
+auto internal_m2n_skylight_get_cloud_thickness(entt::entity id) -> float
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        return comp->get_cloud_thickness();
+    }
+    return 0.0f;
+}
+
+void internal_m2n_skylight_set_cloud_thickness(entt::entity id, float value)
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        comp->set_cloud_thickness(value);
+    }
+}
+
+auto internal_m2n_skylight_get_cloud_size(entt::entity id) -> float
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        return comp->get_cloud_size();
+    }
+    return 0.0f;
+}
+
+void internal_m2n_skylight_set_cloud_size(entt::entity id, float value)
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        comp->set_cloud_size(value);
+    }
+}
+
+auto internal_m2n_skylight_get_cloud_density(entt::entity id) -> float
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        return comp->get_cloud_density();
+    }
+    return 0.0f;
+}
+
+void internal_m2n_skylight_set_cloud_density(entt::entity id, float value)
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        comp->set_cloud_density(value);
+    }
+}
+
+auto internal_m2n_skylight_get_cloud_shadow_strength(entt::entity id) -> float
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        return comp->get_cloud_shadow_strength();
+    }
+    return 0.0f;
+}
+
+auto internal_m2n_skylight_get_cloud_brightness(entt::entity id) -> float
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        return comp->get_cloud_brightness();
+    }
+    return 0.0f;
+}
+
+void internal_m2n_skylight_set_cloud_brightness(entt::entity id, float value)
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        comp->set_cloud_brightness(value);
+    }
+}
+
+void internal_m2n_skylight_set_cloud_shadow_strength(entt::entity id, float value)
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        comp->set_cloud_shadow_strength(value);
+    }
+}
+
+auto internal_m2n_skylight_get_cloud_world_space_altitude(entt::entity id) -> bool
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        return comp->get_cloud_world_space_altitude();
+    }
+    return false;
+}
+
+void internal_m2n_skylight_set_cloud_world_space_altitude(entt::entity id, bool value)
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        comp->set_cloud_world_space_altitude(value);
+    }
+}
+
+auto internal_m2n_skylight_get_cloud_shadows(entt::entity id) -> bool
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        return comp->get_cloud_shadows();
+    }
+    return false;
+}
+
+void internal_m2n_skylight_set_cloud_shadows(entt::entity id, bool value)
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        comp->set_cloud_shadows(value);
+    }
+}
+
+auto internal_m2n_skylight_get_cloud_shadow_opacity(entt::entity id) -> float
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        return comp->get_cloud_shadow_opacity();
+    }
+    return 0.0f;
+}
+
+void internal_m2n_skylight_set_cloud_shadow_opacity(entt::entity id, float value)
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        comp->set_cloud_shadow_opacity(value);
+    }
+}
+
+auto internal_m2n_skylight_get_cloud_softness(entt::entity id) -> float
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        return comp->get_cloud_softness();
+    }
+    return 0.0f;
+}
+
+void internal_m2n_skylight_set_cloud_softness(entt::entity id, float value)
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        comp->set_cloud_softness(value);
+    }
+}
+
+auto internal_m2n_skylight_get_cloud_detail_erode(entt::entity id) -> float
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        return comp->get_cloud_detail_erode();
+    }
+    return 0.0f;
+}
+
+void internal_m2n_skylight_set_cloud_detail_erode(entt::entity id, float value)
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        comp->set_cloud_detail_erode(value);
+    }
+}
+
+auto internal_m2n_skylight_get_cloud_speed(entt::entity id) -> float
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        return comp->get_cloud_speed();
+    }
+    return 0.0f;
+}
+
+void internal_m2n_skylight_set_cloud_speed(entt::entity id, float value)
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        comp->set_cloud_speed(value);
+    }
+}
+
+auto internal_m2n_skylight_get_cloud_wind_direction(entt::entity id) -> float
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        return comp->get_cloud_wind_direction();
+    }
+    return 0.0f;
+}
+
+void internal_m2n_skylight_set_cloud_wind_direction(entt::entity id, float value)
+{
+    if(auto comp = safe_get_component<skylight_component>(id))
+    {
+        comp->set_cloud_wind_direction(value);
+    }
+}
+
 auto internal_m2n_skylight_get_irradiance_intensity(entt::entity id) -> float
 {
     if(auto comp = safe_get_component<skylight_component>(id))
@@ -187,6 +425,62 @@ void register_skylight_component_script_bindings()
                           dotnet_internal_call(internal_m2n_skylight_get_cloud_coverage));
     reg.add_internal_call("internal_m2n_skylight_set_cloud_coverage",
                           dotnet_internal_call(internal_m2n_skylight_set_cloud_coverage));
+    reg.add_internal_call("internal_m2n_skylight_get_cloud_macro_variation",
+                          dotnet_internal_call(internal_m2n_skylight_get_cloud_macro_variation));
+    reg.add_internal_call("internal_m2n_skylight_set_cloud_macro_variation",
+                          dotnet_internal_call(internal_m2n_skylight_set_cloud_macro_variation));
+    reg.add_internal_call("internal_m2n_skylight_get_cloud_base_altitude",
+                          dotnet_internal_call(internal_m2n_skylight_get_cloud_base_altitude));
+    reg.add_internal_call("internal_m2n_skylight_set_cloud_base_altitude",
+                          dotnet_internal_call(internal_m2n_skylight_set_cloud_base_altitude));
+    reg.add_internal_call("internal_m2n_skylight_get_cloud_thickness",
+                          dotnet_internal_call(internal_m2n_skylight_get_cloud_thickness));
+    reg.add_internal_call("internal_m2n_skylight_set_cloud_thickness",
+                          dotnet_internal_call(internal_m2n_skylight_set_cloud_thickness));
+    reg.add_internal_call("internal_m2n_skylight_get_cloud_size",
+                          dotnet_internal_call(internal_m2n_skylight_get_cloud_size));
+    reg.add_internal_call("internal_m2n_skylight_set_cloud_size",
+                          dotnet_internal_call(internal_m2n_skylight_set_cloud_size));
+    reg.add_internal_call("internal_m2n_skylight_get_cloud_density",
+                          dotnet_internal_call(internal_m2n_skylight_get_cloud_density));
+    reg.add_internal_call("internal_m2n_skylight_set_cloud_density",
+                          dotnet_internal_call(internal_m2n_skylight_set_cloud_density));
+    reg.add_internal_call("internal_m2n_skylight_get_cloud_shadow_strength",
+                          dotnet_internal_call(internal_m2n_skylight_get_cloud_shadow_strength));
+    reg.add_internal_call("internal_m2n_skylight_set_cloud_shadow_strength",
+                          dotnet_internal_call(internal_m2n_skylight_set_cloud_shadow_strength));
+    reg.add_internal_call("internal_m2n_skylight_get_cloud_brightness",
+                          dotnet_internal_call(internal_m2n_skylight_get_cloud_brightness));
+    reg.add_internal_call("internal_m2n_skylight_set_cloud_brightness",
+                          dotnet_internal_call(internal_m2n_skylight_set_cloud_brightness));
+    reg.add_internal_call("internal_m2n_skylight_get_cloud_world_space_altitude",
+                          dotnet_internal_call(internal_m2n_skylight_get_cloud_world_space_altitude));
+    reg.add_internal_call("internal_m2n_skylight_set_cloud_world_space_altitude",
+                          dotnet_internal_call(internal_m2n_skylight_set_cloud_world_space_altitude));
+    reg.add_internal_call("internal_m2n_skylight_get_cloud_shadows",
+                          dotnet_internal_call(internal_m2n_skylight_get_cloud_shadows));
+    reg.add_internal_call("internal_m2n_skylight_set_cloud_shadows",
+                          dotnet_internal_call(internal_m2n_skylight_set_cloud_shadows));
+    reg.add_internal_call("internal_m2n_skylight_get_cloud_shadow_opacity",
+                          dotnet_internal_call(internal_m2n_skylight_get_cloud_shadow_opacity));
+    reg.add_internal_call("internal_m2n_skylight_set_cloud_shadow_opacity",
+                          dotnet_internal_call(internal_m2n_skylight_set_cloud_shadow_opacity));
+    reg.add_internal_call("internal_m2n_skylight_get_cloud_softness",
+                          dotnet_internal_call(internal_m2n_skylight_get_cloud_softness));
+    reg.add_internal_call("internal_m2n_skylight_set_cloud_softness",
+                          dotnet_internal_call(internal_m2n_skylight_set_cloud_softness));
+    reg.add_internal_call("internal_m2n_skylight_get_cloud_detail_erode",
+                          dotnet_internal_call(internal_m2n_skylight_get_cloud_detail_erode));
+    reg.add_internal_call("internal_m2n_skylight_set_cloud_detail_erode",
+                          dotnet_internal_call(internal_m2n_skylight_set_cloud_detail_erode));
+    reg.add_internal_call("internal_m2n_skylight_get_cloud_speed",
+                          dotnet_internal_call(internal_m2n_skylight_get_cloud_speed));
+    reg.add_internal_call("internal_m2n_skylight_set_cloud_speed",
+                          dotnet_internal_call(internal_m2n_skylight_set_cloud_speed));
+    reg.add_internal_call("internal_m2n_skylight_get_cloud_wind_direction",
+                          dotnet_internal_call(internal_m2n_skylight_get_cloud_wind_direction));
+    reg.add_internal_call("internal_m2n_skylight_set_cloud_wind_direction",
+                          dotnet_internal_call(internal_m2n_skylight_set_cloud_wind_direction));
     reg.add_internal_call("internal_m2n_skylight_get_irradiance_intensity",
                           dotnet_internal_call(internal_m2n_skylight_get_irradiance_intensity));
     reg.add_internal_call("internal_m2n_skylight_set_irradiance_intensity",

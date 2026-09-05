@@ -48,6 +48,16 @@ uniform vec4 u_gi_light_voxel_params;
 #define u_light_voxel_frame      uint(u_gi_light_voxel_params.z)
 #define u_light_voxel_ready      (u_gi_light_voxel_params.w > 0.0)
 
+/// The relight convergence statistic's texel: one slice past the last face slab of the
+/// bounce vis-memo texture (allocated one slice deeper than the light volume for it); x =
+/// level, y = quantity (0 = summed relative change x GI_QUIESCENCE_STATS_SCALE, 1 = relit
+/// face count). Written by the group reduction in gi_light_voxels_kernel.sh, copied out
+/// and zeroed by cs_gi_light_voxel_stats.sc.
+ivec3 GiLightVoxelStatsTexel(int level, int quantity)
+{
+	return ivec3(level, quantity, u_light_voxel_resolution * SDF_CLIPMAP_LEVEL_COUNT * 6);
+}
+
 /// TOROIDAL world anchoring: a voxel's storage SLOT is its absolute world cell
 /// (floor(world / attr_voxel)) wrapped by the resolution, exactly the world-probe scheme. A
 /// level re-snap then changes which cells are in the window, never which slot a surviving cell
@@ -264,6 +274,324 @@ bool GiLightVoxelReadFade(vec3 position, vec3 normal, vec3 fallback, float fade_
 	}
 	return false;
 }
+
+/**
+ * The irradiance consumers' cascade read (gather rays, world-probe rays): cross-fades the
+ * finer and coarser levels' MEASURED answers over @p fade_voxels of the finer level, with no
+ * foreign fallback - where only one level measured the point, that level answers alone, and
+ * where neither did the walk continues outward exactly as GiLightVoxelRead. The first-success
+ * walk switched hit radiance from 0.25 m to 0.5 m voxels at a knife edge 8 m from the camera,
+ * and that edge sweeps every surface as the camera translates (GI_LIGHT_VOXEL_FADE_VOXELS).
+ */
+bool GiLightVoxelReadBlend(vec3 position, vec3 normal, float fade_voxels, out vec3 out_radiance)
+{
+	out_radiance = vec3_splat(0.0);
+	float field_blend;
+	float answered_voxel;
+	int finest = SdfFindClipmapLevel(position, field_blend, answered_voxel);
+	if(finest >= SDF_CLIPMAP_LEVEL_COUNT)
+	{
+		return false;
+	}
+	float fade = SdfClipmapEdgeBlend(finest, position, fade_voxels);
+	fade = fade * fade * (3.0 - 2.0 * fade);
+	vec3 fine_radiance;
+	bool ok_fine = GiLightVoxelReadLevel(position, normal, finest, fine_radiance);
+	vec3 coarse_radiance;
+	bool ok_coarse = false;
+	if(fade > 0.0 && (finest + 1) < SDF_CLIPMAP_LEVEL_COUNT)
+	{
+		ok_coarse = GiLightVoxelReadLevel(position, normal, finest + 1, coarse_radiance);
+	}
+	if(ok_fine && ok_coarse)
+	{
+		out_radiance = mix(fine_radiance, coarse_radiance, fade);
+		return true;
+	}
+	if(ok_fine)
+	{
+		out_radiance = fine_radiance;
+		return true;
+	}
+	if(ok_coarse)
+	{
+		out_radiance = coarse_radiance;
+		return true;
+	}
+	for(int level = finest + 1; level < SDF_CLIPMAP_LEVEL_COUNT; ++level)
+	{
+		if(GiLightVoxelReadLevel(position, normal, level, out_radiance))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+#if defined(GI_LIGHT_VOXEL_READ_ALBEDO)
+
+/// The attribute-albedo volume (cs_gi_clipmap_attributes.sc): rgb = winning instance albedo
+/// (base colour factor x texture mean), a = 1 where surface - premultiplied like the light
+/// volume, so trilinear (rgb, a) normalised by the filtered alpha is the weight-correct mean
+/// over surface cells. Z stacks LEVEL slabs (no faces). The includer owns keeping stage 11
+/// free; the CPU bind must override the texture's clamp flags with xy REPEAT (toroidal slots,
+/// same contract as the light volume) and W clamp.
+SAMPLER3D(s_gi_attr_albedo, 11);
+
+/**
+ * One cascade level's radiance AND matched-weight mean albedo, for the remodulation ratio.
+ *
+ * THE WEIGHT SETS MUST BE IDENTICAL. The ratio's correctness rests on
+ * radiance_mean / albedo_mean cancelling to the (albedo-weighted) irradiance: with the same
+ * weights, sum(w * a * albedo * E) / sum(w * a * albedo) is exact under locally uniform
+ * lighting at EVERY material boundary. The previous split readers weighted radiance by
+ * face-alpha x facing but albedo by plain cell-trilinear, and wherever face culling thinned
+ * one set (crevices, rims - any silhouette a reflection ray grazes) the ratio over/undershot
+ * to its clamp: a standing bright outline on the lighter material and a dark edging on the
+ * darker one, stamped along every reflected junction - and a x4 amplifier window that kept
+ * otherwise-invisible residual radiance (a departed emitter's tail) glowing as a line.
+ *
+ * Explicit 2x2x2 corner walk instead of hardware trilinear, because the albedo texels must be
+ * weighted by the RADIANCE texels' face alphas, which live in a different texture. Corners
+ * with zero trilinear weight are skipped (they may wrap toroidally; their weight is zero by
+ * the window-edge clamp, same contract as the filtered readers).
+ */
+bool GiLightVoxelReadLevelRemod(vec3 position,
+                                vec3 normal,
+                                int level,
+                                out vec3 out_radiance,
+                                out vec3 out_albedo,
+                                out vec3 out_lit,
+                                out float out_lit_share,
+                                out vec3 out_lit_position)
+{
+	out_radiance = vec3_splat(0.0);
+	out_albedo = vec3_splat(0.0);
+	out_lit_position = position;
+	vec4 level_data = u_sdf_clipmap_levels[level];
+	if(!(level_data.w > 0.0))
+	{
+		return false;
+	}
+	int res = u_light_voxel_resolution;
+	float attr_voxel_size = level_data.w * 2.0;
+	vec3 base_cell = floor(level_data.xyz / attr_voxel_size + vec3_splat(0.5));
+	vec3 cell = clamp(position / attr_voxel_size,
+	                  base_cell + vec3_splat(0.5),
+	                  base_cell + vec3_splat(float(res) - 0.5));
+	vec3 corner_pos = cell - vec3_splat(0.5);
+	vec3 corner_base = floor(corner_pos);
+	vec3 frac = corner_pos - corner_base;
+	ivec3 c0 = ivec3(corner_base);
+	vec3 radiance_sum = vec3_splat(0.0);
+	vec3 lit_sum = vec3_splat(0.0);
+	vec3 albedo_sum = vec3_splat(0.0);
+	vec3 lit_position_sum = vec3_splat(0.0);
+	float weight_sum = 0.0;
+	float lit_weight = 0.0;
+	LOOP
+	for(int corner = 0; corner < 8; ++corner)
+	{
+		ivec3 offset = ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1);
+		vec3 lerp_w = mix(vec3_splat(1.0) - frac, frac, vec3(offset));
+		float w = lerp_w.x * lerp_w.y * lerp_w.z;
+		if(w <= 1e-6)
+		{
+			continue;
+		}
+		ivec3 slot = GiLightVoxelSlot(c0 + offset);
+		// Premultiplied by the cell's surface alpha; a face with alpha > 0 implies a listed
+		// (surface) cell, so no divide is needed to recover the true albedo.
+		vec3 cell_albedo =
+		    texelFetch(s_gi_attr_albedo, ivec3(slot.x, slot.y, level * res + slot.z), 0).xyz;
+		LOOP
+		for(int axis = 0; axis < 3; ++axis)
+		{
+			float component = axis == 0 ? normal.x : (axis == 1 ? normal.y : normal.z);
+			float facing = abs(component);
+			if(facing <= 0.0)
+			{
+				continue;
+			}
+			int face = axis * 2 + (component < 0.0 ? 1 : 0);
+			vec4 face_texel = texelFetch(s_light_voxels, GiLightVoxelTexel(slot, level, face), 0);
+			float face_weight = w * facing;
+			// Radiance texels are premultiplied (rgb = 0 wherever a = 0).
+			radiance_sum += face_texel.xyz * face_weight;
+			weight_sum += face_texel.a * face_weight;
+			// SOURCE faces (alpha just under 1, the relight's flag) carry their cell's own
+			// emission; a mirror hit on the surface NEXT to a voxelised strip must not read
+			// that emission as its lighting. They stay in the total (out_radiance, the
+			// clipmap-shape answer) and leave the lit estimate and its matched albedo.
+			bool source_face = face_texel.a > 0.5 && face_texel.a < 0.5 * (1.0 + GI_LIGHT_VOXEL_SOURCE_ALPHA);
+			float lit_face = source_face ? 0.0 : face_texel.a * face_weight;
+			lit_sum += face_texel.xyz * (source_face ? 0.0 : face_weight);
+			albedo_sum += cell_albedo * lit_face;
+			// Where the lit value was measured: the lit-weighted cell centres, for the
+			// reflection tier's near-field remodulation.
+			lit_position_sum += (vec3(c0 + offset) + vec3_splat(0.5)) * attr_voxel_size * lit_face;
+			lit_weight += lit_face;
+		}
+	}
+	if(weight_sum <= 1e-4)
+	{
+		return false;
+	}
+	out_radiance = GiFiniteOrZero(radiance_sum / weight_sum);
+	out_lit_share = lit_weight / weight_sum;
+	out_lit = lit_weight > 1e-4 ? GiFiniteOrZero(lit_sum / lit_weight) : vec3_splat(0.0);
+	out_albedo = lit_weight > 1e-4 ? albedo_sum / lit_weight : vec3_splat(0.0);
+	out_lit_position = lit_weight > 1e-4 ? lit_position_sum / lit_weight : position;
+	return true;
+}
+
+/// Borrows the lit estimate (and its matched albedo) from the first level at or above
+/// @p first_level whose footprint holds a lit face. Leaves the outputs untouched when none does.
+void GiLightVoxelBorrowLit(vec3 position, vec3 normal, int first_level,
+                           inout vec3 out_lit, inout vec3 out_albedo, inout float out_lit_share,
+                           inout vec3 out_lit_position)
+{
+	LOOP
+	for(int level = first_level; level < SDF_CLIPMAP_LEVEL_COUNT; ++level)
+	{
+		vec3 level_radiance;
+		vec3 level_albedo;
+		vec3 level_lit;
+		float level_lit_share;
+		vec3 level_lit_position;
+		if(GiLightVoxelReadLevelRemod(position, normal, level, level_radiance, level_albedo,
+		                              level_lit, level_lit_share, level_lit_position) &&
+		   level_lit_share > 0.0)
+		{
+			out_lit = level_lit;
+			out_albedo = level_albedo;
+			out_lit_share = level_lit_share;
+			out_lit_position = level_lit_position;
+			return;
+		}
+	}
+}
+
+/// Share-weighted mix of two levels' lit estimates: a level whose footprint held no lit
+/// face contributes no lit value, only the knowledge that it held none.
+vec3 GiLightVoxelMixLit(vec3 lit_a, float share_a, vec3 lit_b, float share_b, float fade)
+{
+	float wa = share_a * (1.0 - fade);
+	float wb = share_b * fade;
+	float ws = wa + wb;
+	return ws > 1e-6 ? (lit_a * wa + lit_b * wb) / ws : vec3_splat(0.0);
+}
+
+/**
+ * GiLightVoxelReadFade's cascade walk with the matched-weight remodulation pair. KEEP THE
+ * LEVEL LOGIC IN STEP with GiLightVoxelReadFade. @p out_albedo_valid is false exactly when
+ * the radiance answer mixed in the caller's @p fallback (coarse-only inside the cross-fade
+ * band): the fallback is not a lattice product, so no albedo can match it and the consumer
+ * must skip the ratio rather than remodulate a partially foreign value.
+ */
+bool GiLightVoxelReadFadeRemod(vec3 position,
+                               vec3 normal,
+                               vec3 fallback,
+                               float fade_voxels,
+                               out vec3 out_radiance,
+                               out vec3 out_albedo,
+                               out bool out_albedo_valid,
+                               out vec3 out_lit,
+                               out float out_lit_share,
+                               out vec3 out_lit_position)
+{
+	out_radiance = vec3_splat(0.0);
+	out_albedo = vec3_splat(0.0);
+	out_albedo_valid = false;
+	float field_blend;
+	float answered_voxel;
+	int finest = SdfFindClipmapLevel(position, field_blend, answered_voxel);
+	if(finest >= SDF_CLIPMAP_LEVEL_COUNT)
+	{
+		return false;
+	}
+	float fade = SdfClipmapEdgeBlend(finest, position, fade_voxels);
+	fade = fade * fade * (3.0 - 2.0 * fade);
+	out_lit = vec3_splat(0.0);
+	out_lit_share = 0.0;
+	out_lit_position = position;
+	vec3 fine_radiance;
+	vec3 fine_albedo;
+	vec3 fine_lit;
+	float fine_lit_share;
+	vec3 fine_lit_position;
+	bool ok_fine = GiLightVoxelReadLevelRemod(position, normal, finest, fine_radiance, fine_albedo,
+	                                          fine_lit, fine_lit_share, fine_lit_position);
+	vec3 coarse_radiance;
+	vec3 coarse_albedo;
+	vec3 coarse_lit;
+	float coarse_lit_share;
+	vec3 coarse_lit_position;
+	bool ok_coarse = false;
+	if(fade > 0.0 && (finest + 1) < SDF_CLIPMAP_LEVEL_COUNT)
+	{
+		ok_coarse = GiLightVoxelReadLevelRemod(position, normal, finest + 1, coarse_radiance,
+		                                       coarse_albedo, coarse_lit, coarse_lit_share,
+		                                       coarse_lit_position);
+	}
+	if(ok_fine && ok_coarse)
+	{
+		out_radiance = mix(fine_radiance, coarse_radiance, fade);
+		out_lit = GiLightVoxelMixLit(fine_lit, fine_lit_share, coarse_lit, coarse_lit_share, fade);
+		out_lit_share = mix(fine_lit_share, coarse_lit_share, fade);
+		// The matched albedo and the measured position follow the lit faces the same way.
+		out_albedo = GiLightVoxelMixLit(fine_albedo, fine_lit_share, coarse_albedo, coarse_lit_share, fade);
+		out_lit_position = GiLightVoxelMixLit(fine_lit_position, fine_lit_share, coarse_lit_position,
+		                                      coarse_lit_share, fade);
+		out_albedo_valid = true;
+		if(out_lit_share <= 0.0)
+		{
+			GiLightVoxelBorrowLit(position, normal, finest + 2, out_lit, out_albedo, out_lit_share,
+			                      out_lit_position);
+		}
+		return true;
+	}
+	if(ok_fine)
+	{
+		out_radiance = fine_radiance;
+		out_albedo = fine_albedo;
+		out_lit = fine_lit;
+		out_lit_share = fine_lit_share;
+		out_lit_position = fine_lit_position;
+		out_albedo_valid = true;
+		if(out_lit_share <= 0.0)
+		{
+			// ALL-SOURCE FOOTPRINT: every face around the hit is an emitter's own (a hit on
+			// the surface a voxelised strip shares its cells with). The fine level has no
+			// lighting estimate for it; the first coarser level that holds a lit face does.
+			GiLightVoxelBorrowLit(position, normal, finest + 1, out_lit, out_albedo, out_lit_share,
+			                      out_lit_position);
+		}
+		return true;
+	}
+	if(ok_coarse)
+	{
+		out_radiance = mix(fallback, coarse_radiance, fade);
+		out_albedo = coarse_albedo;
+		out_lit = coarse_lit;
+		out_lit_share = coarse_lit_share;
+		out_lit_position = coarse_lit_position;
+		out_albedo_valid = false;
+		return true;
+	}
+	for(int level = finest + 2; level < SDF_CLIPMAP_LEVEL_COUNT; ++level)
+	{
+		if(GiLightVoxelReadLevelRemod(position, normal, level, out_radiance, out_albedo, out_lit,
+		                              out_lit_share, out_lit_position))
+		{
+			out_albedo_valid = true;
+			return true;
+		}
+	}
+	return false;
+}
+
+#endif // GI_LIGHT_VOXEL_READ_ALBEDO
 
 #endif // GI_LIGHT_VOXEL_READ
 

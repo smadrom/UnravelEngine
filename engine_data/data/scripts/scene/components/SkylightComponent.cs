@@ -82,6 +82,134 @@ namespace Unravel.Core
         }
 
         /// <summary>
+        /// Weather-scale coverage variation: 0 = uniform sheet, 1.5 = strong clear and dense patches.
+        /// </summary>
+        public float cloudMacroVariation
+        {
+            get => internal_m2n_skylight_get_cloud_macro_variation(owner);
+            set => internal_m2n_skylight_set_cloud_macro_variation(owner, value);
+        }
+
+        /// <summary>
+        /// Cloud layer base, height above the camera in world units.
+        /// </summary>
+        public float cloudBaseAltitude
+        {
+            get => internal_m2n_skylight_get_cloud_base_altitude(owner);
+            set => internal_m2n_skylight_set_cloud_base_altitude(owner, value);
+        }
+
+        /// <summary>
+        /// Cloud layer thickness (base to top) in world units.
+        /// </summary>
+        public float cloudThickness
+        {
+            get => internal_m2n_skylight_get_cloud_thickness(owner);
+            set => internal_m2n_skylight_set_cloud_thickness(owner, value);
+        }
+
+        /// <summary>
+        /// Typical size of a cloud mass in world units.
+        /// </summary>
+        public float cloudSize
+        {
+            get => internal_m2n_skylight_get_cloud_size(owner);
+            set => internal_m2n_skylight_set_cloud_size(owner, value);
+        }
+
+        /// <summary>
+        /// Extinction scale along the view ray; higher = more opaque.
+        /// </summary>
+        public float cloudDensity
+        {
+            get => internal_m2n_skylight_get_cloud_density(owner);
+            set => internal_m2n_skylight_set_cloud_density(owner, value);
+        }
+
+        /// <summary>
+        /// Fraction of the view extinction applied along the sun path (self-shadowing).
+        /// </summary>
+        public float cloudShadowStrength
+        {
+            get => internal_m2n_skylight_get_cloud_shadow_strength(owner);
+            set => internal_m2n_skylight_set_cloud_shadow_strength(owner, value);
+        }
+
+        /// <summary>
+        /// Multiplier on the scattered cloud light (sun and ambient). 1 keeps clouds on the
+        /// sky's light scale; higher pushes them toward white.
+        /// </summary>
+        public float cloudBrightness
+        {
+            get => internal_m2n_skylight_get_cloud_brightness(owner);
+            set => internal_m2n_skylight_set_cloud_brightness(owner, value);
+        }
+
+        /// <summary>
+        /// When true the layer altitudes are measured from world y = 0 (the camera can fly into
+        /// and above the clouds); when false they are measured from the camera.
+        /// </summary>
+        public bool cloudWorldSpaceAltitude
+        {
+            get => internal_m2n_skylight_get_cloud_world_space_altitude(owner);
+            set => internal_m2n_skylight_set_cloud_world_space_altitude(owner, value);
+        }
+
+        /// <summary>
+        /// Whether the cloud layer casts a soft shadow on the scene (directional light).
+        /// </summary>
+        public bool cloudShadows
+        {
+            get => internal_m2n_skylight_get_cloud_shadows(owner);
+            set => internal_m2n_skylight_set_cloud_shadows(owner, value);
+        }
+
+        /// <summary>
+        /// Opacity of the projected cloud shadow, 0 to 1.
+        /// </summary>
+        public float cloudShadowOpacity
+        {
+            get => internal_m2n_skylight_get_cloud_shadow_opacity(owner);
+            set => internal_m2n_skylight_set_cloud_shadow_opacity(owner, value);
+        }
+
+        /// <summary>
+        /// Width of the density ramp at the cloud edge; lower = crisper silhouettes.
+        /// </summary>
+        public float cloudSoftness
+        {
+            get => internal_m2n_skylight_get_cloud_softness(owner);
+            set => internal_m2n_skylight_set_cloud_softness(owner, value);
+        }
+
+        /// <summary>
+        /// Small-scale erosion strength at the cloud edges.
+        /// </summary>
+        public float cloudDetailErode
+        {
+            get => internal_m2n_skylight_get_cloud_detail_erode(owner);
+            set => internal_m2n_skylight_set_cloud_detail_erode(owner, value);
+        }
+
+        /// <summary>
+        /// Wind speed in km/h.
+        /// </summary>
+        public float cloudSpeed
+        {
+            get => internal_m2n_skylight_get_cloud_speed(owner);
+            set => internal_m2n_skylight_set_cloud_speed(owner, value);
+        }
+
+        /// <summary>
+        /// Wind direction in degrees (0 = +X, 90 = +Z); clouds drift toward it.
+        /// </summary>
+        public float cloudWindDirection
+        {
+            get => internal_m2n_skylight_get_cloud_wind_direction(owner);
+            set => internal_m2n_skylight_set_cloud_wind_direction(owner, value);
+        }
+
+        /// <summary>
         /// Strength of indirect diffuse irradiance.
         /// </summary>
         public float irradianceIntensity
@@ -157,6 +285,90 @@ namespace Unravel.Core
 
         [MethodImpl(MethodImplOptions.InternalCall)]
         private static extern void internal_m2n_skylight_set_cloud_coverage(Entity eid, float coverage);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern float internal_m2n_skylight_get_cloud_macro_variation(Entity eid);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern void internal_m2n_skylight_set_cloud_macro_variation(Entity eid, float value);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern float internal_m2n_skylight_get_cloud_base_altitude(Entity eid);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern void internal_m2n_skylight_set_cloud_base_altitude(Entity eid, float value);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern float internal_m2n_skylight_get_cloud_thickness(Entity eid);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern void internal_m2n_skylight_set_cloud_thickness(Entity eid, float value);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern float internal_m2n_skylight_get_cloud_size(Entity eid);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern void internal_m2n_skylight_set_cloud_size(Entity eid, float value);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern float internal_m2n_skylight_get_cloud_density(Entity eid);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern void internal_m2n_skylight_set_cloud_density(Entity eid, float value);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern float internal_m2n_skylight_get_cloud_shadow_strength(Entity eid);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern void internal_m2n_skylight_set_cloud_shadow_strength(Entity eid, float value);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern float internal_m2n_skylight_get_cloud_brightness(Entity eid);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern void internal_m2n_skylight_set_cloud_brightness(Entity eid, float value);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern bool internal_m2n_skylight_get_cloud_world_space_altitude(Entity eid);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern void internal_m2n_skylight_set_cloud_world_space_altitude(Entity eid, bool value);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern bool internal_m2n_skylight_get_cloud_shadows(Entity eid);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern void internal_m2n_skylight_set_cloud_shadows(Entity eid, bool value);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern float internal_m2n_skylight_get_cloud_shadow_opacity(Entity eid);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern void internal_m2n_skylight_set_cloud_shadow_opacity(Entity eid, float value);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern float internal_m2n_skylight_get_cloud_softness(Entity eid);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern void internal_m2n_skylight_set_cloud_softness(Entity eid, float value);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern float internal_m2n_skylight_get_cloud_detail_erode(Entity eid);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern void internal_m2n_skylight_set_cloud_detail_erode(Entity eid, float value);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern float internal_m2n_skylight_get_cloud_speed(Entity eid);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern void internal_m2n_skylight_set_cloud_speed(Entity eid, float value);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern float internal_m2n_skylight_get_cloud_wind_direction(Entity eid);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern void internal_m2n_skylight_set_cloud_wind_direction(Entity eid, float value);
 
         [MethodImpl(MethodImplOptions.InternalCall)]
         private static extern float internal_m2n_skylight_get_irradiance_intensity(Entity eid);

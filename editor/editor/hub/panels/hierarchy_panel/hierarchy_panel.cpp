@@ -16,6 +16,7 @@
 #include <engine/defaults/defaults.h>
 #include <engine/ecs/components/id_component.h>
 #include <engine/ecs/components/prefab_component.h>
+#include <editor/editing/authoring_root.h>
 #include <engine/ecs/components/tag_component.h>
 #include <engine/ecs/components/transform_component.h>
 #include <engine/ecs/ecs.h>
@@ -629,7 +630,9 @@ void draw_entity_context_menu(rtti::context& ctx, imgui_panels* panels, entt::ha
 
             ImGui::Separator();
 
-            if(entity.any_of<prefab_component, prefab_id_component>())
+            // Not for the prefab being edited: "Open Prefab" would open itself, and "Unlink"
+            // would unpack the file's own content - strip its prefab ids - under the user.
+            if(entity.any_of<prefab_component, prefab_id_component>() && !is_authoring_root(entity))
             {
                 if(ImGui::MenuItemIcon(ICON_MDI_OPEN_IN_NEW, "Open Prefab"))
                 {
@@ -766,10 +769,26 @@ auto get_entity_display_label(entt::handle entity) -> std::string
     auto name = entity_panel::get_entity_name(entity);
     auto icon = entity_panel::get_entity_icon(entity);
 
+    // Badged only when it is *not* what the surrounding subtree implies. A prefab instance
+    // inside a prefab is the ordinary case and stays clean; one added here is the exception,
+    // and the exception is what a row has to call out.
+    const char* badge = "";
+    switch(entity_panel::get_entity_prefab_role(entity))
+    {
+        case entity_panel::prefab_role::local_instance:
+            badge = " " ICON_MDI_PLUS_CIRCLE_OUTLINE;
+            break;
+        case entity_panel::prefab_role::local_content:
+            badge = " " ICON_MDI_PLUS;
+            break;
+        default:
+            break;
+    }
+
     const auto ent = entity.entity();
     const auto id = entt::to_integral(ent);
 
-    return icon + name +"###" + std::to_string(id);
+    return icon + name + badge + "###" + std::to_string(id);
 }
 
 void handle_entity_selection(rtti::context& ctx, entt::handle entity)
@@ -906,7 +925,15 @@ void draw_entity(rtti::context& ctx, imgui_panels* panels, entt::handle entity)
         const auto ver = entt::to_version(ent);
         const auto id = entt::to_integral(ent);
     
-        ImGui::SetItemTooltipEx("Id: %d\nIndex: %d\nVersion: %d", id, idx, ver);
+        const char* provenance = entity_panel::describe_prefab_role(entity_panel::get_entity_prefab_role(entity));
+        if(provenance[0] != '\0')
+        {
+            ImGui::SetItemTooltipEx("%s\n\nId: %d\nIndex: %d\nVersion: %d", provenance, id, idx, ver);
+        }
+        else
+        {
+            ImGui::SetItemTooltipEx("Id: %d\nIndex: %d\nVersion: %d", id, idx, ver);
+        }
     }
 
     ImGui::PopStyleColor();

@@ -25,7 +25,11 @@
 #include "gi/gi_light_voxels.sh"
 
 /// rgb = winning albedo, a = 1 where surface. Levels stacked along Z like the distance volume.
-IMAGE3D_WO(s_attr_albedo_out, rgba8, 5);
+/// READ-write: the previous alpha is the was-surface marker that gates the teardown stores
+/// below - a voxel that was non-surface and stays non-surface has nothing to clear, and the
+/// typical recompose is mostly such voxels re-storing zeros over zeros (eight image writes
+/// per voxel of pure redundancy at every camera re-snap).
+IMAGE3D_RW(s_attr_albedo_out, rgba8, 5);
 /// rgb = winning emissive (radiance units), a unused.
 IMAGE3D_WO(s_attr_emissive_out, rgba16f, 6);
 /// The surface-voxel list: a SDF_CLIPMAP_LEVEL_COUNT-entry header of append cursors (index =
@@ -39,7 +43,7 @@ BUFFER_RW(b_surface_list, uint, 9);
 /// slot's six face slabs only when the slot's world CELL changed hands (detected through
 /// b_attr_cells) - a surviving cell keeps the radiance it accumulated across any number of
 /// level re-snaps, which is what stops camera motion from pulsing the bounce light dark.
-IMAGE3D_WO(s_light_voxels_out, rgba16f, 7);
+IMAGE3D_RW(s_light_voxels_out, rgba16f, 7);
 /// One packed cell id per attribute slot per level (GiLightVoxelPackCell).
 BUFFER_RW(b_attr_cells, uint, 11);
 /// Per-texture mean colours (cs_gi_texture_mean.sc); an instance's albedo is its base colour
@@ -59,6 +63,16 @@ uniform vec4 u_clipmap_attr_params;
 /// xyz = this level's world-space origin (snapped minimum corner).
 uniform vec4 u_clipmap_compose_origin;
 
+/// SCROLL-ONLY recompose (global_sdf_clipmap::level::scroll_only): xyz = the window's shift
+/// in attribute cells since this level's previous compose, w > 0.5 when the instance content
+/// is unchanged since then. A cell that survived the scroll and sits at least one cell inside
+/// BOTH windows holds exactly the attributes a recompute would produce - the same world
+/// centre, the same instance set, and the same field bytes (the compose pass copied them) -
+/// so it re-appends to the surface list from its stored alpha and skips the field sample and
+/// the candidate walk. Cells within one cell of either window's boundary run the full path:
+/// the field's half-voxel coverage margin can flip their band test between the two windows.
+uniform vec4 u_clipmap_attr_scroll;
+
 /// Fraction of an attribute cell a candidate can actually occupy: 1 for solids, the shell
 /// thickness fraction for two-sided fields. See the blend note at the use site.
 float GiAttrShellCoverage(SdfHeader header, float scale)
@@ -68,6 +82,26 @@ float GiAttrShellCoverage(SdfHeader header, float scale)
 		return 1.0;
 	}
 	return saturate(2.0 * header.two_sided_thickness * scale / u_attr_voxel_size);
+}
+
+/// Emissive is a SOURCE, so its power scales with the area that emits. Stamping a small
+/// emitter's full radiance across a coarse voxel makes the voxel's whole cross-section
+/// emit - a 0.5 m cube read as a 2 m blob is a 16x energy amplifier, measured as red on
+/// buildings tens of metres from one small emissive cube. Scale the stored radiance by the
+/// instance's largest silhouette (extent product over the smallest extent - exact for
+/// boxes and sheets, conservative for everything else) over the voxel's cross-section,
+/// saturating for anything that genuinely fills the cell: large emissive surfaces are
+/// untouched at every level, and the fine levels see small emitters at full strength.
+/// Albedo deliberately keeps full-value stamping - reflectance is bounded and carries no
+/// power of its own. Mirrors global_sdf_clipmap::compose_level_attributes; the expression
+/// order is part of the transcription contract.
+float GiAttrEmissiveAreaFraction(vec3 bounds_min, vec3 bounds_max)
+{
+	vec3 extent = bounds_max - bounds_min;
+	float volume = (extent.x * extent.y) * extent.z;
+	float smallest = min(extent.x, min(extent.y, extent.z));
+	float silhouette = volume / max(smallest, 1e-4);
+	return saturate(silhouette / (u_attr_voxel_size * u_attr_voxel_size));
 }
 
 NUM_THREADS(4, 4, 4)
@@ -94,15 +128,83 @@ void main()
 	uint packed_cell_id = GiLightVoxelPackCell(cell, u_attr_level);
 	int cell_index =
 	    ((u_attr_level * resolution + slot.z) * resolution + slot.y) * resolution + slot.x;
-	if(b_attr_cells[cell_index] != packed_cell_id)
+	vec3 center = (vec3(cell) + vec3_splat(0.5)) * u_attr_voxel_size;
+	bool survived = b_attr_cells[cell_index] == packed_cell_id;
+	uint capacity = uint(resolution * resolution * resolution);
+	// packed_slot, not `packed`: a GLSL layout-qualifier keyword, illegal as a variable
+	// name on the OpenGL backend.
+	uint packed_slot = uint(slot.x) | (uint(slot.y) << 8u) | (uint(slot.z) << 16u) |
+	                   (uint(u_attr_level) << 24u);
+	BRANCH
+	if(u_clipmap_attr_scroll.w > 0.5 && survived)
 	{
-		b_attr_cells[cell_index] = packed_cell_id;
-		for(int face = 0; face < 6; ++face)
+		// The cell's offset under the OLD window: old base = new base - shift.
+		ivec3 shift = ivec3(u_clipmap_attr_scroll.xyz);
+		ivec3 old_offset = offset + shift;
+		ivec3 interior_min = ivec3(1, 1, 1);
+		ivec3 interior_max = ivec3(resolution - 2, resolution - 2, resolution - 2);
+		bool interior = all(greaterThanEqual(offset, interior_min)) && all(lessThanEqual(offset, interior_max)) &&
+		                all(greaterThanEqual(old_offset, interior_min)) &&
+		                all(lessThanEqual(old_offset, interior_max));
+		if(interior)
 		{
-			imageStore(s_light_voxels_out, GiLightVoxelTexel(slot, u_attr_level, face), vec4_splat(0.0));
+			// Attributes unchanged; only the (rebuilt) surface list needs the cell back.
+			vec4 previous = imageLoad(s_attr_albedo_out, texel);
+			if(previous.a > 0.0)
+			{
+				uint kept_cursor;
+				atomicFetchAndAdd(b_surface_list[uint(u_attr_level)], 1u, kept_cursor);
+				if(kept_cursor < capacity)
+				{
+					b_surface_list[uint(SDF_CLIPMAP_LEVEL_COUNT) + uint(u_attr_level) * capacity + kept_cursor] =
+					    packed_slot;
+				}
+			}
+			return;
 		}
 	}
-	vec3 center = (vec3(cell) + vec3_splat(0.5)) * u_attr_voxel_size;
+	if(!survived)
+	{
+		b_attr_cells[cell_index] = packed_cell_id;
+		// PARENT SEED (GI_LIGHT_VOXEL_SEED_ALPHA): a slot claimed by a new cell starts from the
+		// PARENT level's radiance for the same point instead of black. The parent scrolls half
+		// as often, so its cell is valid here; the seed is stored premultiplied under a
+		// provenance alpha the readers accept as measured and the relight EMA does not (so the
+		// first relight writes through and replaces it). Zero-claimed cells stayed black until
+		// their first relight - up to one rotation - a dark frontier dragged through the near
+		// field every level-0 re-snap. The probes seed from their parent cascade the same way.
+		int parent_level = u_attr_level + 1;
+		bool parent_ok = false;
+		ivec3 parent_slot = ivec3(0, 0, 0);
+		if(parent_level < SDF_CLIPMAP_LEVEL_COUNT)
+		{
+			vec4 parent_data = u_sdf_clipmap_levels[parent_level];
+			if(parent_data.w > 0.0)
+			{
+				float parent_voxel = parent_data.w * 2.0;
+				ivec3 parent_cell = GiLightVoxelCell(center, parent_voxel);
+				parent_slot = GiLightVoxelSlot(parent_cell);
+				int parent_index =
+				    ((parent_level * resolution + parent_slot.z) * resolution + parent_slot.y) * resolution +
+				    parent_slot.x;
+				parent_ok = b_attr_cells[parent_index] == GiLightVoxelPackCell(parent_cell, parent_level);
+			}
+		}
+		for(int face = 0; face < 6; ++face)
+		{
+			vec4 seed = vec4_splat(0.0);
+			if(parent_ok)
+			{
+				vec4 parent_face = imageLoad(s_light_voxels_out, GiLightVoxelTexel(parent_slot, parent_level, face));
+				// Only a MEASURED parent face seeds; culled/seeded/never-measured ones stay zero.
+				if(parent_face.w > 0.5)
+				{
+					seed = vec4(parent_face.xyz * GI_LIGHT_VOXEL_SEED_ALPHA, GI_LIGHT_VOXEL_SEED_ALPHA);
+				}
+			}
+			imageStore(s_light_voxels_out, GiLightVoxelTexel(slot, u_attr_level, face), seed);
+		}
+	}
 	float band = GI_SURFACE_VOXEL_BAND * u_attr_voxel_size;
 	// Band gate on the composed field, ALONE (transcribes the CPU reference, including the
 	// removal of the gradient gate - see compose_level_attributes for the thin-wall-valley
@@ -112,16 +214,26 @@ void main()
 	bool is_surface = field_distance < 0.5 * SDF_CLIPMAP_OUTSIDE && abs(field_distance) <= band;
 	if(!is_surface)
 	{
-		imageStore(s_attr_albedo_out, texel, vec4_splat(0.0));
-		imageStore(s_attr_emissive_out, texel, vec4_splat(0.0));
 		// A voxel that STOPPED being surface leaves the list and is never re-lit, so its
 		// radiance must die here or it survives as a ghost: geometry that moved away kept
 		// glowing at its old cells (a closed door's old radiance held the room lit through
 		// the trilinear neighbourhood). Surface voxels keep their radiance - zeroing THOSE
 		// is the recompose flicker this pass's claim logic exists to prevent.
-		for(int face = 0; face < 6; ++face)
+		//
+		// TRANSITION-ONLY: the previous alpha says whether there is anything to tear down.
+		// A voxel that was already non-surface holds zeros in all eight texels (this rule
+		// plus the cell-claim's own clear are the only writers), and re-storing zeros over
+		// zeros was most of the pass's store traffic on every recompose.
+		vec4 previous = imageLoad(s_attr_albedo_out, texel);
+		if(previous.a > 0.0)
 		{
-			imageStore(s_light_voxels_out, GiLightVoxelTexel(slot, u_attr_level, face), vec4_splat(0.0));
+			imageStore(s_attr_albedo_out, texel, vec4_splat(0.0));
+			imageStore(s_attr_emissive_out, texel, vec4_splat(0.0));
+			for(int face = 0; face < 6; ++face)
+			{
+				imageStore(s_light_voxels_out, GiLightVoxelTexel(slot, u_attr_level, face),
+				           vec4_splat(0.0));
+			}
 		}
 		return;
 	}
@@ -214,12 +326,18 @@ void main()
 	{
 		// The field says surface but nothing is attributable within reach: stay dark - energy
 		// loss, never a fabricated material. Unattributed voxels also leave the list, so any
-		// radiance they held dies with the attribution (same ghost rule as the branch above).
-		imageStore(s_attr_albedo_out, texel, vec4_splat(0.0));
-		imageStore(s_attr_emissive_out, texel, vec4_splat(0.0));
-		for(int face = 0; face < 6; ++face)
+		// radiance they held dies with the attribution (same ghost rule as the branch above,
+		// with the same transition-only gate).
+		vec4 previous = imageLoad(s_attr_albedo_out, texel);
+		if(previous.a > 0.0)
 		{
-			imageStore(s_light_voxels_out, GiLightVoxelTexel(slot, u_attr_level, face), vec4_splat(0.0));
+			imageStore(s_attr_albedo_out, texel, vec4_splat(0.0));
+			imageStore(s_attr_emissive_out, texel, vec4_splat(0.0));
+			for(int face = 0; face < 6; ++face)
+			{
+				imageStore(s_light_voxels_out, GiLightVoxelTexel(slot, u_attr_level, face),
+				           vec4_splat(0.0));
+			}
 		}
 		return;
 	}
@@ -229,10 +347,12 @@ void main()
 	{
 		first_albedo *= b_gi_texture_means[first.mean_slot].xyz;
 	}
+	vec3 first_emissive =
+	    first.emissive * GiAttrEmissiveAreaFraction(first.world_bounds_min, first.world_bounds_max);
 	// Single-source voxels copy EXACTLY: (a * w) / w is not an identity in float, and a
 	// one-ULP wobble flips quantisation on boundary values (see the CPU reference).
 	vec3 blended_albedo = first_albedo;
-	vec3 blended_emissive = first.emissive;
+	vec3 blended_emissive = first_emissive;
 	if(second_index >= 0)
 	{
 		SdfInstance second = SdfLoadInstance(second_index);
@@ -241,6 +361,8 @@ void main()
 		{
 			second_albedo *= b_gi_texture_means[second.mean_slot].xyz;
 		}
+		vec3 second_emissive = second.emissive * GiAttrEmissiveAreaFraction(second.world_bounds_min,
+		                                                                    second.world_bounds_max);
 		// COVERAGE-scaled proximity, not proximity alone: the blend approximates the mixture
 		// of surfaces INSIDE the cell, and a thin shell's volume fraction is bounded by its
 		// thickness over the cell size - a 3 cm rope equidistant with the floor is 2% of the
@@ -254,21 +376,16 @@ void main()
 		float w2 = (u_attr_reach - second_magnitude) * second_coverage;
 		float w_sum = max(w1 + w2, 1e-6);
 		blended_albedo = (first_albedo * w1 + second_albedo * w2) / w_sum;
-		blended_emissive = (first.emissive * w1 + second.emissive * w2) / w_sum;
+		blended_emissive = (first_emissive * w1 + second_emissive * w2) / w_sum;
 	}
 	imageStore(s_attr_albedo_out, texel, vec4(blended_albedo, 1.0));
 	imageStore(s_attr_emissive_out, texel, vec4(blended_emissive, 0.0));
 	uint cursor;
 	atomicFetchAndAdd(b_surface_list[uint(u_attr_level)], 1u, cursor);
-	uint capacity = uint(resolution * resolution * resolution);
 	// Cannot overflow by construction - the segment holds one entry per voxel and each thread
 	// appends at most once - so this clamp is a guard against a mis-sized buffer, not policy.
 	if(cursor < capacity)
 	{
-		// packed_slot, not `packed`: a GLSL layout-qualifier keyword, illegal as a variable
-		// name on the OpenGL backend.
-		uint packed_slot = uint(slot.x) | (uint(slot.y) << 8u) | (uint(slot.z) << 16u) |
-		                   (uint(u_attr_level) << 24u);
 		b_surface_list[uint(SDF_CLIPMAP_LEVEL_COUNT) + uint(u_attr_level) * capacity + cursor] =
 		    packed_slot;
 	}

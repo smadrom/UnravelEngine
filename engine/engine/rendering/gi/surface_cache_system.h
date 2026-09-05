@@ -107,6 +107,37 @@ public:
         return clipmap_instances_;
     }
 
+    /**
+     * @brief A world region whose accumulated lighting went stale recently: the union of the
+     *        bounds a changed placement occupied within the last GI_TEMPORAL_DIRTY_HOLD_FRAMES
+     *        frames (it moved, appeared, vanished or changed material).
+     *
+     * The temporal accumulators localise their fast-flush window to these regions instead of
+     * dropping the whole screen to the fast cap whenever anything anywhere moves - which is
+     * what one oscillating cube in a far cell used to do to every pixel of a still shot.
+     */
+    struct dirty_region
+    {
+        math::bbox bounds{};
+        /// Frame of the most recent change inside the region.
+        uint64_t last_change_frame = 0;
+    };
+
+    /// The regions changed within the hold window, rebuilt by @ref update_world.
+    auto get_dirty_regions() const -> const std::vector<dirty_region>&
+    {
+        return dirty_regions_;
+    }
+
+    /**
+     * @brief Packs the dirty regions as (min, max) vec4 pairs for the shader uniform of
+     *        gi_dirty_regions.sh, most recent first so a fixed budget keeps the regions
+     *        still flushing.
+     * @return The number of regions packed (at most @p max_regions); more regions than that
+     *         exist when get_dirty_regions().size() exceeds it.
+     */
+    auto pack_dirty_regions(float* out_bounds, uint32_t max_regions) const -> uint32_t;
+
     auto get_atlas() -> sdf_atlas&
     {
         return atlas_;
@@ -125,10 +156,44 @@ public:
         return instance_buffer_;
     }
 
+    /// One emissive instance the probes sample explicitly (GI S4, next-event estimation):
+    /// the bounding sphere of its placed bounds, its emitted radiance and its power.
+    struct emitter
+    {
+        math::vec3 center{0.0f, 0.0f, 0.0f};
+        float radius = 0.0f;
+        math::vec3 radiance{0.0f, 0.0f, 0.0f};
+        /// Luminance x bounds surface area, the ordering key for the cap. CPU only: the
+        /// upload packs @ref extent into this lane instead (no shader consumed the power).
+        float power = 0.0f;
+        /// The axis-aligned extent of this piece, metres (at most GI_EMISSIVE_NEE_SEGMENT
+        /// per axis) - the reflection tier's near-field term samples the piece along its
+        /// longest axis. Packed 8 bits per axis into the power lane, negated and offset by
+        /// one as the marker an older upload cannot produce.
+        math::vec3 extent{0.0f, 0.0f, 0.0f};
+    };
+
+    /// This frame's emitter table (rebuilt by update_world, capped by power).
+    auto get_emitters() const -> const std::vector<emitter>&
+    {
+        return emitters_;
+    }
+
+    /// vec4 elements per emitter in the table appended to the instance buffer. Must match
+    /// SDF_EMITTER_STRIDE in gi/gi_emissive_nee.sh: (center, radius), (radiance, power).
+    static constexpr uint32_t emitter_vec4_stride = 2;
+
     /// vec4 elements per packed instance. Must match SDF_INSTANCE_STRIDE in gi/sdf_common.sh.
     /// Two of the ten carry the material; emission is HDR, so it gets its own vec4 rather than
     /// being packed into a spare component.
     static constexpr uint32_t instance_vec4_stride = 10;
+
+    /// Slot capacity of the mean buffer (16 KiB of vec4s). Overflow falls back to the white
+    /// slot with a one-time warning rather than growing - a scene with a thousand distinct
+    /// colour maps has bigger problems than its bounce tint. PUBLIC because the reflection
+    /// pass stages the whole buffer into its trace list (GI_REFLECTION_MEAN_SLOTS must equal
+    /// this; static_assert at the staging site).
+    static constexpr uint32_t texture_mean_capacity = 1024;
 
     /// The per-texture mean buffer the attribute composer reads (slot 0 = white).
     auto get_texture_mean_buffer() const -> gfx::dynamic_vertex_buffer_handle
@@ -148,6 +213,20 @@ public:
     /// Mean-capture dispatches per frame. Each is a 1x1x1 dispatch of 64 texture taps, so the
     /// bound exists to pace the recompose wave a fresh scene triggers, not the GPU cost.
     static constexpr uint32_t max_texture_mean_captures_per_frame = 4;
+
+    /**
+     * @brief Monotonic revision of everything a clipmap-level fingerprint can depend on.
+     *
+     * Bumped when the packed instance bytes change, when a texture-mean capture lands, and
+     * when the atlas residency moves (a field uploaded or released). While it holds still and
+     * a level's target origin holds still, that level's content fingerprint is necessarily
+     * unchanged - which is what lets global_sdf_clipmap::update skip re-walking every
+     * instance for every level on every frame.
+     */
+    auto get_content_revision() const -> uint64_t
+    {
+        return content_revision_;
+    }
 
     /// CSR offsets of the instance cull grid, one entry per cell plus a terminator.
     auto get_grid_offset_buffer() const -> gfx::dynamic_index_buffer_handle
@@ -257,7 +336,63 @@ private:
      *        neutral albedo; it must resolve the same way the renderer does, or a bounce would
      *        tint light with a colour the surface is not actually painted.
      */
-    void add_instance(uint32_t header_index,
+    /// Per-placement motion tracking behind @ref get_dirty_regions, and the cache of the
+    /// pose-derived values @ref add_instance would otherwise recompute every frame. `history`
+    /// holds the (frame, bounds) pairs the placement occupied within the hold window, newest
+    /// last; a placement that vanished keeps its entry until that history ages out.
+    struct tracked_placement
+    {
+        /// FNV over the pose and the baked material (see compute_placement_hash).
+        uint64_t placement_hash = 0;
+        /// The region bounds (emissive-inflated) and the raw world bounds as of the last frame.
+        math::bbox bounds{};
+        math::bbox field_bounds{};
+        /// Pose-derived cache: valid while @ref pose_key matches the frame's (transform, field
+        /// bounds) - the inverse and the transformed corners are pure functions of those, so
+        /// a static placement reuses them instead of paying an inverse per frame.
+        uint64_t pose_key = 0;
+        bool has_pose = false;
+        math::mat4 world_to_local{1.0f};
+        float local_to_world_scale = 1.0f;
+        uint64_t seen_frame = 0;
+        /// Set once the sweep recorded the placement's disappearance; cleared if it returns.
+        bool swept = false;
+        struct history_entry
+        {
+            uint64_t frame = 0;
+            math::bbox bounds{};
+        };
+        std::vector<history_entry> history;
+    };
+
+    /// FNV-1a over the pose and the material the attribute voxels bake, component by
+    /// component (never over sizeof: math::vec3 carries indeterminate padding bytes).
+    static auto compute_placement_hash(const math::mat4& local_to_world,
+                                       const math::vec3& albedo,
+                                       const math::vec3& emissive) -> uint64_t;
+
+    /**
+     * @brief Records a placement's pose for @ref get_dirty_regions: a new, moved, re-materialed
+     *        or vanished placement adds the bounds it occupied to its region history.
+     *
+     * @param identity Stable key of the placement (entity, submesh, placement index), so a pose
+     *        can be compared against the same placement's previous frame.
+     * @param placement_hash The frame's compute_placement_hash of the placement.
+     * @param field_bounds The placement's raw world bounds; the region bounds are derived here
+     *        (an emissive placement inflates by its light's reach).
+     * @return The placement's record, for the pose cache.
+     */
+    auto track_placement(uint64_t identity,
+                         uint64_t placement_hash,
+                         const math::vec3& emissive,
+                         const math::bbox& field_bounds) -> tracked_placement&;
+
+    /// Sweeps placements not seen this frame (their last bounds go stale too), drops history
+    /// older than the hold window and rebuilds @ref dirty_regions_.
+    void rebuild_dirty_regions();
+
+    void add_instance(uint64_t identity,
+                      uint32_t header_index,
                       const mesh_sdf& sdf,
                       const math::mat4& local_to_world,
                       const std::shared_ptr<mesh>& owner,
@@ -297,8 +432,13 @@ private:
      */
     void upload_instances();
 
+    /// Rebuilds the emitter table from this frame's instances (bounding spheres of the
+    /// emissive ones), capped at GI_EMISSIVE_NEE_MAX_EMITTERS by power.
+    void rebuild_emitters();
+
     sdf_atlas atlas_;
     gpu_light_buffer light_buffer_;
+    std::vector<emitter> emitters_;
     /// Identifies one submesh's field. Residency is per SUBMESH, not per mesh: each submesh has
     /// its own field and is uploaded to the atlas independently.
     struct field_key
@@ -337,14 +477,12 @@ private:
     /// vec4 per slot, seeded white; written only by cs_gi_texture_mean dispatches.
     gfx::dynamic_vertex_buffer_handle texture_mean_buffer_{bgfx::kInvalidHandle};
     uint32_t next_texture_mean_slot_ = 1;
-    /// Slot capacity of the mean buffer (16 KiB of vec4s). Overflow falls back to the white
-    /// slot with a one-time warning rather than growing - a scene with a thousand distinct
-    /// colour maps has bigger problems than its bounce tint.
-    static constexpr uint32_t texture_mean_capacity = 1024;
     bool texture_mean_overflow_warned_ = false;
     std::vector<instance> instances_;
     /// Clipmap composition input, rebuilt each frame alongside @ref instances_.
     std::vector<global_sdf_instance> clipmap_instances_;
+    std::unordered_map<uint64_t, tracked_placement> tracked_placements_;
+    std::vector<dirty_region> dirty_regions_;
     /// Keeps every mesh referenced by @ref clipmap_instances_ alive for the duration of
     /// composition. The composer borrows raw mesh_sdf pointers, so an asset unloading
     /// mid-compose would otherwise dangle.
@@ -366,6 +504,8 @@ private:
     std::vector<float> instance_data_;
     /// FNV-1a over @ref instance_data_ as last packed (the light buffer's convention).
     uint64_t instance_fingerprint_ = 0;
+    /// See @ref get_content_revision. Starts at 1 so a zero can mean "no revision known".
+    uint64_t content_revision_ = 1;
     /// The instance fingerprint the grid was last built and uploaded for.
     uint64_t grid_uploaded_fingerprint_ = 0;
     /// Broad-phase over @ref instances_, so a ray tests the instances near it rather than all of

@@ -34,12 +34,15 @@ auto global_sdf_clipmap_gpu::init(uint32_t resolution, bool compose_on_gpu) -> b
     // without it the image binding silently produces no writes rather than an error.
     const uint64_t flags = BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP | BGFX_SAMPLER_W_CLAMP |
                            BGFX_TEXTURE_COMPUTE_WRITE;
+    // BLIT_DST as well: a scroll-only recompose (level::scroll_only) places the overlap of
+    // the old and new windows back into the level slab with a blit, composing only the
+    // exposed slabs.
     texture_ = std::make_shared<gfx::texture>(static_cast<uint16_t>(resolution),
                                               static_cast<uint16_t>(resolution),
                                               static_cast<uint16_t>(depth),
                                               false,
                                               gfx::texture_format::R8,
-                                              flags);
+                                              flags | BGFX_TEXTURE_BLIT_DST);
     if(!texture_ || !texture_->is_valid())
     {
         APPLOG_ERROR("[SurfaceCache] Failed to create the {}x{}x{} clipmap texture.",
@@ -96,9 +99,12 @@ auto global_sdf_clipmap_gpu::init(uint32_t resolution, bool compose_on_gpu) -> b
     // matches a live generation and turns the memo into a permanent miss (the failure is
     // invisible except as light-voxel cost). ~25 MB at the runtime default - half the
     // light volume.
+    // One slice deeper than the light volume: the relight convergence statistic lives past
+    // the last face slab (GiLightVoxelStatsTexel) - the pass has no free stage for a
+    // buffer of its own, and this image is bound read-write on every backend.
     bounce_vis_memo_ = std::make_shared<gfx::texture>(static_cast<uint16_t>(attr_resolution),
                                                       static_cast<uint16_t>(attr_resolution),
-                                                      static_cast<uint16_t>(light_depth),
+                                                      static_cast<uint16_t>(light_depth + 1u),
                                                       false,
                                                       gfx::texture_format::R32U,
                                                       BGFX_TEXTURE_COMPUTE_WRITE);
@@ -182,13 +188,16 @@ auto global_sdf_clipmap_gpu::init(uint32_t resolution, bool compose_on_gpu) -> b
         world_probe_cells_ = gfx::create_dynamic_index_buffer(probe_count,
                                                               BGFX_BUFFER_COMPUTE_READ_WRITE |
                                                                   BGFX_BUFFER_INDEX32);
+        world_probe_counts_ = gfx::create_dynamic_index_buffer(probe_count,
+                                                               BGFX_BUFFER_COMPUTE_READ_WRITE |
+                                                                   BGFX_BUFFER_INDEX32);
         world_probe_atlas_params_[0] = 1.0f / float(gutter_w);
         world_probe_atlas_params_[1] = 1.0f / float(gutter_h);
         world_probe_atlas_params_[2] = float(gutter_w);
         world_probe_atlas_params_[3] = float(gutter_h);
         if(!world_probe_radiance_ || !world_probe_radiance_->is_valid() || !world_probe_irradiance_ ||
            !world_probe_irradiance_->is_valid() || !world_probe_depth_ || !world_probe_depth_->is_valid() ||
-           !bgfx::isValid(world_probe_cells_))
+           !bgfx::isValid(world_probe_cells_) || !bgfx::isValid(world_probe_counts_))
         {
             APPLOG_ERROR("[SurfaceCache] Failed to create the world probe resources.");
             shutdown();
@@ -231,6 +240,11 @@ void global_sdf_clipmap_gpu::shutdown()
     {
         gfx::destroy(world_probe_cells_);
         world_probe_cells_ = gfx::dynamic_index_buffer_handle{bgfx::kInvalidHandle};
+    }
+    if(bgfx::isValid(world_probe_counts_))
+    {
+        gfx::destroy(world_probe_counts_);
+        world_probe_counts_ = gfx::dynamic_index_buffer_handle{bgfx::kInvalidHandle};
     }
     world_probe_cell_count_ = 0;
     needs_buffer_seed_ = false;

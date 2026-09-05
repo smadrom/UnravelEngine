@@ -836,6 +836,13 @@ void model::submit(const math::mat4& world_transform,
 
                             const auto [sm, sm_lod] = resolve(static_cast<uint32_t>(index), *transform, i);
                             gfx::set_world_transform(*transform);
+                            if(extras.prev_submesh_transforms != nullptr)
+                            {
+                                const auto* prev_transform =
+                                    extras.prev_submesh_transforms->get_transform(static_cast<uint32_t>(index), i);
+                                gfx::set_prev_world_transform(prev_transform != nullptr ? *prev_transform
+                                                                                        : *transform);
+                            }
                             mesh->bind_render_buffers_for_submesh(sm, sm_lod);
                             params.preserve_state = (&index != &indices.back());
                             callbacks.setup_params_per_submesh(params, *mat);
@@ -851,6 +858,10 @@ void model::submit(const math::mat4& world_transform,
 
                     const auto [sm, sm_lod] = resolve(static_cast<uint32_t>(index), matrix, 0);
                     gfx::set_world_transform(matrix);
+                    if(extras.prev_world_transform != nullptr)
+                    {
+                        gfx::set_prev_world_transform(*extras.prev_world_transform);
+                    }
                     mesh->bind_render_buffers_for_submesh(sm, sm_lod);
                     params.preserve_state = &index != &indices.back();
                     callbacks.setup_params_per_submesh(params, *mat);
@@ -966,6 +977,15 @@ void model::submit(const math::mat4& world_transform,
                     }
 
                     gfx::set_world_transform(submesh_skinning_transforms.transforms);
+                    if(extras.prev_skinning_transforms != nullptr)
+                    {
+                        const auto& prev_all = *extras.prev_skinning_transforms;
+                        const bool has_matching_prev =
+                            index < prev_all.size() &&
+                            prev_all[index].transforms.size() == submesh_skinning_transforms.transforms.size();
+                        gfx::set_prev_world_transform(has_matching_prev ? prev_all[index].transforms
+                                                                        : submesh_skinning_transforms.transforms);
+                    }
 
                     mesh->bind_render_buffers_for_submesh(sm, sm_lod);
                     params.preserve_state = &index != &indices.back();
@@ -1350,6 +1370,12 @@ void model::submit_for_batching(batch_collector& collector,
                     // Create batch instance with the specific transform
                     batch_instance instance(transform_ptr);
                     instance.lod_params.x = lod_param;
+                    if(extras.prev_submesh_transforms != nullptr)
+                    {
+                        const auto* prev_ptr =
+                            extras.prev_submesh_transforms->get_transform(submesh_index, instance_idx);
+                        instance.prev_world_transform_ptr = prev_ptr != nullptr ? prev_ptr : transform_ptr;
+                    }
 
                     // Collect for batching
                     collector.collect_renderable(key, instance);
@@ -1375,6 +1401,10 @@ void model::submit_for_batching(batch_collector& collector,
                 // Create batch instance with world transform
                 batch_instance instance(&world_transform);
                 instance.lod_params.x = lod_param;
+                if(extras.prev_world_transform != nullptr)
+                {
+                    instance.prev_world_transform_ptr = extras.prev_world_transform;
+                }
 
                 // Collect for batching
                 collector.collect_renderable(key, instance);

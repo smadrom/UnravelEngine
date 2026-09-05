@@ -1,4 +1,5 @@
 #include "inspector_assets.h"
+#include <editor/editing/authoring_root.h>
 #include "inspectors.h"
 
 #include <engine/animation/animation.h>
@@ -889,24 +890,26 @@ auto inspector_asset_handle_animation::inspect(rtti::context& ctx,
 auto inspector_asset_handle_prefab::get_prefab_entity(rtti::context& ctx, const asset_handle<prefab>& prefab)
     -> entt::handle
 {
-    entt::handle instance{};
-    auto view = inspected_scene_.registry->view<prefab_component>();
-    view.each(
-        [&](auto e, auto&& comp)
-        {
-            if(comp.source == prefab && comp.source.version() == inspected_version_)
-            {
-                instance = inspected_scene_.create_handle(e);
-            }
-        });
-    if(!instance)
+    const bool cached = inspected_root_ && inspected_root_.valid() && inspected_uid_ == prefab.uid() &&
+                        inspected_version_ == prefab.version();
+    if(cached)
     {
-        inspected_scene_.unload();
-        instance = inspected_scene_.instantiate(prefab, false);
-        inspected_version_ = prefab.version();
+        return inspected_root_;
     }
 
-    return instance;
+    inspected_scene_.unload();
+    inspected_root_ = inspected_scene_.instantiate(prefab, false);
+    inspected_uid_ = prefab.uid();
+    inspected_version_ = prefab.version();
+
+    // An instance of the prefab that is upstream of it - its edits are saved straight back
+    // into the file. The tag keeps it from being synced against that file (which would put a
+    // reverted override straight back, before the save that would have made the revert stick)
+    // and from recording its own content as overrides of it.
+    inspected_root_.emplace<authoring_root_tag>();
+    scene::adopt_document_statements(inspected_root_);
+
+    return inspected_root_;
 }
 
 auto inspector_asset_handle_prefab::inspect_as_property(rtti::context& ctx, asset_handle<prefab>& data)
@@ -936,8 +939,11 @@ auto inspector_asset_handle_prefab::inspect(rtti::context& ctx,
     }
 
     auto prefab_entity = get_prefab_entity(ctx, data);
-
     auto& am = ctx.get_cached<asset_manager>();
+    auto& em = ctx.get_cached<editing_manager>();
+    // Two authoring roots of one file would be last-writer-wins; while prefab mode has it,
+    // this one only shows it.
+    const bool open_in_prefab_mode = em.is_prefab_mode() && em.edited_prefab.uid() == data.uid();
     inspect_result result{};
 
     if(ImGui::BeginTabBar("asset_handle_prefab",
@@ -947,10 +953,13 @@ auto inspector_asset_handle_prefab::inspect(rtti::context& ctx,
         {
             ImGui::BeginChild(ex::get_type(data.extension()).c_str());
 
-            if(data)
+            if(data && open_in_prefab_mode)
+            {
+                ImGui::TextWrapped("This prefab is open in prefab mode. Edit it there.");
+            }
+            else if(data)
             {
                 result |= ::unravel::inspect(ctx, prefab_entity);
-
                 if(result.edit_finished)
                 {
                     fs::path absolute_key = fs::absolute(fs::resolve_protocol(data.id()));

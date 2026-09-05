@@ -74,7 +74,9 @@ auto reflection_probe_component::get_render_view(size_t idx) -> gfx::render_view
 
 auto reflection_probe_component::get_cubemap() -> const  gfx::texture::ptr&
 {
-    auto& tex = rview_.tex_get_or_emplace("CUBEMAP");
+    // Product of the bake, not auto-collected: it goes unaccessed for as long as the
+    // probe is frustum-culled, and already_generated() would not know to rebuild it.
+    auto& tex = rview_.tex_get_or_emplace("CUBEMAP", false);
     const uint16_t size = probe_resolution_to_size(resolution_);
     constexpr gfx::texture_format format = gfx::texture_format::RGBA16F;
     if(gfx::needs_recreate(tex, {size, size}, format))
@@ -92,7 +94,8 @@ auto reflection_probe_component::get_cubemap() -> const  gfx::texture::ptr&
 
 auto reflection_probe_component::get_cubemap_prefiltered() -> const  gfx::texture::ptr&
 {
-    auto& tex = rview_.tex_get_or_emplace("CUBEMAP_PREFILTERED");
+    // Product of the bake, not auto-collected (see get_cubemap).
+    auto& tex = rview_.tex_get_or_emplace("CUBEMAP_PREFILTERED", false);
     const uint16_t size = probe_resolution_to_size(resolution_);
     constexpr gfx::texture_format format = gfx::texture_format::RGBA16F;
     if(gfx::needs_recreate(tex, {size, size}, format))
@@ -110,6 +113,10 @@ auto reflection_probe_component::get_cubemap_prefiltered() -> const  gfx::textur
 
 auto reflection_probe_component::get_cubemap_fbo(size_t face) -> const gfx::frame_buffer::ptr&
 {
+    // Bake scratch, auto-collected (the default), unlike the product cubemaps in
+    // rview_: every cycle starts by recreating and clearing the faces here, and only
+    // the prefilter reads them, at cycle end. The dormant-only purge in update()
+    // keeps a stalled mid-cycle bake's captured faces intact.
     auto& fbo = face_rviews_[face].fbo_get_or_emplace("CUBEMAP");
     auto& tex = face_rviews_[face].tex_get_or_emplace("CUBEMAP_FACE");
     const uint16_t size = probe_resolution_to_size(resolution_);
@@ -124,18 +131,19 @@ auto reflection_probe_component::get_cubemap_fbo(size_t face) -> const gfx::fram
                                              1,
                                              format,
                                              BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_RT | BGFX_TEXTURE_COMPUTE_WRITE);
-   
+    }
+    // The fbo gets its own guard, never keyed on the texture alone: a collected fbo
+    // entry must rebuild around a still-valid texture instead of coming back null.
+    if(recreate_texture || !fbo)
+    {
         gfx::fbo_attachment att;
         att.layer = 0;
         att.texture = tex;
         att.generate_mips = true;
-
         fbo.reset();
         fbo = std::make_shared<gfx::frame_buffer>();
         fbo->populate({att});
     }
-
-
     return fbo;
 }
 
@@ -155,6 +163,17 @@ void reflection_probe_component::update(float dt)
             }
 
         }
+        // The face views hold a full pipeline scratch set each (G-buffer, lighting
+        // targets) from the last bake; nothing touches them between bakes, so they age
+        // out here. Dormant-only on purpose: a bake stalled mid-cycle (probe culled
+        // with faces half-emitted) must keep its captured faces for the prefilter.
+        // The product cubemaps in rview_ opt out of collection at their creation
+        // sites, so purging the view is safe.
+        for(auto& face_rview : face_rviews_)
+        {
+            face_rview.release_unused(gfx::get_render_frame());
+        }
+        rview_.release_unused(gfx::get_render_frame());
         return;
     }
 

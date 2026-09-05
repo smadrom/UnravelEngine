@@ -1,4 +1,6 @@
 #include "scene.h"
+
+#include <functional>
 #include "uuid/uuid.h"
 #include <engine/ecs/components/id_component.h>
 #include <engine/ecs/components/layer_component.h>
@@ -19,12 +21,15 @@
 #include <engine/scripting/ecs/systems/script_system.h>
 
 #include <engine/rendering/ecs/systems/rendering_system.h>
+#include <engine/rendering/ecs/systems/reflection_probe_system.h>
 #include <engine/ui/ecs/components/ui_document_component.h>
 #include <engine/ui/ecs/systems/ui_system.h>
 #include <engine/events.h>
 #include <engine/play_mode.h>
 #include <engine/meta/ecs/entity.hpp>
 #include <engine/profiler/profiler.h>
+
+#include <hpp/small_vector.hpp>
 
 #include <logging/logging.h>
 
@@ -92,12 +97,91 @@ void unregister_scene(scene* scn)
 }
 
 
+auto destroy_suppression_depth() -> int&
+{
+    static int depth = 0;
+    return depth;
+}
+
+/**
+ * @brief Collects a subtree depth-first, children before parents.
+ *
+ * Children first so a child's slot still observes an intact parent.
+ *
+ * Iterated by reference on purpose: this walk runs no user code, so nothing can
+ * reparent or destroy anything while it is in progress. The snapshot it fills exists
+ * because the publish pass afterwards does run user code.
+ */
+void collect_subtree_post_order(entt::handle entity, hpp::small_vector<entt::handle, 16>& out)
+{
+    if(!entity)
+    {
+        return;
+    }
+
+    if(const auto* transform = entity.try_get<transform_component>())
+    {
+        for(const auto& child : transform->get_children())
+        {
+            collect_subtree_post_order(child, out);
+        }
+    }
+
+    out.push_back(entity);
+}
+
 template<typename ...Ts>
 void destroy_dependent_components(entt::registry& r, entt::entity e)
 {
     r.remove<Ts...>(e);
 }
 
+/**
+ * @brief Strips components down a subtree, stopping at nested prefab instances.
+ *
+ * Wired to on_destroy<prefab_component> to clear prefab ids when an instance is unpacked.
+ * The recursion stops at any child that is itself an instance root: that child belongs to
+ * a different asset, and stripping its ids would silently sever its own link while the
+ * user was only unpacking the outer one.
+ */
+template<typename ...Ts>
+void destroy_dependent_components_in_children(entt::registry& r, entt::entity e)
+{
+    if(!r.valid(e))
+    {
+        return;
+    }
+
+    // A child that is itself an instance root belongs to a different asset. Unpacking the
+    // outer instance must not reach into it: stripping its prefab ids would sever its own
+    // link too, silently and with nothing in the UI to say so.
+    if(r.try_get<prefab_component>(e) != nullptr)
+    {
+        return;
+    }
+
+    destroy_dependent_components<Ts...>(r, e);
+
+    auto transform = r.try_get<transform_component>(e);
+    if(transform)
+    {
+        for(auto child : transform->get_children())
+        {
+            destroy_dependent_components_in_children<Ts...>(r, child);
+        }
+    }
+}
+
+/// Raised by scene::detach_instance_link around its removal, so the unpack hook below knows
+/// this particular removal is a detach rather than an unlink.
+auto keep_prefab_ids_depth() -> int&
+{
+    static thread_local int depth = 0;
+    return depth;
+}
+
+/// Entry point for on_destroy<prefab_component>. Kept at exactly (registry&, entity) so
+/// entt's connect<> can bind it.
 template<typename ...Ts>
 void destroy_dependent_components_recursive(entt::registry& r, entt::entity e)
 {
@@ -105,15 +189,23 @@ void destroy_dependent_components_recursive(entt::registry& r, entt::entity e)
     {
         return;
     }
-    destroy_dependent_components<Ts...>(r, e);
 
+    // A detach, not an unpack: the link goes, the ids stay. See scene::detach_instance_link.
+    if(keep_prefab_ids_depth() > 0)
+    {
+        return;
+    }
+
+    // The entity whose prefab_component is going away: strip it, then descend. The
+    // instance-root check is deliberately not applied here - this *is* the instance root.
+    destroy_dependent_components<Ts...>(r, e);
 
     auto transform = r.try_get<transform_component>(e);
     if(transform)
     {
         for(auto child : transform->get_children())
         {
-            destroy_dependent_components_recursive<Ts...>(r, child);
+            destroy_dependent_components_in_children<Ts...>(r, child);
         }
     }
 }
@@ -173,6 +265,11 @@ scene::scene(const std::string& tag_name)
     on_destroy<character_controller_component>(*registry).connect<&physics_system::on_destroy_cc_component>();
 
     on_construct<prefab_component>(*registry).connect<&owned_component::on_create_component<prefab_component>>();
+    // on_update too: emplace_or_replace / replace / patch on an existing component assign a
+    // whole object over the live one, owner handle included, and fire only this signal. Without
+    // re-stamping here a replaced instance is left with a null owner - a crash waiting in any
+    // code that trusts get_owner().
+    on_update<prefab_component>(*registry).connect<&owned_component::on_create_component<prefab_component>>();
     on_destroy<prefab_component>(*registry).connect<&owned_component::on_destroy_component<prefab_component>>();
 
     on_destroy<prefab_component>(*registry).connect<&destroy_dependent_components_recursive<prefab_id_component>>();
@@ -187,6 +284,11 @@ scene::scene(const std::string& tag_name)
 
     on_construct<particle_emitter_component>(*registry).connect<&particle_emitter_component::on_create_component>();
     on_destroy<particle_emitter_component>(*registry).connect<&particle_emitter_component::on_destroy_component>();
+
+    // Activation must refresh a probe whose product cubemaps were released while inactive.
+    // Wired here (not play-gated like the script/audio hooks) because the editor's active
+    // toggle drives the same transform-flags path in edit mode.
+    on_construct<active_component>(*registry).connect<&reflection_probe_system::on_create_active_component>();
     
 
 }
@@ -199,6 +301,15 @@ scene::~scene()
 
 void scene::unload()
 {
+    // Bulk teardown: every entity goes at once, so contact exit callbacks would be
+    // noise - the guard turns them off for the duration.
+    scoped_destroy_suppression no_pre_destroy;
+
+    // Same order the single-entity path uses: physics leaves the world before the
+    // scripts that might otherwise be called back into, and both before the untyped
+    // clear() tears down everything else in whatever order the pools happen to sit in.
+    registry->clear<physics_component>();
+    registry->clear<character_controller_component>();
     registry->clear<script_component>();
     registry->clear();
     auto reserved_entity = registry->create();
@@ -400,8 +511,22 @@ auto scene::clone_entity(entt::handle clone_from, bool keep_parent, bool call_ca
     APP_SCOPE_PERF("Clone Entity To");
 
     auto* reg = clone_from.registry();
-    entt::handle clone_to(*reg, reg->create());
+
+    // clone_entity_from_stream takes a handle, and the loader behind it reassigns that
+    // handle to entities it creates itself rather than filling in the one it was given.
+    // So this scratch entity exists only to carry the registry through that API, and is
+    // then left over - a componentless entity per clone unless it is cleaned up here.
+    const auto stub = reg->create();
+    entt::handle clone_to(*reg, stub);
     clone_entity(clone_to, clone_from, keep_parent, call_callbacks);
+
+    if(reg->valid(stub) && (!clone_to || clone_to.entity() != stub))
+    {
+        // Never visible to gameplay, so its teardown must not announce anything.
+        scoped_destroy_suppression no_announce;
+        destroy_entity(entt::handle(*reg, stub));
+    }
+
     return clone_to;
 }
 
@@ -422,6 +547,97 @@ void scene::clone_scene(const scene& src_scene, scene& dst_scene, bool call_call
 void scene::clear_entity(entt::handle& handle)
 {
     remove_all_components(handle);
+}
+
+scene::scoped_destroy_suppression::scoped_destroy_suppression()
+{
+    ++destroy_suppression_depth();
+}
+
+scene::scoped_destroy_suppression::~scoped_destroy_suppression()
+{
+    --destroy_suppression_depth();
+}
+
+auto scene::is_destroy_suppressed() -> bool
+{
+    return destroy_suppression_depth() > 0;
+}
+
+void scene::adopt_document_statements(entt::handle root)
+{
+    if(!root)
+    {
+        return;
+    }
+    auto* prefab_comp = root.try_get<prefab_component>();
+    if(prefab_comp == nullptr)
+    {
+        return;
+    }
+    prefab_comp->local.merge(prefab_comp->from_document);
+    prefab_comp->from_document.clear();
+}
+
+void scene::detach_instance_link(entt::handle entity)
+{
+    if(!entity || !entity.all_of<prefab_component>())
+    {
+        return;
+    }
+    // What the document stated about the nested content is this scene's now.
+    re_home_document_statements(entity);
+    ++keep_prefab_ids_depth();
+    entity.remove<prefab_component>();
+    --keep_prefab_ids_depth();
+}
+
+void scene::destroy_entity(entt::handle entity)
+{
+    if(!entity)
+    {
+        return;
+    }
+
+    if(!is_destroy_suppressed())
+    {
+        auto* bus = entity.registry()->ctx().find<on_pre_destroy_bus>();
+
+        // Nobody listening is the common case - edit mode, and play mode with no
+        // physics world - and it must cost nothing.
+        if(bus != nullptr && !bus->sig.empty())
+        {
+            // Announce the entire subtree BEFORE anything is torn down, so every slot
+            // sees a whole entity with whole ancestors. Snapshot first: a slot may
+            // destroy entities, including ones still ahead in this walk.
+            hpp::small_vector<entt::handle, 16> subtree;
+            collect_subtree_post_order(entity, subtree);
+
+            for(const auto& node : subtree)
+            {
+                if(node)
+                {
+                    bus->sig.publish(*node.registry(), node.entity());
+                }
+            }
+        }
+    }
+
+    // A slot may already have destroyed the root out from under us.
+    if(entity)
+    {
+        // Suppressed for the teardown itself. Destroy hooks run inside
+        // entt::registry::destroy, where reaching script code is exactly what the
+        // announcement above exists to avoid; anything that needed to talk to gameplay
+        // has already had its turn.
+        scoped_destroy_suppression teardown;
+
+        // One of only two raw destroys in the codebase - this one, and the child
+        // cascade in transform_component::on_destroy_component. Everywhere else calls
+        // scene::destroy_entity, so that nothing can be torn down without the
+        // subsystems holding per-entity state getting a chance to settle it first.
+        entity.destroy();
+    }
 }
 
 

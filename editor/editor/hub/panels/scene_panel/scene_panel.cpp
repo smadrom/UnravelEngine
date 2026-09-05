@@ -2,6 +2,7 @@
 #include "../panel.h"
 #include "../panels_defs.h"
 #include "../viewport_resolution.h"
+#include "../visualization_modes.h"
 #include "imgui_widgets/utils.h"
 #include <editor/editing/actions/entity_actions.h>
 #include <editor/editing/editing_manager.h>
@@ -786,30 +787,43 @@ auto handle_inverse_kinematics(entt::handle selection, entt::handle center, edit
     }
 
     auto& center_transform_comp = center.get<transform_component>();
+    const math::vec3 target = center_transform_comp.get_position_global();
+
+    // No pole: the solvers keep the chain's current bend plane, so dragging
+    // rotates the limb the way the artist expects.
+    //
+    // A pole must NOT be derived from the gizmo here. setup_gizmo_pivot copies
+    // the active selection's whole global transform - rotation included - onto
+    // the gizmo every frame, and during IK the active selection is the end
+    // effector. A position solve rotates the effector (its parents turn and it
+    // rides along), the gizmo re-copies that rotation next frame, and the pole
+    // it feeds back rotates the chain further: the limb spins. Past ~90 degrees
+    // of bend it spins hard, because that is where the pole's component
+    // perpendicular to the root->end axis collapses and flips sign.
+    const ik_pole pole{};
+
+    if(em.ik_data.num_nodes <= 0)
+    {
+        return false;
+    }
+    const auto num_bones = size_t(em.ik_data.num_nodes);
+
+    ik_solver_params params;
+    // Interactive dragging: iterate harder than the runtime default, the cost is
+    // paid only while a shortcut is held.
+    params.max_iterations = 100;
 
     if(ImGui::IsKeyDown(shortcuts::ik_ccd))
     {
-        return ik_set_position_ccd(selection,
-                                   center_transform_comp.get_position_global(),
-                                   math::vec3(0.f),
-                                   em.ik_data.num_nodes,
-                                   100);
+        return ik_set_position_ccd(selection, target, pole, num_bones, params).applied;
     }
     if(ImGui::IsKeyDown(shortcuts::ik_fabrik))
     {
-        return ik_set_position_fabrik(selection,
-                                      center_transform_comp.get_position_global(),
-                                      math::vec3(0.f),
-                                      em.ik_data.num_nodes,
-                                      100);
+        return ik_set_position_fabrik(selection, target, pole, num_bones, params).applied;
     }
     if(ImGui::IsKeyDown(shortcuts::ik_two_bone))
     {
-        return ik_set_position_two_bone(selection,
-                                        center_transform_comp.get_position_global(),
-                                        center_transform_comp.get_z_axis_global(),
-                                        1.0f,
-                                        1.0f);
+        return ik_set_position_two_bone(selection, target, pole).applied;
     }
     return false;
 }
@@ -1513,7 +1527,7 @@ void scene_panel::reset_camera(rtti::context& ctx)
     auto camera = get_camera();
     if(camera)
     {
-        camera.destroy();
+        scene::destroy_entity(camera);
     }
     defaults::create_camera_entity(ctx, panel_scene_, "Scene Camera");
 }
@@ -1776,40 +1790,24 @@ void scene_panel::draw_visualization_menu()
 
     if(ImGui::BeginMenu(ICON_MDI_DRAWING_BOX ICON_MDI_ARROW_DOWN_BOLD))
     {
-        ImGui::RadioButton("Full", &visualize_passes_, -1);
-        ImGui::RadioButton("Base Color", &visualize_passes_, 0);
-        ImGui::RadioButton("Diffuse Color", &visualize_passes_, 1);
-        ImGui::RadioButton("Specular Color", &visualize_passes_, 2);
-        ImGui::RadioButton("Radiance", &visualize_passes_, 3);
-        ImGui::RadioButton("Irradiance", &visualize_passes_, 4);
-        ImGui::RadioButton("Ambient Occlusion", &visualize_passes_, 5);
-        ImGui::RadioButton("Normals (World Space)", &visualize_passes_, 6);
-        ImGui::RadioButton("Roughness", &visualize_passes_, 7);
-        ImGui::RadioButton("Metalness", &visualize_passes_, 8);
-        ImGui::RadioButton("Emissive Color", &visualize_passes_, 9);
-        ImGui::RadioButton("Subsurface Color", &visualize_passes_, 10);
-        ImGui::RadioButton("Depth", &visualize_passes_, 11);
-        ImGui::RadioButton("SSIL", &visualize_passes_, 12);
-        ImGui::RadioButton("Radiance Alpha", &visualize_passes_, 13);
-        ImGui::RadioButton("Specular Occlusion", &visualize_passes_, 14);
-        ImGui::RadioButton("SDF (Normals)", &visualize_passes_, 15);
-        ImGui::RadioButton("SDF (Step Count)", &visualize_passes_, 16);
-        ImGui::RadioButton("SDF (Headers)", &visualize_passes_, 17);
-        ImGui::RadioButton("SDF (Probe)", &visualize_passes_, 18);
-        ImGui::RadioButton("SDF (Entry)", &visualize_passes_, 19);
-        ImGui::RadioButton("SDF (Clipmap)", &visualize_passes_, 20);
-        ImGui::RadioButton("SDF (Direct Light)", &visualize_passes_, 21);
-        ImGui::RadioButton("SDF (Cascade Levels)", &visualize_passes_, 22);
-        ImGui::RadioButton("SDF (Attr Albedo)", &visualize_passes_, 23);
-        ImGui::RadioButton("SDF (Light Voxels)", &visualize_passes_, 24);
-        ImGui::RadioButton("SDF (World Probes)", &visualize_passes_, 25);
-        ImGui::RadioButton("SDF (Sun Tiers)", &visualize_passes_, 26);
-        ImGui::RadioButton("SDF (Probe Sky)", &visualize_passes_, 27);
-        ImGui::RadioButton("SDF (Vis Memo)", &visualize_passes_, 28);
+        for(const auto& entry : get_visualization_modes())
+        {
+            ImGui::RadioButton(entry.label, &visualize_passes_, static_cast<int>(entry.mode));
+        }
 
         ImGui::EndMenu();
     }
     ImGui::SetItemTooltipEx("%s", "Visualize Render Passes");
+}
+
+void scene_panel::set_visualization_mode(int mode)
+{
+    visualize_passes_ = mode;
+}
+
+auto scene_panel::get_visualization_mode() const -> int
+{
+    return visualize_passes_;
 }
 
 void scene_panel::draw_snapping_menu(editing_manager& em)

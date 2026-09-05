@@ -54,11 +54,17 @@ public:
         r.probe_visibility_variance_gate =
             std::lerp(r.probe_visibility_variance_gate, f.probe_visibility_variance_gate, contribution);
         r.adaptive_probes = dominant ? f.adaptive_probes : r.adaptive_probes;
-        r.probe_space_temporal = dominant ? f.probe_space_temporal : r.probe_space_temporal;
+        r.adaptive_rays = dominant ? f.adaptive_rays : r.adaptive_rays;
+        r.world_probe_jitter = dominant ? f.world_probe_jitter : r.world_probe_jitter;
         r.enable_reflections = dominant ? f.enable_reflections : r.enable_reflections;
+        r.reflection_temporal_frames =
+            dominant ? f.reflection_temporal_frames : r.reflection_temporal_frames;
+        r.denoise_converged_early_out =
+            dominant ? f.denoise_converged_early_out : r.denoise_converged_early_out;
         r.debug_view = dominant ? f.debug_view : r.debug_view;
         r.enable_temporal = dominant ? f.enable_temporal : r.enable_temporal;
-        r.max_accum_frames = std::lerp(r.max_accum_frames, f.max_accum_frames, contribution);
+        r.temporal_slow_frames = std::lerp(r.temporal_slow_frames, f.temporal_slow_frames, contribution);
+        r.denoise_luma_floor = std::lerp(r.denoise_luma_floor, f.denoise_luma_floor, contribution);
         r.reprojection_tolerance =
             std::lerp(r.reprojection_tolerance, f.reprojection_tolerance, contribution);
         r.enable_spatial_denoise = dominant ? f.enable_spatial_denoise : r.enable_spatial_denoise;

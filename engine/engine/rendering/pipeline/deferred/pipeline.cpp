@@ -28,12 +28,24 @@
 #include <graphics/render_pass.h>
 
 #include <algorithm>
+#include <cmath>
 #include <graphics/render_view.h>
 #include <graphics/texture.h>
 #include <graphics/vertex_buffer.h>
 
 namespace unravel
 {
+namespace
+{
+namespace ANONYMOUS
+{
+/// Border fade of the cloud shadow map in map space (fraction of the half extent).
+constexpr float cloud_shadow_border_fade = 0.08f;
+/// Period of the contact-shadow dither's temporal offset (frames); TAA integrates it.
+constexpr int contact_shadow_dither_frames = 16;
+} // namespace ANONYMOUS
+} // namespace unravel
+
 namespace rendering
 {
 
@@ -107,6 +119,10 @@ void apply_pipeline_taa_jitter_to_camera(const camera& view_camera,
     {
         cam.set_aa_data(viewport_size, 0u, 1u);
     }
+    // With the frame's jitter final, record this frame's matrices; last frame's recording
+    // becomes the camera's get_prev_* set (frame-stamped - a second run of the same camera
+    // in one frame is a no-op). This is the ONE place previous matrices are maintained.
+    cam.record_current_matrices();
 }
 
 auto create_or_resize_d_buffer(gfx::render_view& rview,
@@ -294,6 +310,56 @@ auto create_or_resize_o_buffer(gfx::render_view& rview,
         fbo.reset();
         fbo = std::make_shared<gfx::frame_buffer>();
         fbo->populate({tex});
+    }
+
+    return fbo;
+}
+
+// Velocity (motion vector) target, full camera resolution. RGBA16F: RG = total uv-delta
+// (uv_curr - uv_prev), BA = the OBJECT-ONLY component (total minus the camera-induced
+// part), both computed inside the velocity pass with one consistent matrix set.
+//
+// TWO framebuffers over the SAME color texture, and the split is load-bearing:
+//  - "VELOCITY_FBO_CAMERA" is color-only, for the fullscreen camera sub-pass, which
+//    SAMPLES the G-buffer depth. Rendering that sub-pass with DEPTH attached made the
+//    same texture SRV and DSV of one draw - D3D11 silently unbinds the SRV and every
+//    depth sample returns 0 (the NEAR PLANE), inflating the written camera velocity by
+//    the near-plane parallax while keeping its direction plausible. That corruption
+//    masqueraded as a cross-pass "previous view-projection mismatch" for three debugging
+//    rounds (see tasks/velocity_buffer_plan.md).
+//  - "VELOCITY_FBO" carries the shared DEPTH attachment for the movers sub-pass, which
+//    depth-tests EQUAL and never samples depth - no conflict there.
+auto create_or_resize_v_buffer(gfx::render_view& rview, const usize32_t& viewport_size)
+    -> const gfx::frame_buffer::ptr&
+{
+    auto& depth = rview.tex_get_or_emplace("DEPTH");
+
+    auto& tex = rview.tex_get_or_emplace("VELOCITY");
+    if(gfx::needs_recreate(tex, viewport_size, gfx::texture_format::RGBA16F))
+    {
+        tex.reset();
+        tex = std::make_shared<gfx::texture>(viewport_size.width,
+                                             viewport_size.height,
+                                             false,
+                                             1,
+                                             gfx::texture_format::RGBA16F,
+                                             BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
+    }
+
+    auto& camera_fbo = rview.fbo_get_or_emplace("VELOCITY_FBO_CAMERA");
+    if(gfx::needs_recreate(camera_fbo, viewport_size))
+    {
+        camera_fbo.reset();
+        camera_fbo = std::make_shared<gfx::frame_buffer>();
+        camera_fbo->populate({tex});
+    }
+
+    auto& fbo = rview.fbo_get_or_emplace("VELOCITY_FBO");
+    if(gfx::needs_recreate(fbo, viewport_size))
+    {
+        fbo.reset();
+        fbo = std::make_shared<gfx::frame_buffer>();
+        fbo->populate({tex, depth});
     }
 
     return fbo;
@@ -709,6 +775,21 @@ void deferred::run_pipeline_impl(const gfx::frame_buffer::ptr& output,
 
     apply_pipeline_taa_jitter_to_camera(camera, viewport_size, params);
 
+    // Velocity buffer production: UNCONDITIONAL for camera runs, like depth - a standing
+    // frame resource every temporal consumer (and future feature: motion blur, upscalers)
+    // relies on without negotiation. The velocity_pass step bit stays the opt-out lever:
+    // probe captures build pflags from 0 and never set it, and a custom caller can clear
+    // it. Consumers receive the texture EXPLICITLY through their run params (this pipeline
+    // is the only place that fetches "VELOCITY" from the render view); a valid texture IS
+    // their enable - null falls back to their legacy matrix reprojection. Also excludes
+    // movers from static-mesh batching below so their G-buffer raster matches the velocity
+    // pass for the EQUAL depth test.
+    velocity_run_active_ = is_camera_run && (stages & pipeline_steps::velocity_pass) != 0u;
+    if(velocity_run_active_)
+    {
+        model_component::request_velocity_recording(gfx::get_render_frame());
+    }
+
     if(stages & pipeline_steps::geometry_pass)
     {
         gather_visible_models(scn, &camera, params.vflags, render_mask, dt, [&](entt::handle entity, const lod_data& lod_data)
@@ -718,6 +799,8 @@ void deferred::run_pipeline_impl(const gfx::frame_buffer::ptr& output,
     }
 
     run_g_buffer_pass(visibility_set, camera, rview, dt);
+
+    run_velocity_pass(visibility_set, camera, rview);
 
     run_assao_pass(camera, rview, dt, params);
 
@@ -735,6 +818,10 @@ void deferred::run_pipeline_impl(const gfx::frame_buffer::ptr& output,
     // UI composited on it -- display-referred values injected into linear lighting, which
     // auto exposure then meters and re-amplifies (runaway brightening in dark scenes).
     run_ssr_pass(camera, rview, params);
+
+    // Cloud shadow map before any lighting: the directional light and the irradiance bake
+    // read it.
+    run_cloud_shadow_pass(scn, camera, rview);
 
     // Direct lighting starts the current frame LBUFFER after SSR has consumed its history source.
     target = run_direct_lighting_pass(scn, camera, rview, build_shadowmaps, dt);
@@ -786,7 +873,7 @@ void deferred::run_pipeline_impl(const gfx::frame_buffer::ptr& output,
         ((reflection_screen_stack_enabled(params) && params.fill_ssr_params) || params.fill_gi_params);
     if(wants_scene_history)
     {
-        snapshot_prev_scene_color(rview, target);
+        snapshot_prev_scene_color(rview, target, camera);
     }
     else
     {
@@ -805,7 +892,11 @@ void deferred::run_pipeline_impl(const gfx::frame_buffer::ptr& output,
     {
         run_ui_pass(scn, camera, rview, output);
 
-        if(debug_pass_ >= debug_pass_sdf_normals)
+        if(debug_pass_ == debug_pass_velocity)
+        {
+            run_velocity_debug_pass(camera, rview, output);
+        }
+        else if(debug_pass_ >= debug_pass_sdf_normals)
         {
             run_sdf_debug_pass(camera, rview, params, output);
         }
@@ -841,36 +932,15 @@ void deferred::run_pipeline_impl(const gfx::frame_buffer::ptr& output,
 
 }
 
-void deferred::snapshot_prev_scene_color(gfx::render_view& rview, const gfx::frame_buffer::ptr& source)
+void deferred::snapshot_prev_scene_color(gfx::render_view& rview,
+                                         const gfx::frame_buffer::ptr& source,
+                                         const camera& camera)
 {
-    if(!source)
-    {
-        return;
-    }
-    auto src_tex = source->get_texture();
-    if(!src_tex)
-    {
-        return;
-    }
-    // Match the source format exactly: bgfx blit requires identical formats, and the
-    // source can be RGBA16F (HDR pipeline) or RGBA8 (LDR fallback).
-    const auto format = static_cast<gfx::texture_format>(src_tex->info.format);
-    const auto size = src_tex->get_size();
-    auto& prev = rview.tex_get_or_emplace("PREV_SCENE_HDR");
-    if(gfx::needs_recreate(prev, size, format))
-    {
-        prev.reset();
-        prev = std::make_shared<gfx::texture>(size.width,
-                                              size.height,
-                                              false,
-                                              1,
-                                              format,
-                                              BGFX_TEXTURE_BLIT_DST | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
-    }
-    gfx::render_pass blit_pass("History/Prev Scene Color Blit Pass");
-    gfx::blit(blit_pass.id,
-              prev->native_handle(), 0, 0,
-              src_tex->native_handle(), 0, 0);
+    // This frame's G-buffer depth rides along in alpha (scene_history_pass), so the readers
+    // can tell a reprojection that still shows its surface from a disoccluded one.
+    const auto& gbuffer = rview.fbo_get("GBUFFER");
+    const auto depth = gbuffer ? gbuffer->get_texture(4) : nullptr;
+    scene_history_pass_.run(rview, source, depth, camera);
 }
 
 void deferred::snapshot_prev_depth(gfx::render_view& rview, const usize32_t& viewport_size)
@@ -1011,19 +1081,31 @@ void deferred::run_g_buffer_pass(const visibility_set_models_t& visibility_set,
 
         const auto extras = model_comp.get_submit_extras(false);
 
-        // Check if this model can be batched (static mesh, no skinning)
+        // Check if this model can be batched (static mesh, no skinning). Movers stay
+        // batched: their instances carry the previous-frame transform alongside the
+        // current one, and the velocity pass re-rasterizes them with the IDENTICAL
+        // instanced matrix math (vs_velocity_instanced mirrors vs_deferred_geom_instanced
+        // bit for bit), so the EQUAL depth test holds without excluding them here.
         const bool is_skinned = !skinning_matrices.empty();
         const bool can_batch = batch_collector::is_static_mesh_batching_enabled() && !is_skinned;
 
         if (can_batch)
         {
+            // Movers attach their previous-frame transforms so the velocity pass's
+            // instanced submit can pick their instances out of the shared batches.
+            auto batch_extras = extras;
+            if(velocity_run_active_ && model_comp.has_motion())
+            {
+                batch_extras.prev_world_transform = &model_comp.get_prev_world_transform();
+                batch_extras.prev_submesh_transforms = &model_comp.get_prev_submesh_transforms();
+            }
             // Collect this model for batching with appropriate transforms
-            model.submit_for_batching(batch_collector_, world_transform, submesh_transforms, current_lod_index, params.x, &view_frustum, &camera, extras);
+            model.submit_for_batching(batch_collector_, world_transform, submesh_transforms, current_lod_index, params.x, &view_frustum, &camera, batch_extras);
             stats_.drawn_models++;
             // Handle LOD transitions for batched models
             if(math::epsilonNotEqual(current_time, 0.0f, math::epsilon<float>()))
             {
-                model.submit_for_batching(batch_collector_, world_transform, submesh_transforms, target_lod_index, params_inv.x, &view_frustum, &camera, extras);
+                model.submit_for_batching(batch_collector_, world_transform, submesh_transforms, target_lod_index, params_inv.x, &view_frustum, &camera, batch_extras);
                 stats_.drawn_models++;
             }
         }
@@ -1069,6 +1151,89 @@ void deferred::run_g_buffer_pass(const visibility_set_models_t& visibility_set,
     gfx::discard();
 }
 
+namespace
+{
+/**
+ * Shared core of the instanced batch submits (G-buffer geometry and velocity movers).
+ * Iterates the prepared batches, selects instances via @p should_include, packs the
+ * selected ones DIRECTLY into a transient bgfx instance buffer as @p InstanceData
+ * (which supplies packed_size() and a batch_instance conversion - two passes, count
+ * then pack, so the all-instances case stays zero-copy and the filtered case allocates
+ * exactly what it draws), binds the submesh buffers, and hands the draw to
+ * @p submit_batch - program, uniform, state and stats differences live in the callers.
+ * The instance count is clamped to what bgfx actually allocated, so a short transient
+ * pool can never be overrun.
+ */
+template<typename InstanceData, typename BatchList, typename Filter, typename SubmitFn>
+void submit_prepared_batches_instanced(const BatchList& prepared_batches,
+                                       Filter&& should_include,
+                                       SubmitFn&& submit_batch)
+{
+    for(const auto* batch : prepared_batches)
+    {
+        if(!batch->is_valid() || batch->instances.empty())
+        {
+            continue;
+        }
+
+        const auto mesh_ptr = batch->key.mesh_ptr;
+        const auto material_ptr = batch->key.material_ptr;
+        if(!mesh_ptr || !material_ptr)
+        {
+            continue;
+        }
+
+        const auto submesh = mesh_ptr->get_submesh(batch->key.submesh_index, batch->key.lod_index);
+        if(!submesh)
+        {
+            continue;
+        }
+
+        uint32_t instance_count = 0;
+        for(const auto& instance : batch->instances)
+        {
+            if(should_include(instance))
+            {
+                ++instance_count;
+            }
+        }
+        if(instance_count == 0)
+        {
+            continue;
+        }
+
+        bgfx::InstanceDataBuffer instance_buffer;
+        bgfx::allocInstanceDataBuffer(&instance_buffer,
+                                      instance_count,
+                                      static_cast<uint16_t>(InstanceData::packed_size()));
+        if(!instance_buffer.data)
+        {
+            continue;
+        }
+        instance_count = std::min(instance_count, instance_buffer.num);
+
+        auto* buffer_data = reinterpret_cast<InstanceData*>(instance_buffer.data);
+        uint32_t packed = 0;
+        for(const auto& instance : batch->instances)
+        {
+            if(packed >= instance_count)
+            {
+                break;
+            }
+            if(should_include(instance))
+            {
+                buffer_data[packed++] = InstanceData(instance);
+            }
+        }
+
+        mesh_ptr->bind_render_buffers_for_submesh(submesh, batch->key.lod_index);
+        bgfx::setInstanceDataBuffer(&instance_buffer);
+
+        submit_batch(*batch, *material_ptr, instance_count);
+    }
+}
+} // namespace
+
 void deferred::submit_batched_geometry(gfx::render_pass& pass, const camera& camera)
 {
     APP_SCOPE_PERF("Rendering/Submit Batched Geometry");
@@ -1097,86 +1262,270 @@ void deferred::submit_batched_geometry(gfx::render_pass& pass, const camera& cam
     gfx::set_uniform(geom_program_instanced_.u_camera_wpos, camera_pos);
     gfx::set_uniform(geom_program_instanced_.u_camera_clip_planes, clip_planes);
 
-    // Submit each batch
-    for (const auto* batch : prepared_batches)
-    {
-        if (!batch->is_valid() || batch->instances.empty())
+    submit_prepared_batches_instanced<instance_vertex_data>(
+        prepared_batches,
+        [](const batch_instance&) { return true; },
+        [&](const auto& /*batch*/, const material& mat, uint32_t instance_count)
         {
-            continue;
-        }
+            stats_.drawn_static_submeshes += instance_count;
 
-        const auto instance_count = static_cast<uint32_t>(batch->instances.size());
-        stats_.drawn_static_submeshes += instance_count;
-
-        const auto mesh_ptr = batch->key.mesh_ptr;
-        const auto material_ptr = batch->key.material_ptr;
-        const auto lod_index = batch->key.lod_index;
-        const auto submesh_index = batch->key.submesh_index;
-
-        if (!mesh_ptr || !material_ptr)
-        {
-            continue;
-        }
-
-        const auto submesh = mesh_ptr->get_submesh(submesh_index, lod_index);
-        if(!submesh)
-        {
-            continue;
-        }
-
-        // Create instance buffer from batch instances
-        const auto instance_data_size = static_cast<uint16_t>(instance_vertex_data::packed_size());
-        
-        // Allocate instance buffer
-        bgfx::InstanceDataBuffer instance_buffer;
-        bgfx::allocInstanceDataBuffer(&instance_buffer, instance_count, instance_data_size);
-        if (!instance_buffer.data)
-        {
-            continue; // Skip this batch if allocation failed
-        }
-
-        
-        // Submit the mesh with instancing
-        // Bind vertex and index buffers for the specific submesh
-        mesh_ptr->bind_render_buffers_for_submesh(submesh, lod_index);
-        
-        // Pack instance data into buffer
-        auto* buffer_data = reinterpret_cast<instance_vertex_data*>(instance_buffer.data);
-        for (size_t i = 0; i < batch->instances.size(); ++i)
-        {
-            buffer_data[i] = instance_vertex_data(batch->instances[i]);
-        }
-
-        // Set instance data buffer
-        bgfx::setInstanceDataBuffer(&instance_buffer);
-
-        // Submit material properties
-        bool material_submitted = material_ptr->submit(geom_program_instanced_.program.get());
-        if (!material_submitted)
-        {
-            if (material_ptr->is<pbr_material>())
+            // Submit material properties
+            bool material_submitted = mat.submit(geom_program_instanced_.program.get());
+            if(!material_submitted && mat.is<pbr_material>())
             {
-                const auto& pbr = static_cast<const pbr_material&>(*material_ptr);
-                submit_pbr_material(geom_program_instanced_, pbr);
+                submit_pbr_material(geom_program_instanced_, static_cast<const pbr_material&>(mat));
             }
-        }
 
-        // Set LOD parameters (using global LOD settings for now)
-        const auto lod_params = math::vec3{0.0f, -1.0f, 1.0f}; // Default LOD params
-        gfx::set_uniform(geom_program_instanced_.u_lod_params, lod_params);
+            // Set LOD parameters (using global LOD settings for now)
+            const auto lod_params = math::vec3{0.0f, -1.0f, 1.0f}; // Default LOD params
+            gfx::set_uniform(geom_program_instanced_.u_lod_params, lod_params);
 
-        // Submit the instanced draw call
-        gfx::submit(pass.id, geom_program_instanced_.program->native_handle(), 0, false);
-    }
+            gfx::submit(pass.id, geom_program_instanced_.program->native_handle(), 0, false);
+        });
 
     geom_program_instanced_.program->end();
 
     // Update statistics
     const auto& batch_stats = batch_collector_.get_stats();
     stats_.add_batch_stats(batch_stats);
-    
-    // Clear batches to invalidate all transform pointers and free memory
-    batch_collector_.clear();
+
+    // NOT cleared here: the velocity pass reuses the prepared batches (mover instances
+    // carry their previous transforms) in the same frame. run_pipeline_impl clears the
+    // collector at the end of the run, which also invalidates the transform pointers.
+}
+
+void deferred::run_velocity_pass(const visibility_set_models_t& visibility_set,
+                                 const camera& camera,
+                                 gfx::render_view& rview)
+{
+    if(!velocity_run_active_)
+    {
+        // Sole owner of the buffer's lifetime (the PREV_DEPTH convention): drop it as soon as
+        // no consumer wants it instead of waiting for the idle collector.
+        rview.fbo_remove("VELOCITY_FBO");
+        rview.fbo_remove("VELOCITY_FBO_CAMERA");
+        rview.tex_remove("VELOCITY");
+        return;
+    }
+    if(!velocity_camera_program_.program || !velocity_camera_program_.program->is_valid())
+    {
+        return;
+    }
+
+    APP_SCOPE_PERF("Rendering/Velocity Pass");
+
+    const auto& viewport_size = camera.get_viewport_size();
+    const auto& fbo = create_or_resize_v_buffer(rview, viewport_size);
+    const auto& gbuffer = rview.fbo_get("GBUFFER");
+
+    const auto& view = camera.get_view();
+    // Jittered, deliberately: the movers sub-pass must rasterize exactly like the G-buffer for
+    // the EQUAL depth test, and the fullscreen reconstruction mirrors the TAA formulation
+    // (jittered current unprojection + unjittered previous reprojection, camera.h:267-275).
+    const auto& proj = camera.get_projection();
+    const auto prev_vp = camera.get_prev_view_projection_unjittered();
+
+    // 1) Camera-derived velocity for every pixel, reconstructed from depth. Makes the buffer
+    //    complete so consumers never branch on "does this pixel have object velocity".
+    //    MUST render into the color-only FBO: this pass SAMPLES the depth texture, and with
+    //    DEPTH attached the SRV/DSV conflict silently zeroes every depth read on D3D11
+    //    (near-plane reconstruction -> inflated camera velocity; see create_or_resize_v_buffer).
+    {
+        const auto& camera_fbo = rview.fbo_get("VELOCITY_FBO_CAMERA");
+        gfx::render_pass pass("Velocity/Camera Pass");
+        pass.bind(camera_fbo.get());
+        pass.set_view_proj(view, proj);
+
+        if(velocity_camera_program_.program->begin())
+        {
+            gfx::set_texture(velocity_camera_program_.s_depth,
+                             0,
+                             gbuffer->get_texture(4),
+                             BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP | BGFX_SAMPLER_MIN_POINT |
+                                 BGFX_SAMPLER_MAG_POINT);
+            gfx::set_uniform(velocity_camera_program_.u_prev_view_proj, prev_vp.get_matrix());
+
+            const auto topology = gfx::clip_quad(1.0f);
+            gfx::set_state(topology | BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_DEPTH_TEST_ALWAYS);
+            gfx::submit(pass.id, velocity_camera_program_.program->native_handle());
+            gfx::set_state(BGFX_STATE_DEFAULT);
+            velocity_camera_program_.program->end();
+        }
+    }
+
+    // 2) Movers over the top with true per-object motion. Depth EQUAL against the shared
+    //    G-buffer depth also re-creates alpha-cutout coverage for free: texels the geometry
+    //    FS discarded hold another surface's depth and fail the test here.
+    if(velocity_program_.program && velocity_program_.program->is_valid() && velocity_program_skinned_.program &&
+       velocity_program_skinned_.program->is_valid())
+    {
+        gfx::render_pass pass("Velocity/Geometry Pass");
+        pass.bind(fbo.get());
+        pass.set_view_proj(view, proj);
+
+        const auto& view_frustum = camera.get_frustum();
+
+        for(const auto& element : visibility_set)
+        {
+            const auto& entity = element.entity;
+            auto& model_comp = entity.get<model_component>();
+            if(!model_comp.has_motion())
+            {
+                continue;
+            }
+            const auto& model = model_comp.get_model();
+            if(!model.is_valid())
+            {
+                continue;
+            }
+            // Mover stamp for the GI reflection temporal's gate, BEFORE the batched skip so
+            // batched movers (drawn by submit_batched_velocity below) count too: the buffer
+            // holds object velocity this frame, so reflected-content stillness readings are
+            // trustworthy only under the gate's cap for the next temporal window.
+            velocity_movers_frame_ = gfx::get_render_frame();
+            // Batchable movers were collected into the shared batches with their previous
+            // transforms and are drawn by submit_batched_velocity below - mirroring the
+            // G-buffer's can_batch split exactly so nothing draws twice.
+            const bool batched = batch_collector::is_static_mesh_batching_enabled() &&
+                                 model_comp.get_skinning_transforms().empty();
+            if(batched)
+            {
+                continue;
+            }
+
+            const auto& transform_comp = entity.get<transform_component>();
+            const auto& world_transform = transform_comp.get_transform_global();
+            const auto& submesh_transforms = model_comp.get_submesh_transforms();
+            const auto& bone_transforms = model_comp.get_bone_transforms();
+            const auto& skinning_matrices = model_comp.get_skinning_transforms();
+
+            auto extras = model_comp.get_submit_extras(false);
+            extras.prev_world_transform = &model_comp.get_prev_world_transform();
+            extras.prev_submesh_transforms = &model_comp.get_prev_submesh_transforms();
+            extras.prev_skinning_transforms = &model_comp.get_prev_skinning_transforms();
+
+            model::submit_callbacks callbacks;
+            callbacks.setup_begin = [&](const model::submit_callbacks::params& submit_params)
+            {
+                velocity_geom_program& prog =
+                    submit_params.skinned ? velocity_program_skinned_ : velocity_program_;
+                prog.program->begin();
+                gfx::set_uniform(prog.u_prev_view_proj, prev_vp.get_matrix());
+            };
+            callbacks.setup_params_per_submesh =
+                [&](const model::submit_callbacks::params& submit_params, const material& mat)
+            {
+                velocity_geom_program& prog =
+                    submit_params.skinned ? velocity_program_skinned_ : velocity_program_;
+                // Match the material's cull so two-sided surfaces keep velocity coverage, but
+                // own the depth/write bits: EQUAL test, no depth write, color only.
+                const uint64_t cull_state = mat.get_render_states(true, false, false) & BGFX_STATE_CULL_MASK;
+                gfx::set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_DEPTH_TEST_EQUAL | cull_state);
+                gfx::submit(pass.id, prog.program->native_handle(), 0, submit_params.preserve_state);
+            };
+            callbacks.setup_end = [&](const model::submit_callbacks::params& submit_params)
+            {
+                velocity_geom_program& prog =
+                    submit_params.skinned ? velocity_program_skinned_ : velocity_program_;
+                prog.program->end();
+            };
+
+            // Only the settled LOD, no crossfade second submit: dithered-out texels of the
+            // fading LOD fail the EQUAL test and keep their camera-derived velocity, which is
+            // a one-transition-long approximation not worth a second draw.
+            model.submit(world_transform,
+                         submesh_transforms,
+                         bone_transforms,
+                         skinning_matrices,
+                         element.lod_data.current_lod_index,
+                         callbacks,
+                         &view_frustum,
+                         &camera,
+                         extras);
+        }
+
+        // Batched movers: instanced over the SAME prepared batches the G-buffer drew,
+        // with the doubled per-instance stream (current + previous world matrix).
+        if(batch_collector::is_static_mesh_batching_enabled())
+        {
+            submit_batched_velocity(pass, prev_vp);
+        }
+        gfx::discard();
+    }
+}
+
+void deferred::submit_batched_velocity(gfx::render_pass& pass, const math::transform& prev_vp)
+{
+    if(!velocity_program_instanced_.program || !velocity_program_instanced_.program->is_valid())
+    {
+        return;
+    }
+
+    // The batches (and their prepare_batches sorting) are the ones submit_batched_geometry
+    // built this frame; the collector is deliberately not cleared until the end of the run.
+    const auto& prepared_batches = batch_collector_.get_prepared_batches();
+    if(prepared_batches.empty())
+    {
+        return;
+    }
+
+    APP_SCOPE_PERF("Rendering/Velocity Batched Geometry");
+
+    velocity_program_instanced_.program->begin();
+    gfx::set_uniform(velocity_program_instanced_.u_prev_view_proj, prev_vp.get_matrix());
+
+    submit_prepared_batches_instanced<velocity_instance_vertex_data>(
+        prepared_batches,
+        // Only mover instances carry a previous transform; batches without any skip free.
+        [](const batch_instance& instance) { return instance.prev_world_transform_ptr != nullptr; },
+        [&](const auto& /*batch*/, const material& mat, uint32_t /*instance_count*/)
+        {
+            // Match the material's cull (two-sided coverage), own the depth/write bits:
+            // EQUAL test against the G-buffer depth, no depth write, color only.
+            const uint64_t cull_state = mat.get_render_states(true, false, false) & BGFX_STATE_CULL_MASK;
+            gfx::set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_DEPTH_TEST_EQUAL | cull_state);
+            gfx::submit(pass.id, velocity_program_instanced_.program->native_handle(), 0, false);
+        });
+
+    velocity_program_instanced_.program->end();
+}
+
+void deferred::run_velocity_debug_pass(const camera& camera,
+                                       gfx::render_view& rview,
+                                       const gfx::frame_buffer::ptr& output)
+{
+    if(!output)
+    {
+        return;
+    }
+    auto velocity_tex = rview.tex_safe_get("VELOCITY");
+    if(!velocity_tex || !velocity_debug_program_.program || !velocity_debug_program_.program->is_valid())
+    {
+        return;
+    }
+
+    gfx::render_pass pass("Debug/Velocity Pass");
+    pass.bind(output.get());
+    pass.set_view_proj(camera.get_view(), camera.get_projection());
+
+    const auto output_size = output->get_size();
+
+    velocity_debug_program_.program->begin();
+
+    // x = pixels of motion mapped to full brightness in the visualization.
+    const float debug_params[4] = {8.0f, 0.0f, 0.0f, 0.0f};
+    gfx::set_uniform(velocity_debug_program_.u_params, debug_params);
+    gfx::set_texture(velocity_debug_program_.s_velocity, 0, velocity_tex);
+
+    irect32_t rect(0, 0, irect32_t::value_type(output_size.width), irect32_t::value_type(output_size.height));
+    gfx::set_scissor(rect.left, rect.top, rect.width(), rect.height());
+    auto topology = gfx::clip_quad(1.0f);
+    gfx::set_state(topology | BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A);
+    gfx::submit(pass.id, velocity_debug_program_.program->native_handle());
+    gfx::set_state(BGFX_STATE_DEFAULT);
+    velocity_debug_program_.program->end();
+
+    gfx::discard();
 }
 
 void deferred::run_assao_pass(const camera& camera,
@@ -1384,8 +1733,15 @@ auto deferred::run_irradiance_pass(scene& scn, gfx::render_view& rview) -> defer
             mode = 4;
         }
 
-        // x=mode, y=sun_weight (applied in shader for all modes)
-        float mode_vec[4] = {float(mode), dominant.sun_weight, 0.0f, 0.0f};
+        // Cloud coverage coupling: the Perez sky is blended toward an overcast grey by the mean
+        // cloud transmittance (lowest mip of the cloud shadow map).
+        const bool couple_clouds = dominant.use_perez && cloud_shadow_.valid && cloud_shadow_.map;
+        gfx::set_texture(irradiance_compute_program_.s_cloudShadow,
+                         2,
+                         couple_clouds ? cloud_shadow_.map : default_textures::get().white_texture());
+
+        // x=mode, y=sun_weight (applied in shader for all modes), z=cloud coverage coupling
+        float mode_vec[4] = {float(mode), dominant.sun_weight, couple_clouds ? 1.0f : 0.0f, 0.0f};
         gfx::set_uniform(irradiance_compute_program_.u_mode, mode_vec);
 
         bgfx::dispatch(irr_pass.id, irradiance_compute_program_.program->native_handle(), 1, 1, 1);
@@ -1495,22 +1851,16 @@ auto deferred::run_direct_lighting_pass(scene& scn,
 
             lprogram.program->begin();
 
-            float contact_shadow_distance = light.contact_shadow.enabled
-                                             ? light.contact_shadow.ray_length
-                                             : 0.0f;
-
-            float n_dot_l_low = light.contact_shadow.n_dot_l_fade_start;
-            float n_dot_l_high = light.contact_shadow.n_dot_l_fade_end;
-            if(n_dot_l_high < n_dot_l_low)
-            {
-                const float t = n_dot_l_low;
-                n_dot_l_low = n_dot_l_high;
-                n_dot_l_high = t;
-            }
+            const float contact_shadow_distance = light.contact_shadow.enabled
+                                                   ? light.contact_shadow.ray_length
+                                                   : 0.0f;
+            // The dither advances only while TAA integrates it (aa_data.x is the temporal frame
+            // index, 0 without TAA); wrapped so the noise offsets stay in float range.
+            const float contact_frame = std::fmod(camera.get_aa_data().x, float(ANONYMOUS::contact_shadow_dither_frames));
             const float contact_shadow_uniform[4] = {light.contact_shadow.thickness,
-                                                     n_dot_l_low,
-                                                     n_dot_l_high,
-                                                     light.contact_shadow.normal_facing_reject};
+                                                     light.contact_shadow.max_distance,
+                                                     light.contact_shadow.opacity,
+                                                     contact_frame};
 
             if(light.type == light_type::directional)
             {
@@ -1567,6 +1917,26 @@ auto deferred::run_direct_lighting_pass(scene& scn,
             if(has_shadows)
             {
                 generator.submit_uniforms(i);
+            }
+
+            if(light.type == light_type::directional)
+            {
+                // Cloud shadow map at slot 11 (after the 4 cascades). A white fallback keeps the
+                // sampler bound when there is no layer; the enable flag skips the read.
+                const bool use_cloud_shadow = cloud_shadow_.valid && cloud_shadow_.apply_to_lights && cloud_shadow_.map;
+                const float cloud_shadow[4] = {cloud_shadow_.origin.x,
+                                               cloud_shadow_.origin.y,
+                                               1.0f / std::max(cloud_shadow_.extent, 1.0f),
+                                               cloud_shadow_.opacity};
+                const float cloud_shadow2[4] = {use_cloud_shadow ? 1.0f : 0.0f,
+                                                cloud_shadow_.base_world_y,
+                                                ANONYMOUS::cloud_shadow_border_fade,
+                                                0.0f};
+                gfx::set_uniform(lprogram.u_cloudShadow, cloud_shadow);
+                gfx::set_uniform(lprogram.u_cloudShadow2, cloud_shadow2);
+                gfx::set_texture(lprogram.s_cloudShadow,
+                                 11,
+                                 use_cloud_shadow ? cloud_shadow_.map : default_textures::get().white_texture());
             }
             gfx::set_scissor(rect.left, rect.top, rect.width(), rect.height());
             auto topology = gfx::clip_quad(1.0f);
@@ -1792,20 +2162,16 @@ void deferred::run_reflection_probe_pass(scene& scn, const camera& camera, gfx::
     gfx::discard();
 }
 
-auto deferred::run_atmospherics_pass(gfx::frame_buffer::ptr input,
-                                     scene& scn,
-                                     const camera& camera,
-                                     gfx::render_view& rview,
-                                     delta_t dt) -> gfx::frame_buffer::ptr
+namespace
 {
-    APP_SCOPE_PERF("Rendering/Atmospheric Pass");
-
-    atmospheric_pass_perez::run_params params_perez;
-    atmospheric_pass_skybox::run_params params_skybox;
-
+/// Copies the skylight settings into the atmospheric pass parameters. Returns false when the
+/// scene has no active skylight. Only the sun direction depends on the directional light.
+auto gather_skylight_params(scene& scn,
+                            atmospheric_pass_perez::run_params& params_perez,
+                            atmospheric_pass_skybox::run_params& params_skybox,
+                            skylight_component::sky_mode& mode) -> bool
+{
     bool found_sun = false;
-
-    skylight_component::sky_mode mode{};
     scn.registry->view<transform_component, skylight_component, active_component>().each(
         [&](auto e, auto&& transform_comp_ref, auto&& light_comp_ref, auto&& active)
         {
@@ -1828,6 +2194,26 @@ auto deferred::run_atmospherics_pass(gfx::frame_buffer::ptr input,
 
             mode = light_comp_ref.get_mode();
             found_sun = true;
+
+            params_perez.turbidity = light_comp_ref.get_turbidity();
+            params_perez.sky_brightness = light_comp_ref.get_sky_brightness();
+            params_perez.cloud_mode = static_cast<int>(light_comp_ref.get_cloud_mode());
+            params_perez.cloud_coverage = light_comp_ref.get_cloud_coverage();
+            params_perez.cloud_macro_variation = light_comp_ref.get_cloud_macro_variation();
+            params_perez.cloud_base_altitude = light_comp_ref.get_cloud_base_altitude();
+            params_perez.cloud_thickness = light_comp_ref.get_cloud_thickness();
+            params_perez.cloud_size = light_comp_ref.get_cloud_size();
+            params_perez.cloud_softness = light_comp_ref.get_cloud_softness();
+            params_perez.cloud_detail_erode = light_comp_ref.get_cloud_detail_erode();
+            params_perez.cloud_density = light_comp_ref.get_cloud_density();
+            params_perez.cloud_shadow_strength = light_comp_ref.get_cloud_shadow_strength();
+            params_perez.cloud_brightness = light_comp_ref.get_cloud_brightness();
+            params_perez.cloud_world_space_altitude = light_comp_ref.get_cloud_world_space_altitude();
+            params_perez.cloud_shadows = light_comp_ref.get_cloud_shadows();
+            params_perez.cloud_shadow_opacity = light_comp_ref.get_cloud_shadow_opacity();
+            params_perez.cloud_wind_offset = light_comp_ref.get_cloud_wind_offset();
+            params_perez.cloud_time = light_comp_ref.get_cloud_time();
+
             if(auto light_comp = entity.template try_get<light_component>())
             {
                 const auto& light = light_comp->get_light();
@@ -1835,31 +2221,45 @@ auto deferred::run_atmospherics_pass(gfx::frame_buffer::ptr input,
                 if(light.type == light_type::directional)
                 {
                     const auto& world_transform = transform_comp_ref.get_transform_global();
-                    
                     params_perez.light_direction = world_transform.z_unit_axis();
-                    params_perez.turbidity = light_comp_ref.get_turbidity();
-                    params_perez.cloud_mode = static_cast<int>(light_comp_ref.get_cloud_mode());
-                    params_perez.cloud_coverage = light_comp_ref.get_cloud_coverage();
-                    params_perez.cloud_base_altitude = light_comp_ref.get_cloud_base_altitude();
-                    params_perez.cloud_top_altitude = light_comp_ref.get_cloud_top_altitude();
-                    params_perez.cloud_density = light_comp_ref.get_cloud_density();
-                    params_perez.cloud_absorption = light_comp_ref.get_cloud_absorption();
-                    params_perez.cloud_light_absorption = light_comp_ref.get_cloud_light_absorption();
-                    params_perez.cloud_time = light_comp_ref.get_cloud_time();
-                    params_perez.sky_brightness = light_comp_ref.get_sky_brightness();
-                    params_perez.cloud_vol_uv_scale = light_comp_ref.get_cloud_vol_uv_scale();
-                    params_perez.cloud_vol_edge_width = light_comp_ref.get_cloud_vol_edge_width();
-                    params_perez.cloud_vol_shape_power = light_comp_ref.get_cloud_vol_shape_power();
-                    params_perez.cloud_vol_detail_erode = light_comp_ref.get_cloud_vol_detail_erode();
-                    params_perez.cloud_vol_macro_strength = light_comp_ref.get_cloud_vol_macro_strength();
-                    params_perez.cloud_vol_coarse_scale = light_comp_ref.get_cloud_vol_coarse_scale();
-                    params_perez.cloud_vol_base_mix = light_comp_ref.get_cloud_vol_base_mix();
-                    params_perez.cloud_vol_sun_intensity = light_comp_ref.get_cloud_vol_sun_intensity();
                 }
-                params_perez.irradiance_intensity = light_comp_ref.get_irradiance_intensity();
             }
             params_skybox.sky_brightness = light_comp_ref.get_sky_brightness();
         });
+    return found_sun;
+}
+} // namespace
+
+void deferred::run_cloud_shadow_pass(scene& scn, const camera& camera, gfx::render_view& rview)
+{
+    cloud_shadow_ = {};
+    atmospheric_pass_perez::run_params params_perez;
+    atmospheric_pass_skybox::run_params params_skybox;
+    skylight_component::sky_mode mode{};
+    if(!gather_skylight_params(scn, params_perez, params_skybox, mode))
+    {
+        return;
+    }
+    if(mode == skylight_component::sky_mode::skybox)
+    {
+        return;
+    }
+    APP_SCOPE_PERF("Rendering/Cloud Shadow Pass");
+    cloud_shadow_ = atmospheric_pass_perez_.run_cloud_shadow_pass(camera, rview, params_perez);
+}
+
+auto deferred::run_atmospherics_pass(gfx::frame_buffer::ptr input,
+                                     scene& scn,
+                                     const camera& camera,
+                                     gfx::render_view& rview,
+                                     delta_t dt) -> gfx::frame_buffer::ptr
+{
+    APP_SCOPE_PERF("Rendering/Atmospheric Pass");
+
+    atmospheric_pass_perez::run_params params_perez;
+    atmospheric_pass_skybox::run_params params_skybox;
+    skylight_component::sky_mode mode{};
+    const bool found_sun = gather_skylight_params(scn, params_perez, params_skybox, mode);
 
     if(!found_sun)
     {
@@ -1906,6 +2306,8 @@ void deferred::run_ssr_pass(const camera& camera,
     // runs AFTER SSR), so it would trace one frame of undefined GPU memory as radiance.
     auto prev_scene = rview.tex_safe_get("PREV_SCENE_HDR");
     ssr_params.previous_frame = prev_scene ? prev_scene : default_textures::get().black_texture();
+    // This frame's velocity buffer, handed to the pass explicitly (a valid texture IS the enable).
+    ssr_params.velocity = rview.tex_safe_get("VELOCITY");
 
     ssr_params.cam = &camera;
 
@@ -1913,6 +2315,15 @@ void deferred::run_ssr_pass(const camera& camera,
     {
         rparams.fill_ssr_params(ssr_params);
     }
+
+    // Content-lag signal for the temporal's release ceiling (see run_params) - held one
+    // accumulation window past the last mover draw. Placed after fill_ssr_params so the
+    // settings window is final.
+    const uint64_t ssr_frame_now = gfx::get_render_frame();
+    ssr_params.velocity_movers_recent =
+        velocity_movers_frame_ != ~0ull && ssr_frame_now >= velocity_movers_frame_ &&
+        ssr_frame_now - velocity_movers_frame_ <=
+            uint64_t(math::max(ssr_params.settings.fidelityfx.temporal.max_accum_frames, 1));
 
     ssr_params.hiz_buffer = rview.tex_get("HIZBUFFER");
 
@@ -1938,6 +2349,8 @@ void deferred::run_ssil_pass(const camera& camera,
     ssil_params.g_buffer = rview.fbo_get("GBUFFER");
     ssil_params.direct_lighting = rview.fbo_get("LBUFFER")->get_texture(0);
     ssil_params.prev_depth = rview.tex_safe_get("PREV_DEPTH");
+    // This frame's velocity buffer, handed to the pass explicitly (a valid texture IS the enable).
+    ssil_params.velocity = rview.tex_safe_get("VELOCITY");
     ssil_params.prev_ssil = rview.tex_safe_get("PREV_SSIL");
     // Last frame's environment SH (the pass that computes it runs later, in the indirect
     // lighting pass); used as the per-ray miss fallback so escaped rays integrate the
@@ -2010,6 +2423,9 @@ auto deferred::run_taa_pass(const camera& camera,
     // Still the PREVIOUS frame's depth here (the snapshot happens at end of frame);
     // used for disocclusion rejection. Null on the first frame.
     p.prev_depth = rview.tex_safe_get("PREV_DEPTH");
+    // THIS frame's velocity buffer (produced right after the G-buffer pass); null when the
+    // velocity pass is off, which drops the resolve back to camera-only depth reprojection.
+    p.velocity = rview.tex_safe_get("VELOCITY");
     rparams.fill_taa_params(p);
     return taa_pass_.run(rview, p);
 }
@@ -2182,7 +2598,10 @@ void deferred::run_gi_scene_passes(scene& scn, const camera& camera, gfx::render
     resolve_gi_settings(params, gi);
     auto clipmap_settings = gi.clipmap;
     clipmap_settings.compose_on_gpu = clipmap_settings.compose_on_gpu && gi_clipmap_compose_pass_.is_valid();
-    view_cache.update(surface_cache.get_clipmap_instances(), camera.get_position(), clipmap_settings);
+    view_cache.update(surface_cache.get_clipmap_instances(),
+                      camera.get_position(),
+                      clipmap_settings,
+                      surface_cache.get_content_revision());
     // Runs whenever the programs exist, not only when the GPU composes: the pass also
     // seeds the compute-writable cell buffers and drains the texture-mean captures, and
     // the CPU composer needs both. The dirty-mask handoff keeps the composers exclusive
@@ -2200,8 +2619,24 @@ void deferred::run_gi_scene_passes(scene& scn, const camera& camera, gfx::render
     // sdf-debug-only path keeps the cascade alive but has no lights to spend.
     if(params.fill_gi_params)
     {
-        run_gi_light_voxel_pass(scn, camera, rview, surface_cache, view_cache, gi);
-        run_gi_world_probe_pass(camera, rview, surface_cache, view_cache);
+        // QUIESCENCE GATE: with the light set, the clipmap content and origins, and the
+        // probe window all provably still for several complete windows, re-running the
+        // world side rewrites bit-identical values - the trace re-traces the same stratum,
+        // the convolve re-integrates the same atlas, the voxels relight to the same
+        // radiance. ~0.8 ms/frame of GPU skipped in a parked shot, resumed the same frame
+        // anything changes. Held open while an SDF debug view is up: those views paint per
+        // frame through these very dispatches.
+        const uint64_t light_hash = surface_cache.get_light_buffer().get_content_hash();
+        const bool quiescent =
+            view_cache.update_quiescence(light_hash,
+                                         camera.get_position(),
+                                         gi_light_voxel_pass_.get_relight_sample()) &&
+            !wants_sdf_debug;
+        if(!quiescent)
+        {
+            run_gi_light_voxel_pass(scn, camera, rview, surface_cache, view_cache, gi);
+            run_gi_world_probe_pass(camera, rview, surface_cache, view_cache, gi);
+        }
         // One frame counter for both passes; each consumer keys its own rotation off it.
         ++light_voxel_frame_;
     }
@@ -2219,6 +2654,9 @@ void deferred::run_gi_light_voxel_pass(scene& scn,
     light_params.view_cache = &view_cache;
     light_params.frame = light_voxel_frame_;
     light_params.camera_position = camera.get_position();
+    // Unjittered: the cascade fit in build_shadows ran before the TAA jitter was applied,
+    // and the slice test in the kernel must describe the same frustum.
+    light_params.camera_view_proj = camera.get_view_projection_unjittered().get_matrix();
     light_params.probe_visibility_variance_gate = gi.resolve.probe_visibility_variance_gate;
     // The sun-tier and vis-memo views are WRITER-side diagnostics: the compute
     // pass stamps categorical colors into the light volume and the debug pass
@@ -2232,7 +2670,8 @@ void deferred::run_gi_light_voxel_pass(scene& scn,
 void deferred::run_gi_world_probe_pass(const camera& camera,
                                        gfx::render_view& rview,
                                        surface_cache_system& surface_cache,
-                                       surface_cache_view& view_cache)
+                                       surface_cache_view& view_cache,
+                                       const gi_settings& gi)
 {
     // World probes trace against the freshly lit voxels (GI v2 plan 3.3).
     gi_world_probe_pass::run_params probe_params;
@@ -2242,6 +2681,7 @@ void deferred::run_gi_world_probe_pass(const camera& camera,
     probe_params.irradiance_sh = rview.tex_safe_get("IRRADIANCE_SH");
     probe_params.frame = light_voxel_frame_;
     probe_params.light_hash = surface_cache.get_light_buffer().get_content_hash();
+    probe_params.jitter_directions = gi.resolve.world_probe_jitter;
     gi_world_probe_pass_.run(rview, probe_params);
 }
 
@@ -2261,11 +2701,28 @@ void deferred::run_gi_reflection_pass(const camera& camera, gfx::render_view& rv
     grp.output = rview.fbo_safe_get("RBUFFER");
     grp.hiz = rview.tex_safe_get("HIZBUFFER");
     grp.irradiance_sh = rview.tex_safe_get("IRRADIANCE_SH");
+    // Sky-miss fallback: RBUFFER holds exactly the freshly drawn authored probe layer at
+    // this point (cleared and rebuilt by run_reflection_probe_pass earlier this frame; the
+    // GI composite and SSR write into it later). Without the probe stack this frame the
+    // buffer is stale with last frame's composite + SSR - reading it would feed the pass
+    // its own output - so the pass falls back to the sky SH instead.
+    if(reflection_screen_stack_enabled(params) && grp.output)
+    {
+        grp.probe_layer = grp.output->get_texture(0);
+    }
     // This pass runs before the frame's GI resolve, so the stored texture still holds
     // LAST frame's denoised result - the rough-specular source (one frame of lag, the
     // same convention as prev_color).
     grp.gi_diffuse = rview.tex_safe_get("GI_RESOLVE");
     grp.temporal_frames = gi_reflection_settings.resolve.reflection_temporal_frames;
+    // This frame's velocity buffer, handed to the pass explicitly (a valid texture IS the enable).
+    grp.velocity = rview.tex_safe_get("VELOCITY");
+    // Mover signal for the temporal's stillness-release cap, held one temporal window past
+    // the last mover draw so a just-departed mover's ghost still flushes under the clamp.
+    const uint64_t frame_now = gfx::get_render_frame();
+    grp.velocity_movers_recent =
+        velocity_movers_frame_ != ~0ull && frame_now >= velocity_movers_frame_ &&
+        frame_now - velocity_movers_frame_ <= uint64_t(math::max(grp.temporal_frames, 1));
     grp.resolution = gi_reflection_settings.resolve.resolution;
     grp.cam = &camera;
     grp.surface_cache = &engine::context().get_cached<surface_cache_system>();
@@ -2302,6 +2759,8 @@ auto deferred::run_gi_resolve_pass(const camera& camera,
         // Still the PREVIOUS frame's depth at this point: the snapshot happens later in the
         // frame, which is exactly what temporal reprojection needs to validate history.
         params.prev_depth = rview.tex_safe_get("PREV_DEPTH");
+        // This frame's velocity buffer, handed to the pass explicitly (a valid texture IS the enable).
+        params.velocity = rview.tex_safe_get("VELOCITY");
         // Last frame's environment SH (the irradiance pass runs later in the frame), for the
         // ray-miss sky measurement -- same sourcing as the SSIL pass. Null on the first frame.
         params.irradiance_sh = rview.tex_safe_get("IRRADIANCE_SH");
@@ -2547,6 +3006,21 @@ auto deferred::init(rtti::context& ctx) -> bool
 
     geom_program_instanced_.cache_uniforms();
     geom_program_instanced_.program = load_program("deferred_geom/vs_deferred_geom_instanced", "deferred_geom/fs_deferred_geom");
+
+    velocity_program_.cache_uniforms();
+    velocity_program_.program = load_program("velocity/vs_velocity", "velocity/fs_velocity");
+
+    velocity_program_skinned_.cache_uniforms();
+    velocity_program_skinned_.program = load_program("velocity/vs_velocity_skinned", "velocity/fs_velocity");
+
+    velocity_program_instanced_.cache_uniforms();
+    velocity_program_instanced_.program = load_program("velocity/vs_velocity_instanced", "velocity/fs_velocity");
+
+    velocity_camera_program_.cache_uniforms();
+    velocity_camera_program_.program = load_program("vs_clip_quad", "velocity/fs_velocity_camera");
+
+    velocity_debug_program_.cache_uniforms();
+    velocity_debug_program_.program = load_program("vs_clip_quad", "velocity/fs_velocity_debug");
 
     sphere_ref_probe_program_.cache_uniforms();
     sphere_ref_probe_program_.program = load_program("vs_clip_quad_ex", "reflection_probe/fs_sphere_reflection_probe");

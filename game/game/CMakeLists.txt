@@ -15,14 +15,9 @@ target_include_directories(${target_name}
 add_dependencies(${target_name} engine)
 target_link_libraries(${target_name} PUBLIC engine)
 
-if(WIN32)
-  set_target_properties(${target_name} PROPERTIES OUTPUT_NAME "UnravelPlayer")
-  add_definitions(-DPLAYER_NAME="UnravelPlayer")
+set_target_properties(${target_name} PROPERTIES OUTPUT_NAME "unravel-player")
+add_definitions(-DPLAYER_NAME="unravel-player")
 
-else()
-  set_target_properties(${target_name} PROPERTIES OUTPUT_NAME "unravel-player")
-  add_definitions(-DPLAYER_NAME="unravel-player")
-endif()
 
 set_target_properties(${target_name} PROPERTIES
     CXX_STANDARD 20
@@ -32,13 +27,11 @@ set_target_properties(${target_name} PROPERTIES
     WINDOWS_EXPORT_ALL_SYMBOLS ON
 )
 
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    if(UNRAVEL_UNITY_BUILD)
-        set_target_properties(${target_name} PROPERTIES
+if(UNRAVEL_UNITY_BUILD AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set_target_properties(${target_name} PROPERTIES
         UNITY_BUILD ON
         UNITY_BUILD_UNIQUE_ID "ANONYMOUS"
         )
-    endif()
 endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release")

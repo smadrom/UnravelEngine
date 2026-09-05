@@ -122,6 +122,17 @@ struct editing_manager
     void on_prefab_updated(const asset_handle<prefab>& pfb);
 
     void sync_prefab_entity(rtti::context& ctx, entt::handle entity, const asset_handle<prefab>& pfb);
+
+    /**
+     * @brief The sync to run after overrides were reverted or restored under an entity.
+     *
+     * For an entity at or inside an instance: the outermost instance, whose replay owns the
+     * values being reverted to and cascades into everything nested. When that outermost
+     * instance is an authoring root - the prefab being edited, which is upstream of its own
+     * file - it is not replayed; the instances directly under it are synced against their own
+     * prefabs instead, which is what restores a reverted value from the prefab that owns it.
+     */
+    void sync_after_override_change(rtti::context& ctx, entt::handle entity);
     void sync_prefab_instances(rtti::context& ctx, scene* scn);
     auto get_select_mode() const -> select_mode;
 
@@ -473,6 +484,8 @@ struct editing_manager
     
     // Execute all pending actions (called automatically each frame)
     void execute_actions();
+    /// Executes one action now: runs it, notifies, and moves it to the undo stack if undoable.
+    void execute_action(std::shared_ptr<editing_action_t>& action);
     
     // Undo/Redo operations
     auto undo() -> std::shared_ptr<editing_action_t>;
@@ -487,6 +500,8 @@ struct editing_manager
     
     auto has_unsaved_changes() const -> bool { return has_unsaved_changes_; }
     void clear_unsaved_changes() { has_unsaved_changes_ = false; }
+    /// Whether anything was edited in prefab mode since it was entered or last saved.
+    auto has_unsaved_prefab_changes() const -> bool { return prefab_has_unsaved_changes_; }
 
     void clear(bool clear_unsaved = true);
 
@@ -690,6 +705,7 @@ struct editing_manager
 
     bool waiting_for_compilation_before_play_{};
     bool has_unsaved_changes_;
+    bool prefab_has_unsaved_changes_{};
     
 
     // Prompts the user to save changes and returns true if changes should be saved

@@ -4,6 +4,8 @@
 #include <engine/rendering/perez_luminance.h>
 #include <graphics/render_pass.h>
 #include <graphics/texture.h>
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace unravel
@@ -215,12 +217,20 @@ auto atmospheric_pass_perez::init(rtti::context& ctx) -> bool
     auto vs_sky = am.get_asset<gfx::shader>("engine:/data/shaders/atmospherics/vs_sky.sc");
     auto fs_sky = am.get_asset<gfx::shader>("engine:/data/shaders/atmospherics/fs_sky.sc");
     auto fs_cloud = am.get_asset<gfx::shader>("engine:/data/shaders/atmospherics/fs_cloud.sc");
+    auto fs_cloud_shadow = am.get_asset<gfx::shader>("engine:/data/shaders/atmospherics/fs_cloud_shadow.sc");
+    auto fs_cloud_composite = am.get_asset<gfx::shader>("engine:/data/shaders/atmospherics/fs_cloud_composite.sc");
 
     atmospheric_program_.cache_uniforms();
     atmospheric_program_.program = std::make_unique<gpu_program>(vs_sky, fs_sky);
 
     cloud_program_.cache_uniforms();
     cloud_program_.program = std::make_unique<gpu_program>(vs_sky, fs_cloud);
+
+    cloud_shadow_program_.cache_uniforms();
+    cloud_shadow_program_.program = std::make_unique<gpu_program>(vs_sky, fs_cloud_shadow);
+
+    cloud_composite_program_.cache_uniforms();
+    cloud_composite_program_.program = std::make_unique<gpu_program>(vs_sky, fs_cloud_composite);
 
     int vertical_count = 32;
     int horizontal_count = 32;
@@ -263,6 +273,373 @@ auto atmospheric_pass_perez::init(rtti::context& ctx) -> bool
     return true;
 }
 
+namespace
+{
+constexpr int cloud_mode_volumetric = 2;
+// Jitter sequence length uploaded as a float: the golden-ratio fract loses precision past
+// ~2^20, and the sequence only needs to cover the accumulation window.
+constexpr uint32_t cloud_jitter_period = 1024;
+constexpr const char* cloud_frame_count_key = "CLOUD_FRAME_COUNT";
+constexpr const char* cloud_prev_wind_keys[2] = {"CLOUD_PREV_WIND_X", "CLOUD_PREV_WIND_Y"};
+constexpr const char* cloud_tex_keys[2] = {"CLOUD_PING", "CLOUD_PONG"};
+constexpr const char* cloud_aux_keys[2] = {"CLOUD_AUX_PING", "CLOUD_AUX_PONG"};
+constexpr const char* cloud_fbo_keys[2] = {"CLOUD_FBO_PING", "CLOUD_FBO_PONG"};
+constexpr const char* cloud_shadow_tex_key = "CLOUD_SHADOW";
+constexpr const char* cloud_shadow_fbo_key = "CLOUD_SHADOW_FBO";
+// Cloud shadow map: resolution and world extent in cloud sizes. 16 cloud sizes at 512
+// texels is ~600 units per texel at the default size; the sun's penumbra over the layer
+// altitude is wider than that, so the shadows are soft at any resolution.
+constexpr uint16_t cloud_shadow_resolution = 512;
+constexpr float cloud_shadow_extent_sizes = 16.0f;
+// Below this sun elevation the shadow map is not rendered (the sun ray through the layer
+// is too long to be meaningful and the lighting shader ignores it as well).
+constexpr float cloud_shadow_min_sun_elevation = 0.05f;
+} // namespace
+
+auto atmospheric_pass_perez::make_cloud_uniforms(const run_params& params,
+                                                 const camera& camera,
+                                                 float exposition,
+                                                 float hour) -> cloud_uniform_block
+{
+    // Layout shared with clouds.sh / fs_cloud.sc / fs_sky.sc / fs_cloud_shadow.sc.
+    cloud_uniform_block uniforms{};
+    uniforms.exposition[0] = 0.02f;
+    uniforms.exposition[1] = 3.0f;
+    uniforms.exposition[2] = exposition;
+    uniforms.exposition[3] = hour;
+    uniforms.cloud_params[0] = params.cloud_coverage;
+    uniforms.cloud_params[1] = params.cloud_base_altitude;
+    uniforms.cloud_params[2] = params.cloud_thickness;
+    uniforms.cloud_params[3] = params.cloud_density;
+    uniforms.cloud_params2[0] = params.cloud_shadow_strength;
+    uniforms.cloud_params2[1] = 1.0f / std::max(params.cloud_size, 1.0f);
+    uniforms.cloud_params2[2] = params.cloud_softness;
+    uniforms.cloud_params2[3] = float(params.cloud_mode);
+    uniforms.cloud_params3[0] = params.cloud_detail_erode;
+    uniforms.cloud_params3[1] = params.cloud_macro_variation;
+    uniforms.cloud_params3[2] = params.cloud_wind_offset.x;
+    uniforms.cloud_params3[3] = params.cloud_wind_offset.y;
+    uniforms.cloud_params4[0] = params.cloud_time;
+    uniforms.cloud_params4[1] = params.cloud_brightness;
+    uniforms.cloud_params4[2] = 0.0f;
+    uniforms.cloud_params4[3] = 0.0f;
+    const auto& cam_pos = camera.get_position();
+    uniforms.camera[0] = cam_pos.x;
+    uniforms.camera[1] = cam_pos.y;
+    uniforms.camera[2] = cam_pos.z;
+    uniforms.camera[3] = layer_base_world_y(params, camera);
+    return uniforms;
+}
+
+auto atmospheric_pass_perez::layer_base_world_y(const run_params& params, const camera& camera) -> float
+{
+    const float ground_y = params.cloud_world_space_altitude ? 0.0f : camera.get_position().y;
+    return ground_y + params.cloud_base_altitude;
+}
+
+auto atmospheric_pass_perez::run_cloud_shadow_pass(const camera& camera,
+                                                   gfx::render_view& rview,
+                                                   const run_params& params) -> cloud_shadow_result
+{
+    cloud_shadow_result result;
+    if(params.cloud_mode == 0 || !cloud_shadow_program_.program || !cloud_shadow_program_.program->is_valid())
+    {
+        return result;
+    }
+    const math::vec3 sun_dir = math::normalize(-params.light_direction);
+    if(sun_dir.y <= cloud_shadow_min_sun_elevation)
+    {
+        return result;
+    }
+
+    const auto& cam_pos = camera.get_position();
+    result.extent = cloud_shadow_extent_sizes * params.cloud_size;
+    result.base_world_y = layer_base_world_y(params, camera);
+    result.opacity = params.cloud_shadow_opacity;
+    result.apply_to_lights = params.cloud_shadows;
+    // Centre the map where the sun ray through the camera meets the layer base, snapped to
+    // the texel grid so the texels do not swim as the camera moves.
+    const float texel = result.extent / float(cloud_shadow_resolution);
+    const float to_base = std::max(result.base_world_y - cam_pos.y, 0.0f) / sun_dir.y;
+    math::vec2 origin(cam_pos.x + sun_dir.x * to_base, cam_pos.z + sun_dir.z * to_base);
+    origin.x = std::floor(origin.x / texel) * texel;
+    origin.y = std::floor(origin.y / texel) * texel;
+    result.origin = origin;
+
+    constexpr uint64_t flags = BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP;
+    const usize32_t size{cloud_shadow_resolution, cloud_shadow_resolution};
+    auto& tex = rview.tex_get_or_emplace(cloud_shadow_tex_key);
+    auto& fbo = rview.fbo_get_or_emplace(cloud_shadow_fbo_key);
+    if(gfx::needs_recreate(tex, size))
+    {
+        // Mips: the lowest level is the mean transmittance the irradiance bake reads.
+        tex = std::make_shared<gfx::texture>(cloud_shadow_resolution, cloud_shadow_resolution, true, 1, gfx::texture_format::R8, flags);
+        fbo = std::make_shared<gfx::frame_buffer>();
+        fbo->populate({tex});
+    }
+    else if(gfx::needs_recreate(fbo, size))
+    {
+        fbo = std::make_shared<gfx::frame_buffer>();
+        fbo->populate({tex});
+    }
+
+    irradiance_perez_params perez;
+    compute_irradiance_perez_params(params.light_direction, params.turbidity, perez);
+    const float hour = ANONYMOUS::hour_of_day(-params.light_direction);
+    const cloud_uniform_block uniforms = make_cloud_uniforms(params, camera, perez.exposition, hour);
+
+    gfx::render_pass pass("Atmospherics/Cloud Shadow Map");
+    pass.bind(fbo.get());
+    pass.set_view_proj(camera.get_view_relative(), camera.get_projection());
+    pass.clear(BGFX_CLEAR_COLOR, 0xFFFFFFFF, 0.0f, 0);
+
+    cloud_shadow_program_.program->begin();
+    gfx::set_uniform(cloud_shadow_program_.u_sunDirection, perez.sun_direction);
+    gfx::set_uniform(cloud_shadow_program_.u_cloudParams, uniforms.cloud_params);
+    gfx::set_uniform(cloud_shadow_program_.u_cloudParams2, uniforms.cloud_params2);
+    gfx::set_uniform(cloud_shadow_program_.u_cloudParams3, uniforms.cloud_params3);
+    gfx::set_uniform(cloud_shadow_program_.u_cloudParams4, uniforms.cloud_params4);
+    gfx::set_uniform(cloud_shadow_program_.u_cloudCamera, uniforms.camera);
+    float map_params[4] = {origin.x, origin.y, result.extent, 0.0f};
+    gfx::set_uniform(cloud_shadow_program_.u_cloudShadowMap, map_params);
+
+    auto& cloud_noise = default_textures::get().cloud_noise();
+    if(cloud_noise.base_noise)
+    {
+        gfx::set_texture(cloud_shadow_program_.s_cloudNoise, 0, cloud_noise.base_noise.get());
+    }
+    if(cloud_noise.flat_noise)
+    {
+        gfx::set_texture(cloud_shadow_program_.s_cloudNoise2D, 1, cloud_noise.flat_noise.get());
+    }
+
+    gfx::set_scissor(0, 0, cloud_shadow_resolution, cloud_shadow_resolution);
+    gfx::set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A);
+    gfx::set_index_buffer(ib_->native_handle());
+    gfx::set_vertex_buffer(0, vb_->native_handle());
+    gfx::submit(pass.id, cloud_shadow_program_.program->native_handle());
+    gfx::set_state(BGFX_STATE_DEFAULT);
+    cloud_shadow_program_.program->end();
+
+    result.map = tex;
+    result.valid = true;
+    return result;
+}
+
+void atmospheric_pass_perez::release_cloud_resources(gfx::render_view& rview)
+{
+    if(!rview.tex_safe_get(cloud_tex_keys[0]))
+    {
+        return;
+    }
+    for(int i = 0; i < 2; ++i)
+    {
+        rview.fbo_remove(cloud_fbo_keys[i]);
+        rview.tex_remove(cloud_tex_keys[i]);
+        rview.tex_remove(cloud_aux_keys[i]);
+    }
+    rview.data_get_or_emplace(cloud_frame_count_key) = 0;
+    rview.data_get_or_emplace(cloud_prev_wind_keys[0]) = 0;
+    rview.data_get_or_emplace(cloud_prev_wind_keys[1]) = 0;
+}
+
+auto atmospheric_pass_perez::run_cloud_prepass(const camera& camera,
+                                               gfx::render_view& rview,
+                                               const usize32_t& output_size,
+                                               const gfx::texture::ptr& depth,
+                                               const irradiance_perez_params& perez,
+                                               const cloud_uniform_block& uniforms,
+                                               const run_params& params) -> cloud_prepass_result
+{
+    const auto& view = camera.get_view_relative();
+    const auto& proj = camera.get_projection();
+
+    const uint32_t half_w = std::max(1u, output_size.width / 2);
+    const uint32_t half_h = std::max(1u, output_size.height / 2);
+    const usize32_t half_size{half_w, half_h};
+
+    constexpr uint64_t cloud_tex_flags = BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP;
+
+    auto& cloud_frame_count = rview.data_get_or_emplace(cloud_frame_count_key);
+
+    // The wind offset wraps to the noise tile period; the per-frame advance (unwrapped)
+    // drives the history reprojection.
+    constexpr float wind_period = float(cloud_noise_textures::tile_period);
+    float wind_delta[2] = {0.0f, 0.0f};
+    for(int i = 0; i < 2; ++i)
+    {
+        auto& prev_bits = rview.data_get_or_emplace(cloud_prev_wind_keys[i]);
+        float prev{};
+        std::memcpy(&prev, &prev_bits, sizeof(float));
+        const float cur = params.cloud_wind_offset[i];
+        float delta = cur - prev;
+        if(delta > 0.5f * wind_period)
+        {
+            delta -= wind_period;
+        }
+        else if(delta < -0.5f * wind_period)
+        {
+            delta += wind_period;
+        }
+        wind_delta[i] = delta;
+        std::memcpy(&prev_bits, &cur, sizeof(float));
+    }
+
+    bool recreated = false;
+    gfx::texture::ptr cloud_tex[2];
+    gfx::texture::ptr cloud_aux[2];
+    for(int i = 0; i < 2; ++i)
+    {
+        auto& tex = rview.tex_get_or_emplace(cloud_tex_keys[i]);
+        if(gfx::needs_recreate(tex, half_size))
+        {
+            tex = std::make_shared<gfx::texture>(half_w, half_h, false, 1, gfx::texture_format::RGBA16F, cloud_tex_flags);
+            recreated = true;
+        }
+        // R = history sample count / max, G = scene distance (km) for the depth-aware composite.
+        auto& aux = rview.tex_get_or_emplace(cloud_aux_keys[i]);
+        if(gfx::needs_recreate(aux, half_size))
+        {
+            aux = std::make_shared<gfx::texture>(half_w, half_h, false, 1, gfx::texture_format::RG16F, cloud_tex_flags);
+            recreated = true;
+        }
+        cloud_tex[i] = tex;
+        cloud_aux[i] = aux;
+    }
+
+    gfx::frame_buffer::ptr cloud_fbo[2];
+    for(int i = 0; i < 2; ++i)
+    {
+        auto& fbo = rview.fbo_get_or_emplace(cloud_fbo_keys[i]);
+        if(recreated || gfx::needs_recreate(fbo, half_size))
+        {
+            fbo = std::make_shared<gfx::frame_buffer>();
+            fbo->populate({cloud_tex[i], cloud_aux[i]});
+        }
+        cloud_fbo[i] = fbo;
+    }
+    if(recreated)
+    {
+        cloud_frame_count = 0;
+    }
+
+    const uint32_t cur = cloud_frame_count & 1;
+    const uint32_t prev = cur ^ 1;
+
+    gfx::render_pass cloud_pass("Atmospherics/Cloud Pre-Pass");
+    cloud_pass.bind(cloud_fbo[cur].get());
+    cloud_pass.set_view_proj(view, proj);
+    cloud_pass.clear(BGFX_CLEAR_COLOR, 0x000000FF, 0.0f, 0);
+
+    cloud_program_.program->begin();
+
+    gfx::set_uniform(cloud_program_.u_skyLuminanceXYZ, perez.sky_luminance_xyz);
+    gfx::set_uniform(cloud_program_.u_skyLuminance, perez.sky_luminance_rgb);
+    gfx::set_uniform(cloud_program_.u_sunLuminance, perez.sun_luminance_rgb);
+    gfx::set_uniform(cloud_program_.u_sunDirection, perez.sun_direction);
+    gfx::set_uniform(cloud_program_.u_parameters, uniforms.exposition);
+    gfx::set_uniform(cloud_program_.u_perezCoeff, &perez.perez_coeff[0][0], 5);
+    gfx::set_uniform(cloud_program_.u_cloudParams, uniforms.cloud_params);
+    gfx::set_uniform(cloud_program_.u_cloudParams2, uniforms.cloud_params2);
+    gfx::set_uniform(cloud_program_.u_cloudParams3, uniforms.cloud_params3);
+    gfx::set_uniform(cloud_program_.u_cloudParams4, uniforms.cloud_params4);
+    gfx::set_uniform(cloud_program_.u_cloudCamera, uniforms.camera);
+
+    // x = jitter index, y = history valid.
+    const float history_valid = cloud_frame_count > 0 ? 1.0f : 0.0f;
+    float cloud_frame[4] = {float(cloud_frame_count % cloud_jitter_period), history_valid, 0.0f, 0.0f};
+    gfx::set_uniform(cloud_program_.u_cloudFrame, cloud_frame);
+
+    // History offset: where a feature seen now sat last frame, relative to the current
+    // camera = wind advance in world units + the camera translation since the last frame.
+    // Previous matrices come from the ONE promoted TAA pair (unjittered projection - the
+    // jittered chain is retired); the sub-pixel alignment only improves the reprojection.
+    const float cloud_size = std::max(params.cloud_size, 1.0f);
+    const math::vec3 cam_pos = camera.get_position();
+    const math::vec3 prev_cam_pos = math::inverse(camera.get_prev_view()).get_position();
+    const math::vec3 cam_delta = cam_pos - prev_cam_pos;
+    float history_offset[4] = {wind_delta[0] * cloud_size + cam_delta.x,
+                               cam_delta.y,
+                               wind_delta[1] * cloud_size + cam_delta.z,
+                               0.0f};
+    gfx::set_uniform(cloud_program_.u_cloudHistory, history_offset);
+
+    auto prev_vp = camera.get_prev_view_projection_relative_unjittered();
+    gfx::set_uniform(cloud_program_.u_prevViewProj, prev_vp.get_matrix());
+
+    auto& cloud_noise = default_textures::get().cloud_noise();
+    if(cloud_noise.base_noise)
+    {
+        gfx::set_texture(cloud_program_.s_cloudNoise, 0, cloud_noise.base_noise.get());
+    }
+    gfx::set_texture(cloud_program_.s_cloudHistory, 1, cloud_tex[prev].get());
+    gfx::set_texture(cloud_program_.s_cloudHistoryAux, 2, cloud_aux[prev].get());
+    if(cloud_noise.flat_noise)
+    {
+        gfx::set_texture(cloud_program_.s_cloudNoise2D, 3, cloud_noise.flat_noise.get());
+    }
+    if(depth)
+    {
+        gfx::set_texture(cloud_program_.s_depth, 4, depth);
+    }
+
+    irect32_t cloud_rect(0, 0, half_w, half_h);
+    gfx::set_scissor(cloud_rect.left, cloud_rect.top, cloud_rect.width(), cloud_rect.height());
+
+    gfx::set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A);
+    gfx::set_index_buffer(ib_->native_handle());
+    gfx::set_vertex_buffer(0, vb_->native_handle());
+    gfx::submit(cloud_pass.id, cloud_program_.program->native_handle());
+
+    gfx::set_state(BGFX_STATE_DEFAULT);
+    cloud_program_.program->end();
+
+    cloud_frame_count++;
+    cloud_prepass_result result;
+    result.cloud = cloud_tex[cur];
+    result.aux = cloud_aux[cur];
+    result.size = half_size;
+    return result;
+}
+
+void atmospheric_pass_perez::run_cloud_composite(gfx::frame_buffer* surface,
+                                                 const camera& camera,
+                                                 const usize32_t& output_size,
+                                                 const gfx::texture::ptr& depth,
+                                                 const cloud_prepass_result& prepass)
+{
+    if(!prepass.cloud || !prepass.aux || !cloud_composite_program_.program || !cloud_composite_program_.program->is_valid())
+    {
+        return;
+    }
+    gfx::render_pass pass("Atmospherics/Cloud Composite");
+    pass.bind(surface);
+    pass.set_view_proj(camera.get_view_relative(), camera.get_projection());
+
+    cloud_composite_program_.program->begin();
+    const float composite[4] = {1.0f / float(prepass.size.width),
+                                1.0f / float(prepass.size.height),
+                                float(prepass.size.width),
+                                float(prepass.size.height)};
+    gfx::set_uniform(cloud_composite_program_.u_cloudComposite, composite);
+    gfx::set_texture(cloud_composite_program_.s_cloudTex, 0, prepass.cloud);
+    gfx::set_texture(cloud_composite_program_.s_cloudAux, 1, prepass.aux);
+    if(depth)
+    {
+        gfx::set_texture(cloud_composite_program_.s_depth, 2, depth);
+    }
+
+    irect32_t rect(0, 0, irect32_t::value_type(output_size.width), irect32_t::value_type(output_size.height));
+    gfx::set_scissor(rect.left, rect.top, rect.width(), rect.height());
+    // Premultiplied: frame = cloud.rgb + frame * cloud.transmittance.
+    gfx::set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_SRC_ALPHA));
+    gfx::set_index_buffer(ib_->native_handle());
+    gfx::set_vertex_buffer(0, vb_->native_handle());
+    gfx::submit(pass.id, cloud_composite_program_.program->native_handle());
+    gfx::set_state(BGFX_STATE_DEFAULT);
+    cloud_composite_program_.program->end();
+}
+
 void atmospheric_pass_perez::run(gfx::frame_buffer::ptr input,
                                  const camera& camera,
                                  gfx::render_view& rview,
@@ -279,127 +656,24 @@ void atmospheric_pass_perez::run(gfx::frame_buffer::ptr input,
     compute_irradiance_perez_params(params.light_direction, params.turbidity, perez);
     perez.exposition *= params.sky_brightness;
 
-    float hour = ANONYMOUS::hour_of_day(-params.light_direction);
-    float exposition[4] = {0.02f, 3.0f, perez.exposition, hour};
-    float cloud_params[4] = {params.cloud_coverage, params.cloud_base_altitude, params.cloud_time, params.cloud_density};
-    float cloud_params2[4] = {params.cloud_absorption, params.cloud_light_absorption, params.cloud_top_altitude, float(params.cloud_mode)};
-    float cloud_params3[4] = {params.cloud_vol_uv_scale,
-                              params.cloud_vol_edge_width,
-                              params.cloud_vol_shape_power,
-                              params.cloud_vol_detail_erode};
-    float cloud_params4[4] = {params.cloud_vol_macro_strength,
-                              params.cloud_vol_coarse_scale,
-                              params.cloud_vol_base_mix,
-                              params.cloud_vol_sun_intensity};
+    const float hour = ANONYMOUS::hour_of_day(-params.light_direction);
+    const cloud_uniform_block uniforms = make_cloud_uniforms(params, camera, perez.exposition, hour);
 
-    auto& cloud_noise = default_textures::get().cloud_noise();
-
-    // === Pass 1: Cloud pre-pass at half resolution with temporal blending (ping-pong) ===
-    // Only run when cloud_mode == volumetric (2)
-    if(params.cloud_mode == 2 && cloud_program_.program && cloud_program_.program->is_valid())
+    // === Pass 1: cloud pre-pass at half resolution with temporal accumulation ===
+    // The input frame buffer carries the scene depth as its second attachment.
+    const gfx::texture::ptr depth = surface->get_attachment_count() > 1 ? surface->get_texture(1) : gfx::texture::ptr{};
+    cloud_prepass_result prepass;
+    const bool volumetric = params.cloud_mode == cloud_mode_volumetric;
+    if(volumetric && cloud_program_.program && cloud_program_.program->is_valid())
     {
-        uint32_t half_w = output_size.width / 2;
-        uint32_t half_h = output_size.height / 2;
-        if(half_w < 1) half_w = 1;
-        if(half_h < 1) half_h = 1;
-
-        constexpr uint64_t cloud_tex_flags = BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP;
-
-        auto& cloud_frame_count = rview.data_get_or_emplace("CLOUD_FRAME_COUNT");
-
-        auto& prev_cloud_time_bits = rview.data_get_or_emplace("CLOUD_PREV_TIME");
-        float prev_cloud_time{};
-        std::memcpy(&prev_cloud_time, &prev_cloud_time_bits, sizeof(float));
-        float cloud_time_delta = params.cloud_time - prev_cloud_time;
-        uint32_t cur_time_bits{};
-        std::memcpy(&cur_time_bits, &params.cloud_time, sizeof(float));
-        prev_cloud_time_bits = cur_time_bits;
-
-        auto& cloud_tex_a = rview.tex_get_or_emplace("CLOUD_PING");
-        if(gfx::needs_recreate(cloud_tex_a, {half_w, half_h}))
-        {
-            cloud_tex_a.reset();
-            cloud_tex_a = std::make_shared<gfx::texture>(half_w, half_h, false, 1,
-                gfx::texture_format::RGBA16F, cloud_tex_flags);
-            cloud_frame_count = 0;
-        }
-
-        auto& cloud_tex_b = rview.tex_get_or_emplace("CLOUD_PONG");
-        if(gfx::needs_recreate(cloud_tex_b, {half_w, half_h}))
-        {
-            cloud_tex_b.reset();
-            cloud_tex_b = std::make_shared<gfx::texture>(half_w, half_h, false, 1,
-                gfx::texture_format::RGBA16F, cloud_tex_flags);
-            cloud_frame_count = 0;
-        }
-
-        uint32_t cur = cloud_frame_count & 1;
-        auto& current_tex  = (cur == 0) ? cloud_tex_a : cloud_tex_b;
-        auto& history_tex  = (cur == 0) ? cloud_tex_b : cloud_tex_a;
-
-        auto& cloud_fbo_a = rview.fbo_get_or_emplace("CLOUD_FBO_PING");
-        if(gfx::needs_recreate(cloud_fbo_a, {half_w, half_h}))
-        {
-            cloud_fbo_a.reset();
-            cloud_fbo_a = std::make_shared<gfx::frame_buffer>();
-            cloud_fbo_a->populate({cloud_tex_a});
-        }
-
-        auto& cloud_fbo_b = rview.fbo_get_or_emplace("CLOUD_FBO_PONG");
-        if(gfx::needs_recreate(cloud_fbo_b, {half_w, half_h}))
-        {
-            cloud_fbo_b.reset();
-            cloud_fbo_b = std::make_shared<gfx::frame_buffer>();
-            cloud_fbo_b->populate({cloud_tex_b});
-        }
-
-        auto& current_fbo = (cur == 0) ? cloud_fbo_a : cloud_fbo_b;
-
-        gfx::render_pass cloud_pass("Atmospherics/Cloud Pre-Pass");
-        cloud_pass.bind(current_fbo.get());
-        cloud_pass.set_view_proj(view, proj);
-        cloud_pass.clear(BGFX_CLEAR_COLOR, 0x000000FF, 0.0f, 0);
-
-        cloud_program_.program->begin();
-
-        gfx::set_uniform(cloud_program_.u_skyLuminanceXYZ, perez.sky_luminance_xyz);
-        gfx::set_uniform(cloud_program_.u_skyLuminance, perez.sky_luminance_rgb);
-        gfx::set_uniform(cloud_program_.u_sunLuminance, perez.sun_luminance_rgb);
-        gfx::set_uniform(cloud_program_.u_sunDirection, perez.sun_direction);
-        gfx::set_uniform(cloud_program_.u_parameters, exposition);
-        gfx::set_uniform(cloud_program_.u_perezCoeff, &perez.perez_coeff[0][0], 5);
-        gfx::set_uniform(cloud_program_.u_cloudParams, cloud_params);
-        gfx::set_uniform(cloud_program_.u_cloudParams2, cloud_params2);
-        gfx::set_uniform(cloud_program_.u_cloudParams3, cloud_params3);
-        gfx::set_uniform(cloud_program_.u_cloudParams4, cloud_params4);
-
-        float cloud_frame[4] = {float(gfx::get_render_frame()), float(cloud_frame_count), cloud_time_delta, 0.0f};
-        gfx::set_uniform(cloud_program_.u_cloudFrame, cloud_frame);
-
-        auto prev_vp = camera.get_prev_view_projection_relative();
-        gfx::set_uniform(cloud_program_.u_prevViewProj, prev_vp.get_matrix());
-
-        if(cloud_noise.base_noise)
-        {
-            gfx::set_texture(cloud_program_.s_cloudNoise, 0, cloud_noise.base_noise.get());
-        }
-        gfx::set_texture(cloud_program_.s_cloudHistory, 1, history_tex.get());
-
-        irect32_t cloud_rect(0, 0, half_w, half_h);
-        gfx::set_scissor(cloud_rect.left, cloud_rect.top, cloud_rect.width(), cloud_rect.height());
-
-        gfx::set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A);
-        gfx::set_index_buffer(ib_->native_handle());
-        gfx::set_vertex_buffer(0, vb_->native_handle());
-        gfx::submit(cloud_pass.id, cloud_program_.program->native_handle());
-
-        gfx::set_state(BGFX_STATE_DEFAULT);
-        cloud_program_.program->end();
-
-        cloud_frame_count++;
+        prepass = run_cloud_prepass(camera, rview, output_size, depth, perez, uniforms, params);
+    }
+    else
+    {
+        release_cloud_resources(rview);
     }
 
-    // === Pass 2: Sky pass (full resolution, composites half-res clouds) ===
+    // === Pass 2: sky pass (full resolution, composites the half-res clouds) ===
     gfx::render_pass pass("Atmospherics/Sky Pass");
     pass.bind(surface);
     pass.set_view_proj(view, proj);
@@ -412,19 +686,15 @@ void atmospheric_pass_perez::run(gfx::frame_buffer::ptr input,
         gfx::set_uniform(atmospheric_program_.u_skyLuminanceXYZ, perez.sky_luminance_xyz);
         gfx::set_uniform(atmospheric_program_.u_skyLuminance, perez.sky_luminance_rgb);
         gfx::set_uniform(atmospheric_program_.u_sunDirection, perez.sun_direction);
-        gfx::set_uniform(atmospheric_program_.u_parameters, exposition);
+        gfx::set_uniform(atmospheric_program_.u_parameters, uniforms.exposition);
         gfx::set_uniform(atmospheric_program_.u_perezCoeff, &perez.perez_coeff[0][0], 5);
-        gfx::set_uniform(atmospheric_program_.u_cloudParams, cloud_params);
-        gfx::set_uniform(atmospheric_program_.u_cloudParams2, cloud_params2);
+        gfx::set_uniform(atmospheric_program_.u_cloudParams, uniforms.cloud_params);
+        gfx::set_uniform(atmospheric_program_.u_cloudParams2, uniforms.cloud_params2);
+        gfx::set_uniform(atmospheric_program_.u_cloudParams3, uniforms.cloud_params3);
+        gfx::set_uniform(atmospheric_program_.u_cloudParams4, uniforms.cloud_params4);
+        gfx::set_uniform(atmospheric_program_.u_cloudCamera, uniforms.camera);
 
-        auto cloud_frame_count = rview.data_get("CLOUD_FRAME_COUNT");
-        uint32_t prev = (cloud_frame_count - 1) & 1;
-        const auto& cloud_tex = rview.tex_safe_get(prev == 0 ? "CLOUD_PING" : "CLOUD_PONG");
-        if(cloud_tex)
-        {
-            gfx::set_texture(atmospheric_program_.s_cloudTex, 0, cloud_tex);
-        }
-
+        auto& cloud_noise = default_textures::get().cloud_noise();
         if(cloud_noise.flat_noise)
         {
             gfx::set_texture(atmospheric_program_.s_cloudNoise2D, 1, cloud_noise.flat_noise.get());
@@ -440,6 +710,12 @@ void atmospheric_pass_perez::run(gfx::frame_buffer::ptr input,
 
         gfx::set_state(BGFX_STATE_DEFAULT);
         atmospheric_program_.program->end();
+    }
+
+    // === Pass 3: volumetric composite over the whole frame (sky and geometry) ===
+    if(volumetric)
+    {
+        run_cloud_composite(surface, camera, output_size, depth, prepass);
     }
 
     gfx::discard();

@@ -60,9 +60,12 @@ string(REGEX REPLACE "^v([0-9]+)\\..*" "\\1" GIT_VERSION_MAJOR "${GIT_VERSION}")
 string(REGEX REPLACE "^v[0-9]+\\.([0-9]+).*" "\\1" GIT_VERSION_MINOR "${GIT_VERSION}")
 string(REGEX REPLACE "^v[0-9]+\\.[0-9]+\\.([0-9]+).*" "\\1" GIT_VERSION_PATCH "${GIT_VERSION}")
 string(REGEX REPLACE "^v[0-9]+\\.[0-9]+\\.[0-9]+(.*)" "\\1" GIT_VERSION_SHA1 "${GIT_VERSION}")
+string(REGEX REPLACE "-g[0-9a-f]+$" "" GIT_VERSION_NO_SHA "${GIT_VERSION}")
 set(VERSION_SHORT "${GIT_VERSION_MAJOR}.${GIT_VERSION_MINOR}.${GIT_VERSION_PATCH}${GIT_VERSION_SHA1}")
+string(REGEX REPLACE "^v" "" VERSION_SHORT_NO_SHA "${GIT_VERSION_NO_SHA}")
 
 message(STATUS "Version ${GIT_VERSION}")
+message(STATUS "Version (no sha) ${VERSION_SHORT_NO_SHA}")
 message(STATUS "CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}")
 
 option(BUILD_ENGINE_SHARED "Build as a shared library." ON)
@@ -182,6 +185,7 @@ add_subdirectory(integrations/pw_runtime)
 add_subdirectory(engine)
 add_subdirectory(editor)
 add_subdirectory(game)
+add_subdirectory(tests)
 
 
 file(GLOB_RECURSE SOURCES ${PROJECT_SOURCE_DIR}/engine_data/data/shaders/* ${PROJECT_SOURCE_DIR}/engine_data/data/scripts/*)
@@ -323,19 +327,38 @@ _get_all_cmake_targets(all_targets ${CMAKE_CURRENT_LIST_DIR})
 #get_property(all_targets GLOBAL PROPERTY TARGETS)
 
 set(exec_targets "")
+set(unshipped_exec_files "")
 foreach(target ${all_targets})
   get_target_property(target_type ${target} TYPE)
   if(NOT target_type STREQUAL "EXECUTABLE")
     continue()
   endif()
-  # EXCLUDE_FROM_ALL harnesses (gi_tests, etc.) are not part of the default build
-  # and must not be packaged. install(PROGRAMS $<TARGET_FILE:...>) fails CPack
-  # when the binary was never produced.
+  # EXCLUDE_FROM_ALL executables (the gi_tests / animation_tests / ik_tests harnesses,
+  # dependency samples) are not part of the default build, so they must not be packaged:
+  # install(PROGRAMS $<TARGET_FILE:...>) fails CPack when the binary was never produced.
+  # Remember their file names too - EXCLUDE_FROM_ALL only shapes the build graph, and the
+  # runtime tree install below is a plain filesystem sweep that would otherwise pick up a
+  # locally built harness sitting next to the editor.
   get_target_property(exclude_from_all ${target} EXCLUDE_FROM_ALL)
   if(exclude_from_all)
+    get_target_filename(${target} target_filename)
+    list(APPEND unshipped_exec_files "${target_filename}")
     continue()
   endif()
   list(APPEND exec_targets ${target})
+endforeach()
+list(REMOVE_DUPLICATES unshipped_exec_files)
+
+# Turn each unshipped executable into install(DIRECTORY) exclusions: the binary itself plus
+# the debug/link sidecars MSVC drops beside it under the same stem.
+set(unshipped_exec_patterns "")
+foreach(unshipped_file ${unshipped_exec_files})
+  get_filename_component(unshipped_stem "${unshipped_file}" NAME_WE)
+  list(APPEND unshipped_exec_patterns
+       PATTERN "${unshipped_file}" EXCLUDE
+       PATTERN "${unshipped_stem}.pdb" EXCLUDE
+       PATTERN "${unshipped_stem}.ilk" EXCLUDE
+       )
 endforeach()
 
 # Runtime tree (data, clrpp, default-build tools). Test binaries stay out even
@@ -344,8 +367,7 @@ install(DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/
         COMPONENT UnravelEngine
         DESTINATION .
         FILES_MATCHING PATTERN "*"
-        PATTERN "gi_tests" EXCLUDE
-        PATTERN "gi_tests.exe" EXCLUDE
+        ${unshipped_exec_patterns}
         )
 
 # Install each shipped executable using its generator expression for its file path.
@@ -360,7 +382,7 @@ endforeach()
 # Basic settings
 
 set(CPACK_PACKAGE_NAME "UnravelEngine")
-set(CPACK_PACKAGE_VERSION "${VERSION_SHORT}")
+set(CPACK_PACKAGE_VERSION "${VERSION_SHORT_NO_SHA}")
 set(CPACK_COMPONENTS_ALL UnravelEngine)
 
 

@@ -97,6 +97,9 @@ uniform vec4 u_sdf_params;
 #define u_sdf_atlas_brick_dim u_sdf_params.x
 #define u_sdf_atlas_voxel_dim u_sdf_params.y
 #define u_sdf_instance_count  int(u_sdf_params.z)
+/// Emissive instances in the table appended to b_sdf_instances after the instances (see
+/// gi_emissive_nee.sh); 0 when the probes have nothing to sample explicitly.
+#define u_sdf_emitter_count   int(u_sdf_params.w)
 
 struct SdfHeader
 {
@@ -693,6 +696,13 @@ void SdfTestInstance(int index, vec3 origin, vec3 direction, vec3 inv_dir, float
 	}
 	float t = t_near;
 	bool resolved = false;
+	// LOOP on every march in this file: max_steps is a compile-time constant at most call
+	// sites after inlining, and fxc then attempts to fully unroll a ~100-line body 64 times
+	// per instantiation - nested inside the grid walk and duplicated per caller, that was
+	// a measured term of the GI shaders' 68-second s_5_0 compile total (the light-voxel
+	// kernel alone took 23 s). Divergent early-exit marches gain nothing from unrolling at
+	// runtime - the Hi-Z march has shipped [loop] all along.
+	LOOP
 	for(int step_index = 0; step_index < max_steps; ++step_index)
 	{
 		if(t > t_far)
@@ -798,6 +808,7 @@ SdfRayHit SdfTraceInstances(vec3 origin, vec3 direction, float t_min, float t_ma
 		// No grid this frame (nothing resident, or the upload failed). Testing everything is the
 		// slow answer, not a wrong one, and it keeps the tier working rather than silently
 		// dropping every instance.
+		LOOP
 		for(int i = 0; i < u_sdf_instance_count; ++i)
 		{
 			SdfTestInstance(i, origin, direction, inv_dir, t_min, t_max, max_steps, surface_bias,
@@ -856,6 +867,9 @@ SdfRayHit SdfTraceInstances(vec3 origin, vec3 direction, float t_min, float t_ma
 	// It also bounds per-instance cost without a separate budget: a visit can only cover one cell's
 	// worth of distance, so the "max_steps PER INSTANCE" blowup largely disappears on its own.
 	float t_cell_enter = t_enter;
+	// LOOP: the walk body carries the whole per-instance sphere trace (see the compile-time
+	// note at the mesh march above).
+	LOOP
 	for(int visited = 0; visited < SDF_GRID_MAX_STEPS; ++visited)
 	{
 		float t_step = min(t_next.x, min(t_next.y, t_next.z));
@@ -866,6 +880,7 @@ SdfRayHit SdfTraceInstances(vec3 origin, vec3 direction, float t_min, float t_ma
 		int cell_index = int(cell_f.x + cell_f.y * dim.x + cell_f.z * dim.x * dim.y);
 		uint begin = b_sdf_grid_offsets[cell_index];
 		uint end = b_sdf_grid_offsets[cell_index + 1];
+		LOOP
 		for(uint entry_index = begin; entry_index < end; ++entry_index)
 		{
 			SdfTestInstance(int(b_sdf_grid_instances[entry_index]), origin, direction, inv_dir,
@@ -908,7 +923,7 @@ SdfRayHit SdfTraceInstances(vec3 origin, vec3 direction, float t_min, float t_ma
 
 SdfRayHit SdfTraceClipmap(vec3 origin, vec3 direction, float t_min, float t_max, int max_steps,
                           float surface_bias, float relaxation, bool want_normal, float expand_start,
-                          bool expand_full)
+                          bool expand_full, bool want_normal_on_exhaustion)
 {
 	SdfRayHit result = SdfMakeMiss();
 	if(!u_sdf_clipmap_enabled || t_min >= t_max)
@@ -938,6 +953,9 @@ SdfRayHit SdfTraceClipmap(vec3 origin, vec3 direction, float t_min, float t_max,
 	float suppress_travel = 0.0;
 	bool first_sample = true;
 	bool from_origin = t_min <= 0.0;
+	// LOOP: see the compile-time note at the mesh march - this body additionally carries
+	// the coarse-level descent, so its unroll was the widest of all.
+	LOOP
 	for(int step = 0; step < max_steps; ++step)
 	{
 		if(t > t_max)
@@ -1160,7 +1178,11 @@ SdfRayHit SdfTraceClipmap(vec3 origin, vec3 direction, float t_min, float t_max,
 	{
 		result.clearance = 0.0;
 	}
-	if(want_normal)
+	// Gated separately from want_normal: a caller whose exhaustion path never consumes the
+	// normal (reflections fall back to the gather value on exhaustion) skips four full
+	// clipmap samples here. Every pre-existing caller passes want_normal through, so the
+	// default behaviour is unchanged.
+	if(want_normal_on_exhaustion)
 	{
 		vec3 p_exhausted = origin + direction * t;
 		float e_voxel;
@@ -1176,6 +1198,15 @@ SdfRayHit SdfTraceClipmap(vec3 origin, vec3 direction, float t_min, float t_max,
 		result.normal = len > 1e-8 ? n / len : vec3(0.0, 1.0, 0.0);
 	}
 	return result;
+}
+
+/// The prior full form: exhaustion keeps the normal whenever the caller wanted one.
+SdfRayHit SdfTraceClipmap(vec3 origin, vec3 direction, float t_min, float t_max, int max_steps,
+                          float surface_bias, float relaxation, bool want_normal, float expand_start,
+                          bool expand_full)
+{
+	return SdfTraceClipmap(origin, direction, t_min, t_max, max_steps, surface_bias, relaxation,
+	                       want_normal, expand_start, expand_full, want_normal);
 }
 
 /// The ramped-expand form every pre-existing caller means: full-from-launch is opt-in for
