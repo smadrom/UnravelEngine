@@ -4,6 +4,14 @@ set(target_name engine)
 
 add_library(${target_name} ${libsrc} ${shader_files})
 
+# PW_MAP v2 output hashes use BLAKE3. Keep the vendored C implementation
+# portable and independent of the engine's C++ precompiled header.
+set_source_files_properties(
+    pw/detail/blake3.c pw/detail/blake3_dispatch.c pw/detail/blake3_portable.c
+    PROPERTIES SKIP_PRECOMPILE_HEADERS ON
+    COMPILE_DEFINITIONS "BLAKE3_NO_SSE2;BLAKE3_NO_SSE41;BLAKE3_NO_AVX2;BLAKE3_NO_AVX512;BLAKE3_USE_NEON=0"
+)
+
 include(GenerateExportHeader)
 generate_export_header(${target_name})
 

@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace unravel
 {
@@ -918,7 +919,8 @@ auto mesh::create_heightfield(const gfx::vertex_layout& format,
                               float half_extent_z,
                               float height_scale,
                               mesh_create_origin origin,
-                              bool hardware_copy) -> bool
+                              bool hardware_copy,
+                              uint32_t stitch_block_grid) -> bool
 {
     (void)origin;
     const uint32_t sx = segments_x;
@@ -968,7 +970,27 @@ auto mesh::create_heightfield(const gfx::vertex_layout& format,
     math::quat rot(math::vec3(math::radians(-180.0f), 0.f, 0.0f));
     auto mesh = rotate_mesh(hf_mesh, rot);
     create_mesh(vertex_format_, mesh, preparation_data_, bbox_);
-    
+    if(stitch_block_grid != 0)
+    {
+        for(uint32_t z = 0; z < sz; ++z)
+        {
+            for(uint32_t x = 0; x < sx; ++x)
+            {
+                const uint32_t col = x % stitch_block_grid;
+                const uint32_t row = z % stitch_block_grid;
+                const bool reverse = (col == stitch_block_grid - 1 && row == 0) ||
+                                     (col == 0 && row == stitch_block_grid - 1);
+                if(reverse) continue;
+                const uint32_t tl = z * vx + x;
+                const uint32_t tr = tl + 1;
+                const uint32_t bl = tl + vx;
+                const uint32_t br = bl + 1;
+                const size_t first = (static_cast<size_t>(z) * sx + x) * 2;
+                preparation_data_.triangle_data[first].indices = {tl, tr, br};
+                preparation_data_.triangle_data[first + 1].indices = {tl, br, bl};
+            }
+        }
+    }
     return end_prepare_primitive(hardware_copy);
 }
 
@@ -1348,6 +1370,62 @@ void mesh::build_ib(bool hardware_copy)
         }
 
     } // End if hardware buffer required
+}
+
+auto mesh::upload_gpu_buffers() -> bool
+{
+    if(prepare_status_ != mesh_status::prepared || !system_vb_ || !system_ib_ || vertex_count_ == 0 ||
+       face_count_ == 0 || vertex_format_.getStride() == 0)
+    {
+        return false;
+    }
+    const uint64_t vertex_bytes = uint64_t(vertex_count_) * vertex_format_.getStride();
+    if(vertex_bytes > std::numeric_limits<uint32_t>::max())
+    {
+        return false;
+    }
+    const auto can_upload_indices = [](const uint32_t* indices, uint32_t faces) -> bool
+    {
+        return indices && faces > 0 && uint64_t(faces) * 3 * sizeof(uint32_t) <= std::numeric_limits<uint32_t>::max();
+    };
+    if(!can_upload_indices(system_ib_, face_count_) ||
+       !std::all_of(lods_.begin(), lods_.end(), [&](const auto& lod)
+       {
+           return can_upload_indices(lod.system_ib_, lod.face_count_);
+       }))
+    {
+        return false;
+    }
+    // Owned upload copies survive cancellation/destruction before bgfx consumes the command.
+    auto vertex_buffer = get_hardware_vb();
+    if(!vertex_buffer || !vertex_buffer->is_valid())
+    {
+        const uint16_t flags = BGFX_BUFFER_COMPUTE_READ | BGFX_BUFFER_COMPUTE_FORMAT_32X1 | BGFX_BUFFER_COMPUTE_TYPE_FLOAT;
+        const auto* memory = gfx::copy(system_vb_, static_cast<uint32_t>(vertex_bytes));
+        vertex_buffer = std::make_shared<gfx::vertex_buffer>(memory, vertex_format_, flags);
+        hardware_vb_ = vertex_buffer;
+    }
+    const auto upload_indices = [](std::shared_ptr<void>& hardware, const uint32_t* indices, uint32_t faces) -> bool
+    {
+        auto buffer = std::static_pointer_cast<gfx::index_buffer>(hardware);
+        if(!buffer || !buffer->is_valid())
+        {
+            const uint16_t flags = BGFX_BUFFER_INDEX32 | BGFX_BUFFER_COMPUTE_READ |
+                                   BGFX_BUFFER_COMPUTE_FORMAT_32X1 | BGFX_BUFFER_COMPUTE_TYPE_UINT;
+            const auto* memory = gfx::copy(indices, static_cast<uint32_t>(uint64_t(faces) * 3 * sizeof(uint32_t)));
+            buffer = std::make_shared<gfx::index_buffer>(memory, flags);
+            hardware = buffer;
+        }
+        return buffer->is_valid();
+    };
+    bool uploaded = vertex_buffer->is_valid();
+    uploaded &= upload_indices(hardware_ib_, system_ib_, face_count_);
+    for(auto& lod : lods_)
+    {
+        uploaded &= upload_indices(lod.hardware_ib_, lod.system_ib_, lod.face_count_);
+    }
+    hardware_mesh_ = uploaded;
+    return uploaded;
 }
 
 auto mesh::generate_adjacency(std::vector<uint32_t>& adjacency) -> bool

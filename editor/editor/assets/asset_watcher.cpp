@@ -35,7 +35,7 @@
 #include <logging/logging.h>
 
 #include <algorithm>
-#include <condition_variable>
+#include <thread>
 #include <set>
 
 namespace unravel
@@ -63,95 +63,23 @@ auto checking_for_recompilation_job_name() -> std::string
     return fmt::format("Checking for recompilation of {}", ex::get_type<T>());
 }
 
-class asset_compile_gate
+void wait_for_compiles(const std::shared_ptr<asset_task_queue>& queue,
+                       const asset_task_queue::scope_ptr& scope,
+                       int minimum_priority, const on_wait_progress_t& on_progress = {})
 {
-public:
-    class permit
+    while(true)
     {
-    public:
-        explicit permit(asset_compile_gate& gate)
-            : gate_(&gate)
-        {
-            gate_->acquire();
-        }
-
-        ~permit()
-        {
-            if(gate_ != nullptr)
-            {
-                gate_->release();
-            }
-        }
-
-        permit(const permit&) = delete;
-        auto operator=(const permit&) -> permit& = delete;
-
-        permit(permit&& other) noexcept
-            : gate_(other.gate_)
-        {
-            other.gate_ = nullptr;
-        }
-
-        auto operator=(permit&& other) noexcept -> permit&
-        {
-            if(this != &other)
-            {
-                if(gate_ != nullptr)
-                {
-                    gate_->release();
-                }
-                gate_ = other.gate_;
-                other.gate_ = nullptr;
-            }
-
-            return *this;
-        }
-
-    private:
-        asset_compile_gate* gate_{};
-    };
-
-    static auto instance() -> asset_compile_gate&
-    {
-        static asset_compile_gate gate;
-        return gate;
+        const auto progress = queue->snapshot(scope, minimum_priority);
+        if(!progress.busy()) break;
+        if(on_progress)
+            on_progress(progress.completed, progress.completed + progress.pending + progress.active,
+                        progress.name.empty() ? "Waiting for asset compiler" : progress.name);
+        // Compilation may publish metadata through main-thread callbacks.
+        tpp::this_thread::process();
+        std::this_thread::sleep_for(1ms);
     }
-
-    auto acquire_permit() -> permit
-    {
-        return permit(*this);
-    }
-
-private:
-    void acquire()
-    {
-        std::unique_lock lock(mutex_);
-        cv_.wait(lock, [this]() { return active_jobs_ < max_active_jobs; });
-        ++active_jobs_;
-    }
-
-    void release()
-    {
-        {
-            std::lock_guard lock(mutex_);
-            --active_jobs_;
-        }
-        cv_.notify_one();
-    }
-
-    static constexpr std::size_t max_active_jobs = 1;
-
-    std::mutex mutex_{};
-    std::condition_variable cv_{};
-    std::size_t active_jobs_{};
-};
-
-auto acquire_asset_compile_permit() -> asset_compile_gate::permit
-{
-    return asset_compile_gate::instance().acquire_permit();
+    tpp::this_thread::process();
 }
-
-
 
 auto get_absolute_source_path(const fs::path& source_file_path) -> fs::path
 {
@@ -302,7 +230,8 @@ auto check_files_integrity(const std::string& key, const fs::path& entry_path) -
 }
 
 template<typename T>
-auto watch_assets(rtti::context& ctx, const fs::path& dir, const fs::pattern_filter& filter, bool reload_async)
+auto watch_assets(rtti::context& ctx, const asset_task_queue::scope_ptr& scope,
+                  const fs::path& dir, const fs::pattern_filter& filter, bool reload_async)
     -> uint64_t
 {
     auto& am = ctx.get_cached<asset_manager>();
@@ -312,8 +241,9 @@ auto watch_assets(rtti::context& ctx, const fs::path& dir, const fs::pattern_fil
 
     fs::path watch_dir = fs::path(dir).make_preferred();
     hpp::source_location loc = hpp::source_location::current();
-    auto callback = [&am, &ts, &tm, &em, loc](const auto& entries, bool is_initial_list)
+    auto callback = [&am, &ts, &tm, &em, loc, scope](const auto& entries, bool is_initial_list)
     {
+        if(scope->cancelled) return;
         std::set<hpp::uuid> changed;
         std::set<hpp::uuid> removed;
         // Dependents of every UUID in `removed`, computed *before* unload.
@@ -383,8 +313,9 @@ auto watch_assets(rtti::context& ctx, const fs::path& dir, const fs::pattern_fil
         if(!changed.empty() || !removed.empty())
         {
             tpp::invoke(tpp::main_thread::get_id(),
-                        [&tm, &em, &am, changed, removed, removed_dependents]()
+                        [&tm, &em, &am, changed, removed, removed_dependents, scope]()
                         {
+                            if(scope->cancelled) return;
                             // A change in any of these types can visually
                             // affect a prefab thumbnail (texture in a
                             // material, material on a mesh, mesh in a
@@ -433,16 +364,16 @@ auto watch_assets(rtti::context& ctx, const fs::path& dir, const fs::pattern_fil
 }
 
 template<typename T>
-auto watch_assets_depenencies(rtti::context& ctx, const fs::path& dir, const fs::pattern_filter& filter) -> uint64_t
+auto watch_assets_depenencies(rtti::context& ctx, const std::shared_ptr<asset_task_queue>& queue,
+                             const asset_task_queue::scope_ptr& scope,
+                             const fs::path& dir, const fs::pattern_filter& filter) -> uint64_t
 {
     auto& am = ctx.get_cached<asset_manager>();
-    auto& ts = ctx.get_cached<threader>();
-
     fs::path watch_dir = fs::path(dir).make_preferred();
 
-    auto callback = [&am, &ts](const auto& entries, bool is_initial_list)
+    auto callback = [&am, queue, scope](const auto& entries, bool is_initial_list)
     {
-        if(is_initial_list)
+        if(is_initial_list || scope->cancelled)
         {
             return;
         }
@@ -461,12 +392,14 @@ auto watch_assets_depenencies(rtti::context& ctx, const fs::path& dir, const fs:
                 }
                 else // created or modified
                 {
-                    auto task = ts.pool->schedule(checking_dependencies_job_name<T>(),
-                                                  [&am, entry]()
+                    queue->enqueue(scope, "dependencies:" + entry.path.generic_string(), checking_dependencies_job_name<T>(), 2,
+                                                  [&am, entry, scope]()
                                                   {
+                                                      if(scope->cancelled) return;
                                                       auto assets = am.get_assets<T>();
                                                       for(const auto& asset : assets)
                                                       {
+                                                          if(scope->cancelled) return;
                                                           auto meta = am.get_metadata(asset.uid());
                                                           auto absolute_path = fs::resolve_protocol(meta.location);
 
@@ -491,16 +424,18 @@ auto watch_assets_depenencies(rtti::context& ctx, const fs::path& dir, const fs:
 
 template<typename T>
 static void add_to_syncer(rtti::context& ctx,
+                          const std::shared_ptr<asset_task_queue>& queue,
+                          const asset_task_queue::scope_ptr& scope,
                           fs::syncer& syncer,
                           const fs::syncer::on_entry_removed_t& on_removed,
                           const fs::syncer::on_entry_renamed_t& on_renamed)
 {
-    auto& ts = ctx.get_cached<threader>();
     auto& am = ctx.get_cached<asset_manager>();
 
     auto on_modified =
-        [&ts, &am](const std::string& ext, const auto& ref_path, const auto& synced_paths, bool is_initial_listing)
+        [queue, scope, &am](const std::string& ext, const auto& ref_path, const auto& synced_paths, bool is_initial_listing)
     {
+        if(scope->cancelled) return;
         auto paths = remove_meta_tag(synced_paths);
 
         for(const auto& output : paths)
@@ -513,13 +448,24 @@ static void add_to_syncer(rtti::context& ctx,
             auto key = get_asset_key(output);
             if(check_files_integrity(key, output))
             {
-                auto job_name = fmt::format("Compiling {}", ex::get_type<T>());
-                auto task = ts.pool->schedule(job_name,
+                if constexpr(std::is_same_v<T, script> || std::is_same_v<T, scene_prefab> || std::is_same_v<T, prefab>)
+                {
+                    // Project bootstrap enumerates scripts and immediately opens
+                    // its saved scene/prefabs. Their copy/minify step must finish
+                    // before initial compiled-asset registration; mesh and texture
+                    // conversion remains asynchronous and does not block this.
+                    if(!asset_compiler::compile<T>(am, ref_path, output))
+                        APPLOG_ERROR("Project bootstrap asset compilation failed: {}", output.string());
+                    continue;
+                }
+                auto job_name = fmt::format("Compiling {} - {}", ex::get_type<T>(), output.string());
+                constexpr int compile_priority = std::is_same_v<T, gfx::texture> || std::is_same_v<T, material> ? 2 : 1;
+                queue->enqueue(scope, output.generic_string(), job_name, compile_priority,
                                               [&am, ref_path, output, job_name]()
                                               {
-                                                  auto compile_permit = acquire_asset_compile_permit();
                                                   APPLOG_TRACE_PERF_NAMED_ALLOC(std::chrono::milliseconds, fmt::format("{} - {}", job_name, output.string()));
-                                                  asset_compiler::compile<T>(am, ref_path, output);
+                                                  if(!asset_compiler::compile<T>(am, ref_path, output))
+                                                      APPLOG_ERROR("Asset compilation failed: {}", output.string());
                                               });
             }
         }
@@ -537,27 +483,30 @@ static void add_to_syncer(rtti::context& ctx,
 }
 
 template<typename T>
-static void watch_synced(rtti::context& ctx, std::vector<uint64_t>& watchers, const fs::path& dir)
+static void watch_synced(rtti::context& ctx, const asset_task_queue::scope_ptr& scope,
+                         std::vector<uint64_t>& watchers, const fs::path& dir)
 {
     for(const auto& type : ex::get_suported_formats<T>())
     {
-        const auto watch_id = watch_assets<T>(ctx, dir, fs::pattern_filter("*" + type + ".asset"), true);
+        const auto watch_id = watch_assets<T>(ctx, scope, dir, fs::pattern_filter("*" + type + ".asset"), true);
         watchers.push_back(watch_id);
     }
 }
 
 template<>
 void add_to_syncer<gfx::shader>(rtti::context& ctx,
+                                const std::shared_ptr<asset_task_queue>& queue,
+                                const asset_task_queue::scope_ptr& scope,
                                 fs::syncer& syncer,
                                 const fs::syncer::on_entry_removed_t& on_removed,
                                 const fs::syncer::on_entry_renamed_t& on_renamed)
 {
-    auto& ts = ctx.get_cached<threader>();
     auto& am = ctx.get_cached<asset_manager>();
 
     auto on_modified =
-        [&ts, &am](const std::string& ext, const auto& ref_path, const auto& synced_paths, bool is_initial_listing)
+        [queue, scope, &am](const std::string& ext, const auto& ref_path, const auto& synced_paths, bool is_initial_listing)
     {
+        if(scope->cancelled) return;
         auto paths = remove_meta_tag(synced_paths);
         if(paths.empty())
         {
@@ -585,16 +534,12 @@ void add_to_syncer<gfx::shader>(rtti::context& ctx,
             if(check_files_integrity(key, output))
             {
                 bool high_priority = gfx::get_current_renderer_filename_extension() == extension;
-                tpp::priority::group priority = high_priority ? tpp::priority::normal() : tpp::priority::low();
-
-                auto job_name = fmt::format("Compiling {}", ex::get_type<gfx::shader>() + "(" + extension + ")");
-                auto task = ts.pool->schedule(job_name,
-                                              priority,
+                auto job_name = fmt::format("Compiling {}({}) - {}", ex::get_type<gfx::shader>(), extension, output.string());
+                queue->enqueue(scope, output.generic_string(), job_name, high_priority ? 2 : 0,
                                               [&am, ref_path, output, job_name]()
                                               {
-                                                  auto compile_permit = acquire_asset_compile_permit();
-                                                //   APPLOG_TRACE_PERF_NAMED_ALLOC(std::chrono::milliseconds, fmt::format("{} - {}", job_name, output.string()));
-                                                  asset_compiler::compile<gfx::shader>(am, ref_path, output);
+                                                  if(!asset_compiler::compile<gfx::shader>(am, ref_path, output))
+                                                      APPLOG_ERROR("Shader compilation failed: {}", output.string());
                                               });
             }
         }
@@ -619,13 +564,14 @@ void add_to_syncer<gfx::shader>(rtti::context& ctx,
 }
 
 template<>
-void watch_synced<gfx::shader>(rtti::context& ctx, std::vector<uint64_t>& watchers, const fs::path& dir)
+void watch_synced<gfx::shader>(rtti::context& ctx, const asset_task_queue::scope_ptr& scope,
+                              std::vector<uint64_t>& watchers, const fs::path& dir)
 {
     const auto& renderer_extension = gfx::get_current_renderer_filename_extension();
     for(const auto& type : ex::get_suported_formats<gfx::shader>())
     {
         const auto watch_id =
-            watch_assets<gfx::shader>(ctx, dir, fs::pattern_filter("*" + type + ".asset" + renderer_extension), true);
+            watch_assets<gfx::shader>(ctx, scope, dir, fs::pattern_filter("*" + type + ".asset" + renderer_extension), true);
         watchers.push_back(watch_id);
     }
 }
@@ -660,6 +606,7 @@ void asset_watcher::setup_directory(rtti::context& ctx, fs::syncer& syncer)
 }
 
 void asset_watcher::setup_meta_syncer(rtti::context& ctx,
+                                       const asset_task_queue::scope_ptr& compile_scope,
                                       std::vector<uint64_t>& watchers,
                                       fs::syncer& syncer,
                                       const fs::path& data_dir,
@@ -755,13 +702,13 @@ void asset_watcher::setup_meta_syncer(rtti::context& ctx,
 
     for(const auto& dep_ex : ex::get_suported_dependencies_formats<gfx::shader>())
     {
-        auto id = watch_assets_depenencies<gfx::shader>(ctx, data_dir, fs::pattern_filter("*" + dep_ex));
+        auto id = watch_assets_depenencies<gfx::shader>(ctx, compile_queue_, compile_scope, data_dir, fs::pattern_filter("*" + dep_ex));
         watchers.emplace_back(id);
     }
 
     for(const auto& dep_ex : ex::get_suported_dependencies_formats<ui_tree>())
     {
-        auto id = watch_assets_depenencies<ui_tree>(ctx, data_dir, fs::pattern_filter("*" + dep_ex));
+        auto id = watch_assets_depenencies<ui_tree>(ctx, compile_queue_, compile_scope, data_dir, fs::pattern_filter("*" + dep_ex));
         watchers.emplace_back(id);
     }
 
@@ -775,24 +722,13 @@ void asset_watcher::setup_meta_syncer(rtti::context& ctx,
 
     syncer.sync(data_dir, meta_dir, on_sync_progress);
 
-    if(wait)
-    {
-        auto& ts = ctx.get_cached<threader>();
-        APPLOG_TRACE("Waiting for jobs to complete... (this may take a while)");
-
-        
-        ts.pool->wait_all_polling(tpp::priority::category::normal,
-                          [&on_progress](const tpp::thread_pool::progress_info& info)
-                          {
-                              if(on_progress)
-                              {
-                                  on_progress(info.current_job, info.total_jobs, info.name);
-                              }
-                          });
-    }
+    // Metadata registration above is synchronous. Do not wait for unrelated
+    // compilation jobs here; the cache stage owns its own bootstrap drain.
+    (void)wait;
 }
 
 void asset_watcher::setup_cache_syncer(rtti::context& ctx,
+                                       const asset_task_queue::scope_ptr& compile_scope,
                                        std::vector<uint64_t>& watchers,
                                        fs::syncer& syncer,
                                        const fs::path& meta_dir,
@@ -829,19 +765,19 @@ void asset_watcher::setup_cache_syncer(rtti::context& ctx,
         }
     };
 
-    add_to_syncer<gfx::texture>(ctx, syncer, on_removed, on_renamed);
-    add_to_syncer<gfx::shader>(ctx, syncer, on_removed, on_renamed);
-    add_to_syncer<mesh>(ctx, syncer, on_removed, on_renamed);
-    add_to_syncer<material>(ctx, syncer, on_removed, on_renamed);
-    add_to_syncer<animation_clip>(ctx, syncer, on_removed, on_renamed);
-    add_to_syncer<prefab>(ctx, syncer, on_removed, on_renamed);
-    add_to_syncer<scene_prefab>(ctx, syncer, on_removed, on_renamed);
-    add_to_syncer<physics_material>(ctx, syncer, on_removed, on_renamed);
-    add_to_syncer<audio_clip>(ctx, syncer, on_removed, on_renamed);
-    add_to_syncer<font>(ctx, syncer, on_removed, on_renamed);
-    add_to_syncer<script>(ctx, syncer, on_removed, on_renamed);
-    add_to_syncer<ui_tree>(ctx, syncer, on_removed, on_renamed);
-    add_to_syncer<style_sheet>(ctx, syncer, on_removed, on_renamed);
+    add_to_syncer<gfx::texture>(ctx, compile_queue_, compile_scope, syncer, on_removed, on_renamed);
+    add_to_syncer<gfx::shader>(ctx, compile_queue_, compile_scope, syncer, on_removed, on_renamed);
+    add_to_syncer<mesh>(ctx, compile_queue_, compile_scope, syncer, on_removed, on_renamed);
+    add_to_syncer<material>(ctx, compile_queue_, compile_scope, syncer, on_removed, on_renamed);
+    add_to_syncer<animation_clip>(ctx, compile_queue_, compile_scope, syncer, on_removed, on_renamed);
+    add_to_syncer<prefab>(ctx, compile_queue_, compile_scope, syncer, on_removed, on_renamed);
+    add_to_syncer<scene_prefab>(ctx, compile_queue_, compile_scope, syncer, on_removed, on_renamed);
+    add_to_syncer<physics_material>(ctx, compile_queue_, compile_scope, syncer, on_removed, on_renamed);
+    add_to_syncer<audio_clip>(ctx, compile_queue_, compile_scope, syncer, on_removed, on_renamed);
+    add_to_syncer<font>(ctx, compile_queue_, compile_scope, syncer, on_removed, on_renamed);
+    add_to_syncer<script>(ctx, compile_queue_, compile_scope, syncer, on_removed, on_renamed);
+    add_to_syncer<ui_tree>(ctx, compile_queue_, compile_scope, syncer, on_removed, on_renamed);
+    add_to_syncer<style_sheet>(ctx, compile_queue_, compile_scope, syncer, on_removed, on_renamed);
 
     auto on_sync_progress = [on_progress](size_t completed, size_t total, const std::string& current_job)
     {
@@ -853,33 +789,21 @@ void asset_watcher::setup_cache_syncer(rtti::context& ctx,
     syncer.sync(meta_dir, cache_dir, on_sync_progress);
 
     if(wait)
-    {
-        auto& ts = ctx.get_cached<threader>();
-        APPLOG_TRACE("Waiting for jobs to complete... (this may take a while)");
-        hpp::source_location loc = hpp::source_location::current();
-        ts.pool->wait_all_polling(tpp::priority::category::normal,
-                          [&on_progress](const tpp::thread_pool::progress_info& info)
-                          {
-                              if(on_progress)
-                              {
-                                  on_progress(info.current_job, info.total_jobs, info.name);
-                              }
-                          });
-    }
+        wait_for_compiles(compile_queue_, compile_scope, 1, on_progress);
 
-    watch_synced<gfx::texture>(ctx, watchers, cache_dir);
-    watch_synced<gfx::shader>(ctx, watchers, cache_dir);
-    watch_synced<mesh>(ctx, watchers, cache_dir);
-    watch_synced<material>(ctx, watchers, cache_dir);
-    watch_synced<animation_clip>(ctx, watchers, cache_dir);
-    watch_synced<prefab>(ctx, watchers, cache_dir);
-    watch_synced<scene_prefab>(ctx, watchers, cache_dir);
-    watch_synced<physics_material>(ctx, watchers, cache_dir);
-    watch_synced<audio_clip>(ctx, watchers, cache_dir);
-    watch_synced<font>(ctx, watchers, cache_dir);
-    watch_synced<script>(ctx, watchers, cache_dir);
-    watch_synced<ui_tree>(ctx, watchers, cache_dir);
-    watch_synced<style_sheet>(ctx, watchers, cache_dir);
+    watch_synced<gfx::texture>(ctx, compile_scope, watchers, cache_dir);
+    watch_synced<gfx::shader>(ctx, compile_scope, watchers, cache_dir);
+    watch_synced<mesh>(ctx, compile_scope, watchers, cache_dir);
+    watch_synced<material>(ctx, compile_scope, watchers, cache_dir);
+    watch_synced<animation_clip>(ctx, compile_scope, watchers, cache_dir);
+    watch_synced<prefab>(ctx, compile_scope, watchers, cache_dir);
+    watch_synced<scene_prefab>(ctx, compile_scope, watchers, cache_dir);
+    watch_synced<physics_material>(ctx, compile_scope, watchers, cache_dir);
+    watch_synced<audio_clip>(ctx, compile_scope, watchers, cache_dir);
+    watch_synced<font>(ctx, compile_scope, watchers, cache_dir);
+    watch_synced<script>(ctx, compile_scope, watchers, cache_dir);
+    watch_synced<ui_tree>(ctx, compile_scope, watchers, cache_dir);
+    watch_synced<style_sheet>(ctx, compile_scope, watchers, cache_dir);
 }
 
 asset_watcher::asset_watcher()
@@ -917,6 +841,12 @@ auto asset_watcher::init(rtti::context& ctx) -> bool
 {
     APPLOG_TRACE("{}::{}", hpp::type_name_str(*this), __func__);
 
+    auto& threads = ctx.get_cached<threader>();
+    compile_queue_ = std::make_shared<asset_task_queue>([&threads](const std::string& name, int priority, asset_task_queue::task work)
+    {
+        threads.pool->schedule(name, priority > 0 ? tpp::priority::normal() : tpp::priority::low(), std::move(work));
+    });
+
     auto& ev = ctx.get_cached<events>();
     ev.on_os_event.connect(sentinel_, 1000, this, &asset_watcher::on_os_event);
 
@@ -927,6 +857,16 @@ auto asset_watcher::deinit(rtti::context& ctx) -> bool
 {
     APPLOG_TRACE("{}::{}", hpp::type_name_str(*this), __func__);
 
+    // No queued compiler may outlive asset_manager/threader or app:/ rebinding.
+    for(auto& [protocol, state] : watched_protocols_)
+        if(compile_queue_) compile_queue_->cancel(state.compile_scope);
+    while(!watched_protocols_.empty())
+    {
+        const std::string protocol = watched_protocols_.begin()->first;
+        unwatch_assets(ctx, protocol);
+    }
+    compile_queue_.reset();
+
     return true;
 }
 
@@ -936,13 +876,16 @@ void asset_watcher::watch_assets(rtti::context& ctx,
                                  const on_wait_progress_t& on_progress)
 {
     auto start_time = std::chrono::steady_clock::now();
+    if(watched_protocols_.count(protocol)) unwatch_assets(ctx, protocol);
     auto& w = watched_protocols_[protocol];
+    w.compile_scope = compile_queue_->create_scope();
 
     auto data_protocol = ex::get_data_directory_no_slash(protocol);
     auto meta_protocol = ex::get_meta_directory_no_slash(protocol);
     auto cache_protocol = ex::get_compiled_directory_no_slash(protocol);
 
     setup_meta_syncer(ctx,
+                      w.compile_scope,
                       w.watchers,
                       w.meta_syncer,
                       fs::resolve_protocol(data_protocol),
@@ -951,6 +894,7 @@ void asset_watcher::watch_assets(rtti::context& ctx,
                       on_progress);
 
     setup_cache_syncer(ctx,
+                       w.compile_scope,
                        w.watchers,
                        w.cache_syncer,
                        fs::resolve_protocol(meta_protocol),
@@ -972,10 +916,19 @@ void asset_watcher::unwatch_assets(rtti::context& ctx, const std::string& protoc
     }
 
     auto& w = it->second;
-
+    if(compile_queue_) compile_queue_->cancel(w.compile_scope);
     unwatch(w.watchers);
     w.meta_syncer.unsync();
     w.cache_syncer.unsync();
+
+    // Cancel unstarted old-generation requests. A running compile still owns
+    // source/metadata side effects, so drain just that work before unloading
+    // the group or letting project_manager bind app:/ to another directory.
+    if(compile_queue_)
+    {
+        compile_queue_->cancel(w.compile_scope);
+        wait_for_compiles(compile_queue_, w.compile_scope, 0);
+    }
 
     watched_protocols_.erase(it);
 
@@ -986,7 +939,7 @@ void asset_watcher::unwatch_assets(rtti::context& ctx, const std::string& protoc
 auto asset_watcher::get_pending_jobs_count(rtti::context& ctx) const -> size_t
 {
     auto& ts = ctx.get_cached<threader>();
-    return ts.pool->get_jobs_count();
+    return ts.pool->get_jobs_count() + (compile_queue_ ? compile_queue_->snapshot().pending : 0);
 }
 
 void asset_watcher::recreate_meta_files(rtti::context& ctx, const std::string& protocol)

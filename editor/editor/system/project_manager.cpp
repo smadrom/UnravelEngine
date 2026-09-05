@@ -165,7 +165,9 @@ auto project_manager::open_project(rtti::context& ctx, const fs::path& project_p
     auto& ls = ctx.get_cached<loading_screen>();
     ls.begin_module("Opening project");
     auto& aw = ctx.get_cached<asset_watcher>();
-    aw.watch_assets(ctx, "app:/", true, [&ls](size_t completed, size_t total, const std::string& job) -> void
+    // Register source metadata now; compile the complete project incrementally.
+    // Consumers poll actual asset readiness while the editor stays responsive.
+    aw.watch_assets(ctx, "app:/", false, [&ls](size_t completed, size_t total, const std::string& job) -> void
     {
         ls.progress(completed, total, job);
     });

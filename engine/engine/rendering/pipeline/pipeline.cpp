@@ -23,6 +23,7 @@
 #include <engine/rendering/pipeline/volume_resolver.h>
 #include <engine/rendering/ecs/components/particle_emitter_component.h>
 #include <engine/rendering/ecs/systems/particle_system.h>
+#include <engine/pw/pw_effect_geometry.h>
 #include <RmlUi/Core/ElementDocument.h>
 
 #include <graphics/graphics.h>
@@ -92,6 +93,7 @@ auto pipeline::init(rtti::context& ctx) -> bool
 
     particle_program_instanced_ = load_program("particles/instanced/vs_particle_instanced", "particles/instanced/fs_particle_instanced");
     particle_program_instanced_mask_ = load_program("particles/instanced/vs_particle_instanced", "particles/instanced/fs_particle_instanced_mask");
+    pw_effect_program_ = load_program("pw/vs_pw_effect", "pw/fs_pw_effect");
     world_quad_program_ = load_program("rmlui_world/vs_world_quad", "rmlui_world/fs_world_quad");
 
     return true;
@@ -587,6 +589,8 @@ void pipeline::run_particle_pass(scene& scn, const camera& camera, gfx::render_v
 
     stats_.drawn_particles = 0;
     stats_.drawn_particles_batches = 0;
+    if(pw_effect_program_)
+        render_pw_effect_geometry(scn, camera, pass.id, *pw_effect_program_);
 
     if(particle_program_instanced_ && particle_program_instanced_mask_ && particle_program_instanced_->begin() && particle_program_instanced_mask_->begin())
     {
@@ -740,6 +744,26 @@ void pipeline::run_particle_pass(scene& scn, const camera& camera, gfx::render_v
 
         particle_program_instanced_->end();
         particle_program_instanced_mask_->end();
+    }
+    if(pw_effect_program_ && lbuffer_depth && has_pw_warp_geometry(scn))
+    {
+        // Refraction must sample a completed color copy, never its active render target.
+        const auto size = lbuffer_depth->get_size();
+        const auto format = lbuffer_depth->get_texture()->info.format;
+        auto& source_texture = rview.tex_get_or_emplace("PW_WARP_SOURCE");
+        auto& source_fbo = rview.fbo_get_or_emplace("PW_WARP_SOURCE");
+        if(gfx::needs_recreate(source_texture, size, format))
+        {
+            source_fbo.reset();
+            source_texture = std::make_shared<gfx::texture>(size.width, size.height, false, 1, format,
+                                                           BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
+        }
+        if(!source_fbo) source_fbo = std::make_shared<gfx::frame_buffer>(std::vector<gfx::texture::ptr>{source_texture});
+        blit_pass_.run(rview, {lbuffer_depth, source_fbo});
+        gfx::render_pass warp_pass("PW/Refraction");
+        warp_pass.bind(lbuffer_depth.get());
+        warp_pass.set_view_proj(view, proj);
+        render_pw_effect_geometry(scn, camera, warp_pass.id, *pw_effect_program_, source_texture.get(), true);
     }
 }
 

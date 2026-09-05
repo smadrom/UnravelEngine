@@ -272,6 +272,16 @@ struct asset_handle
     }
 
     /**
+     * @brief Starts a deferred load and returns only successfully loaded data, without waiting.
+     * Unlike get(false), this never returns the shared empty fallback on failure or while loading.
+     */
+    auto get_if_ready() const -> std::shared_ptr<T>
+    {
+        get(false);
+        return peek();
+    }
+
+    /**
      * @brief Checks if the handle references a task.
      */
     auto is_valid() const -> bool

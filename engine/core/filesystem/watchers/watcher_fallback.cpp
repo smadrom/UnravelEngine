@@ -9,7 +9,6 @@
 #include <unordered_set>
 #include <utility>
 #include <base/platform/thread.hpp>
-#include <hpp/event.hpp>
 
 namespace fs
 {
@@ -21,6 +20,94 @@ namespace
 void log_path(const fs::path& /*unused*/)
 {
 }
+
+// Each subscription owns its callback while an emission is in progress.
+// Disconnect closes admission first, then waits outside the subscriber-map lock.
+class callback_slot
+{
+public:
+    using callback = std::function<void(const std::vector<watcher::entry>&)>;
+    explicit callback_slot(callback work) : work_(std::move(work)) {}
+
+    void invoke(const std::vector<watcher::entry>& entries)
+    {
+        const auto thread = std::this_thread::get_id();
+        {
+            std::lock_guard lock(mutex_);
+            if(closed_) return;
+            ++active_;
+            ++threads_[thread];
+        }
+        try { work_(entries); }
+        catch(...) { finish(thread); throw; }
+        finish(thread);
+    }
+
+    void close()
+    {
+        std::unique_lock lock(mutex_);
+        closed_ = true;
+        const auto own = threads_.find(std::this_thread::get_id());
+        const size_t own_calls = own == threads_.end() ? 0 : own->second;
+        // A callback may unwatch itself. Its owning shared_ptr keeps it alive
+        // through return; only callbacks on other threads must be drained here.
+        cv_.wait(lock, [&] { return active_ <= own_calls; });
+    }
+
+private:
+    void finish(const std::thread::id& thread)
+    {
+        std::lock_guard lock(mutex_);
+        --active_;
+        auto own = threads_.find(thread);
+        if(--own->second == 0) threads_.erase(own);
+        cv_.notify_all();
+    }
+    callback work_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::map<std::thread::id, size_t> threads_;
+    size_t active_ = 0;
+    bool closed_ = false;
+};
+
+class callback_list
+{
+public:
+    auto connect(callback_slot::callback work) -> uint64_t
+    {
+        std::lock_guard lock(mutex_);
+        const auto key = ++next_key_;
+        slots_.emplace(key, std::make_shared<callback_slot>(std::move(work)));
+        return key;
+    }
+    void disconnect(uint64_t key)
+    {
+        std::shared_ptr<callback_slot> slot;
+        {
+            std::lock_guard lock(mutex_);
+            const auto found = slots_.find(key);
+            if(found == slots_.end()) return;
+            slot = std::move(found->second);
+            slots_.erase(found);
+        }
+        slot->close();
+    }
+    void emit(const std::vector<watcher::entry>& entries)
+    {
+        std::vector<std::shared_ptr<callback_slot>> snapshot;
+        {
+            std::lock_guard lock(mutex_);
+            snapshot.reserve(slots_.size());
+            for(const auto& [key, slot] : slots_) snapshot.push_back(slot);
+        }
+        for(const auto& slot : snapshot) slot->invoke(entries);
+    }
+private:
+    std::mutex mutex_;
+    uint64_t next_key_ = 0;
+    std::map<uint64_t, std::shared_ptr<callback_slot>> slots_;
+};
 
 } // namespace
 
@@ -453,7 +540,7 @@ public:
     }
 
     /// Event that emits changes to all connected impls
-    hpp::event<void(const std::vector<watcher::entry>&)> on_changes;
+    callback_list on_changes;
     
     auto get_path() const -> const fs::path&
     {
@@ -488,7 +575,7 @@ private:
     observed_changes buffered_changes_;
 };
 
-class watcher_fallback::impl
+class watcher_fallback::impl : public std::enable_shared_from_this<watcher_fallback::impl>
 {
 public:
     impl(const fs::path& path,
@@ -509,19 +596,29 @@ public:
     {
         // Initialize entries cache and optionally emit initial list
         initialize_entries(initial_list);
-        
+    }
+
+    void connect()
+    {
         // Connect to the listener's changes
-        slot_key_ = listener_->on_changes.connect([this](const std::vector<watcher::entry>& changes) -> void
+        const auto weak = weak_from_this();
+        slot_key_ = listener_->on_changes.connect([weak](const std::vector<watcher::entry>& changes) -> void
         {
-            handle_changes(changes);
+            if(const auto owner = weak.lock()) owner->handle_changes(changes);
         });
     }
     
     ~impl()
     {
-        if(listener_)
+        disconnect();
+    }
+
+    void disconnect()
+    {
+        if(listener_ && slot_key_ != 0)
         {
             listener_->on_changes.disconnect(slot_key_);
+            slot_key_ = 0;
         }
     }
     
@@ -872,6 +969,7 @@ auto watcher_fallback::watch_impl(const fs::path& path,
     static std::atomic<std::uint64_t> free_id = {1};
     auto key = free_id++;
     auto impl = std::make_shared<watcher_fallback::impl>(path, filter, recursive, initial_list, poll_interval, std::move(callback), listener, watcher_name);
+    impl->connect();
     {
         std::lock_guard<std::mutex> lock(mutex_);
         watchers_[key] = impl;
@@ -913,21 +1011,31 @@ void watcher_fallback::prune_stale_listeners()
 
 void watcher_fallback::unwatch_impl(std::uint64_t key)
 {
+    std::shared_ptr<impl> retired;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        watchers_.erase(key);
+        const auto found = watchers_.find(key);
+        if(found != watchers_.end())
+        {
+            retired = std::move(found->second);
+            watchers_.erase(found);
+        }
         prune_stale_listeners();
     }
+    // User callbacks may call watch/unwatch; never wait with mutex_ held.
+    if(retired) retired->disconnect();
     cv_.notify_all();
 }
 
 void watcher_fallback::unwatch_all_impl()
 {
+    std::map<std::uint64_t, std::shared_ptr<impl>> retired;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        watchers_.clear();
+        retired.swap(watchers_);
         directory_listeners_.clear();
     }
+    for(const auto& [key, value] : retired) value->disconnect();
     cv_.notify_all();
 }
 

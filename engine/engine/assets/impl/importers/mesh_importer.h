@@ -8,6 +8,12 @@ namespace unravel
 {
 namespace importer
 {
+/** Source-specific build capabilities. User settings still control optional work. */
+struct source_mesh_policy
+{
+    bool generate_lods = true;
+    bool generate_sdf = true;
+};
 struct imported_material
 {
     std::string name;
@@ -30,7 +36,8 @@ bool load_mesh_data_from_file(asset_manager& am,
                               mesh::load_data& load_data,
                               std::vector<animation_clip>& animations,
                               std::vector<imported_material>& materials,
-                              std::vector<imported_texture>& textures);
+                              std::vector<imported_texture>& textures,
+                              source_mesh_policy* source_policy = nullptr);
 
 /// External sidecar files required by a multi-file mesh source (.gltf buffers/images, .obj mtllib).
 /// Used by the importer wait path and by asset_compiler::resolve_dependencies<mesh>.

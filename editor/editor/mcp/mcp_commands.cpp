@@ -736,7 +736,7 @@ auto make_load_map_result(rtti::context& ctx, mcp_system& sys, const json& param
         throw std::runtime_error("load_map: failed to load '" + path + "'");
     }
 
-    sys.invalidate_camera();
+    sys.invalidate_camera(ctx);
 
     json result;
     result["ok"] = true;
@@ -765,6 +765,23 @@ auto make_login_status_result(const mcp_system::login_load_status& status) -> js
     result["water_created"] = status.water_created;
     result["water_skipped"] = status.water_skipped;
     result["terrain"] = status.terrain;
+    result["grass_total"] = status.grass_total;
+    result["grass_created"] = status.grass_created;
+    result["grass_blades"] = status.grass_blades;
+    result["ecmodels_total"] = status.ecmodels_total;
+    result["ecmodels_created"] = status.ecmodels_created;
+    result["effects_total"] = status.effects_total;
+    result["effects_created"] = status.effects_created;
+    result["ready_effect_ids"] = status.ready_effect_ids;
+    result["ready_grass_ids"] = status.ready_grass_ids;
+    result["ready_ecmodel_ids"] = status.ready_ecmodel_ids;
+    result["full"] = status.full;
+    result["generation"] = status.generation;
+    result["active_map"] = status.active_map;
+    result["duplicate_references"] = status.duplicate_references;
+    result["water_duplicate_references"] = status.water_duplicate_references;
+    result["ready_building_ids"] = status.ready_building_ids;
+    result["ready_water_ids"] = status.ready_water_ids;
     result["current_index"] = status.current_index;
     if(status.has_current)
     {
@@ -809,7 +826,8 @@ auto make_load_login_result(rtti::context& ctx, mcp_system& sys, const json& par
     }
 
     const bool restart = params.value("restart", false);
-    sys.start_map_load(ctx, content_root, map_slug, static_cast<uint32_t>(chunk_size), restart);
+    const bool require_full = params.value("require_full", true);
+    sys.start_map_load(ctx, content_root, map_slug, static_cast<uint32_t>(chunk_size), restart, require_full);
     const auto status = sys.get_login_load_status();
     if(!status.start_error.empty())
     {

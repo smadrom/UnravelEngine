@@ -10,6 +10,7 @@
 #include <editor/system/project_manager.h>
 #include <engine/assets/asset_manager.h>
 #include <engine/assets/impl/asset_extensions.h>
+#include <engine/assets/impl/asset_reader.h>
 #include <engine/assets/impl/asset_writer.h>
 #include <engine/ecs/components/prefab_component.h>
 #include <engine/ecs/components/tag_component.h>
@@ -91,17 +92,20 @@ auto matches_asset_extension(const std::string& ext) -> bool
 template<typename T>
 auto poll_handle_ready(asset_manager& am, const std::string& key, std::chrono::milliseconds timeout) -> bool
 {
-    auto handle = am.get_asset<T>(key);
     const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while(std::chrono::steady_clock::now() < deadline)
+    do
     {
-        if(handle && handle.is_ready())
+        // Refresh the handle after a watcher reload, and submit deferred jobs without waiting.
+        if(am.get_asset<T>(key).get_if_ready())
         {
             return true;
         }
+        if(std::chrono::steady_clock::now() >= deadline)
+        {
+            return false;
+        }
         tpp::this_thread::sleep_for(std::chrono::milliseconds(32));
-    }
-    return handle && handle.is_ready();
+    } while(true);
 }
 
 auto try_wait_asset_ready(rtti::context& ctx, const std::string& key, std::chrono::milliseconds timeout) -> bool
@@ -110,6 +114,25 @@ auto try_wait_asset_ready(rtti::context& ctx, const std::string& key, std::chron
 
     auto& am = ctx.get_cached<asset_manager>();
     const auto ext = fs::path(key).extension().generic_string();
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    const auto compiled = asset_reader::resolve_compiled_asset_path(key, to_lower_ascii(ext));
+    const auto required_path = compiled.empty() ? fs::absolute(fs::resolve_protocol(key)) : compiled;
+    // A metadata-only import pass is not a compiled asset. Unknown companion files only need copying.
+    do
+    {
+        fs::error_code ec;
+        if(fs::is_regular_file(required_path, ec) && !ec && fs::file_size(required_path, ec) > 0 && !ec)
+        {
+            break;
+        }
+        if(std::chrono::steady_clock::now() >= deadline)
+        {
+            return false;
+        }
+        tpp::this_thread::sleep_for(std::chrono::milliseconds(32));
+    } while(true);
+    timeout = std::max(std::chrono::milliseconds::zero(),
+                       std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()));
     if(matches_asset_extension<material>(ext))
     {
         return poll_handle_ready<material>(am, key, timeout);
@@ -126,23 +149,8 @@ auto try_wait_asset_ready(rtti::context& ctx, const std::string& key, std::chron
     {
         return poll_handle_ready<scene_prefab>(am, key, timeout);
     }
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while(std::chrono::steady_clock::now() < deadline)
-    {
-        auto meta = am.get_metadata_for_key(key);
-        if(!meta.location.empty() || !meta.meta.type.empty())
-        {
-            return true;
-        }
-        const auto absolute = fs::absolute(fs::resolve_protocol(key));
-        fs::error_code ec;
-        if(fs::exists(absolute, ec) && fs::file_size(absolute, ec) > 0)
-        {
-            return true;
-        }
-        tpp::this_thread::sleep_for(std::chrono::milliseconds(32));
-    }
-    return false;
+    // Other importable types are ready on disk; do not force every texture/audio asset into memory.
+    return true;
 }
 
 auto read_import_timeout_ms(const simdjson::dom::object& args, int64_t default_ms) -> std::chrono::milliseconds
@@ -1119,4 +1127,3 @@ void register_asset_tools(mcp_tool_registry& registry)
 }
 
 } // namespace unravel::mcp
-

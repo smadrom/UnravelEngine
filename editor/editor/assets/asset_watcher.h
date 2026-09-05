@@ -1,5 +1,6 @@
 #pragma once
 #include <context/context.hpp>
+#include <engine/assets/asset_task_queue.h>
 #include <filesystem/syncer.h>
 #include <ospp/event.h>
 
@@ -37,6 +38,7 @@ private:
 
     void setup_directory(rtti::context& ctx, fs::syncer& syncer);
     void setup_meta_syncer(rtti::context& ctx,
+                           const asset_task_queue::scope_ptr& compile_scope,
                            std::vector<uint64_t>& watchers,
                            fs::syncer& syncer,
                            const fs::path& data_dir,
@@ -44,6 +46,7 @@ private:
                            bool wait,
                            const on_wait_progress_t& on_progress);
     void setup_cache_syncer(rtti::context& ctx,
+                            const asset_task_queue::scope_ptr& compile_scope,
                             std::vector<uint64_t>& watchers,
                             fs::syncer& syncer,
                             const fs::path& meta_dir,
@@ -56,9 +59,11 @@ private:
         fs::syncer meta_syncer;
         fs::syncer cache_syncer;
         std::vector<std::uint64_t> watchers;
+        asset_task_queue::scope_ptr compile_scope;
     };
 
     std::map<std::string, watched> watched_protocols_{};
+    std::shared_ptr<asset_task_queue> compile_queue_;
     std::shared_ptr<int> sentinel_ = std::make_shared<int>(0);
 
     std::mutex recreate_meta_files_queue_mutex_{};

@@ -243,11 +243,13 @@ inline auto get_format_version<unravel::mesh>() -> uint64_t
     //     rewrites the surface every frame, so the field could only ever occlude as a rigid
     //     bind-pose statue pinned to the entity's root transform. The runtime walk also refuses
     //     stale fields, so this bump is what reclaims the disk and atlas space they held.
+    // 22: EDS glTF exports preserve PW coordinates and material slots by generator metadata,
+    //     including maps outside Login. Previously those meshes were mirrored and rotated.
     //
     // NOTE: the compiled asset is a function of the BAKE ALGORITHM, not only of the source
     // mesh. Any change to mesh_sdf_baker that alters its output needs a bump here, or existing
     // projects silently keep the field produced by the previous code.
-    return 21;
+    return 22;
 }
 
 template<>

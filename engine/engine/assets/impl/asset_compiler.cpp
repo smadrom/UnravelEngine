@@ -1406,7 +1406,8 @@ auto compile<mesh>(asset_manager& am, const fs::path& key, const fs::path& outpu
     std::vector<importer::imported_texture> textures;
     // load_mesh_data_from_file waits for multi-file companions (.gltf/.bin, .obj/.mtl)
     // before Assimp runs, so incomplete copies cannot produce empty mesh buffers.
-    if(!importer::load_mesh_data_from_file(am, absolute_path, *importer, data, animations, materials, textures))
+    importer::source_mesh_policy source_policy;
+    if(!importer::load_mesh_data_from_file(am, absolute_path, *importer, data, animations, materials, textures, &source_policy))
     {
         APPLOG_ERROR("Failed compilation of {0}", str_input);
         return false;
@@ -1434,7 +1435,7 @@ auto compile<mesh>(asset_manager& am, const fs::path& key, const fs::path& outpu
         }
     }
     // Generate LODs offline during compilation (no GPU buffers created)
-    if(importer->model.generate_lods)
+    if(importer->model.generate_lods && source_policy.generate_lods)
     {
         // Use custom LOD configs if provided, otherwise use defaults
         auto lod_configs = mesh::generate_default_lod_configs(data, importer->model.lod_target_error);
@@ -1447,7 +1448,7 @@ auto compile<mesh>(asset_manager& am, const fs::path& key, const fs::path& outpu
     // Bake the GI distance field from the final LOD0 topology. This runs after skinning and
     // LOD generation because both can rewrite the vertex and index buffers; baking earlier
     // would produce a field that no longer matches the geometry that ships.
-    if(importer->sdf.generate_sdf)
+    if(importer->sdf.generate_sdf && source_policy.generate_sdf)
     {
         APPLOG_INFO("Baking SDF for {0}", str_input);
         APP_SCOPE_PERF("Bake Mesh SDF");

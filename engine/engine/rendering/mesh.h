@@ -603,6 +603,8 @@ public:
      * @param half_extent_x Half world size along X; vertices span [-half_extent_x, half_extent_x].
      * @param half_extent_z Half world size along Z.
      * @param height_scale Multiplier applied to each height sample before placing along Y.
+     * @param stitch_block_grid Nonzero selects main diagonals with the two opposite corner cells
+     * reversed in every block, matching stitched native terrain. Zero preserves uniform diagonals.
      */
     auto create_heightfield(const gfx::vertex_layout& format,
                           hpp::span<const float> heights,
@@ -612,7 +614,8 @@ public:
                           float half_extent_z,
                           float height_scale,
                           mesh_create_origin origin,
-                          bool hardware_copy = true) -> bool;
+                          bool hardware_copy = true,
+                          uint32_t stitch_block_grid = 0) -> bool;
 
     /**
      * @brief Creates a cube geometry.
@@ -821,6 +824,13 @@ public:
      * @param hardware_copy Whether to use hardware copy.
      */
     void build_ib(bool hardware_copy = true);
+
+    /**
+     * @brief Uploads an already prepared CPU mesh and its LODs on the renderer thread.
+     * Retains CPU geometry and SDF data; does not rebuild topology or repeat the SDF bake.
+     * @return True only when every required GPU buffer is valid.
+     */
+    auto upload_gpu_buffers() -> bool;
 
     /**
      * @brief Generates edge-triangle adjacency information for the mesh data.

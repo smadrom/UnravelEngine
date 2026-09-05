@@ -21,6 +21,7 @@
 #include <assimp/Importer.hpp>
 #include <assimp/LogStream.hpp>
 #include <assimp/ProgressHandler.hpp>
+#include <assimp/commonMetaData.h>
 #include <assimp/material.h>
 #include <assimp/postprocess.h>
 #include <assimp/scene.h>
@@ -529,47 +530,20 @@ auto normalize_assimp_path(const char* path) -> fs::path
     return normalize_assimp_path(std::string(path));
 }
 
-auto is_login_gltf_mesh_path(const fs::path& path) -> bool
+auto is_pw_gltf_scene(const aiScene& scene) -> bool
 {
-    const auto normalized_path = normalize_assimp_path(path);
-    const auto normalized = string_utils::to_lower(normalized_path.generic_string());
-    if(normalized.find("/data/login/") == std::string::npos)
+    if(!scene.mMetaData)
     {
         return false;
     }
-
-    const auto extension = string_utils::to_lower(normalized_path.extension().string());
-    if(extension == ".glb" || extension == ".gltf")
-    {
-        return true;
-    }
-
-    if(normalized.find("/objects/") == std::string::npos)
-    {
-        return false;
-    }
-
-    std::ifstream file(normalized_path, std::ios::binary);
-    if(!file)
-    {
-        return false;
-    }
-
-    std::array<char, 512> header{};
-    file.read(header.data(), static_cast<std::streamsize>(header.size()));
-    const auto read_count = file.gcount();
-    if(read_count >= 4 && header[0] == 'g' && header[1] == 'l' && header[2] == 'T' && header[3] == 'F')
-    {
-        return true;
-    }
-
-    if(read_count <= 0)
-    {
-        return false;
-    }
-
-    const std::string_view text(header.data(), static_cast<size_t>(read_count));
-    return text.find("\"asset\"") != std::string_view::npos && text.find("\"meshes\"") != std::string_view::npos;
+    aiString format;
+    aiString generator;
+    // The EDS exporter stores PW's coordinate frame and material slot indices in glTF.
+    // Recognize its content, including relocated maps, instead of special-casing a folder.
+    return scene.mMetaData->Get(AI_METADATA_SOURCE_FORMAT, format) &&
+           std::string_view(format.C_Str()) == "glTF2 Importer" &&
+           scene.mMetaData->Get(AI_METADATA_SOURCE_GENERATOR, generator) &&
+           std::string_view(generator.C_Str()) == "A3DMapEditor EDS converter";
 }
 
 /**
@@ -5505,8 +5479,10 @@ auto load_mesh_data_from_file(asset_manager& am,
                               mesh::load_data& load_data,
                               std::vector<animation_clip>& animations,
                               std::vector<imported_material>& materials,
-                              std::vector<imported_texture>& textures) -> bool
+                              std::vector<imported_texture>& textures,
+                              source_mesh_policy* source_policy) -> bool
 {
+    if(source_policy) *source_policy = {};
     // Multi-file formats (glTF + .bin/textures, OBJ + mtllib) must be complete on disk
     // before Assimp reads them; otherwise vertex buffers can import as empty.
     if(!wait_for_mesh_source_dependencies(path))
@@ -5539,9 +5515,30 @@ auto load_mesh_data_from_file(asset_manager& am,
     fs::path file = path.stem();
     fs::path output_dir = path.parent_path();
 
-    // clang-format off
+    // Read once before selecting post-processing so the source metadata is authoritative.
+    APPLOG_TRACE("Mesh Importer: Loading {}", path.generic_string());
+    const aiScene* scene = read_file(importer, path, 0);
+    if(scene == nullptr)
+    {
+        APPLOG_ERROR(importer.GetErrorString());
+        return false;
+    }
+    const bool pw_open_format_gltf = is_pw_gltf_scene(*scene);
+    if(source_policy && pw_open_format_gltf)
+    {
+        aiString usage;
+        if(scene->mMetaData->Get("pwMeshUsage", usage) &&
+           (std::string_view(usage.C_Str()) == "grass" || std::string_view(usage.C_Str()) == "ecmodel"))
+        {
+            // Authored grass consists of alpha-cutout blades. Solid SDFs would occlude
+            // their transparent texels, and generic mesh simplification destroys blades.
+            // Animated ECM geometry also cannot use a field baked from its bind pose.
+            source_policy->generate_lods = false;
+            source_policy->generate_sdf = false;
+        }
+    }
 
-    const bool login_open_format_gltf = is_login_gltf_mesh_path(path);
+    // clang-format off
 
     uint32_t flags = aiProcess_RemoveComponent              |
                      aiProcess_Triangulate                  |
@@ -5557,13 +5554,13 @@ auto load_mesh_data_from_file(asset_manager& am,
 
     // clang-format on
 
-    if(!login_open_format_gltf)
+    if(!pw_open_format_gltf)
     {
         flags |= aiProcess_ConvertToLeftHanded;
     }
     else
     {
-        APPLOG_TRACE("Mesh Importer: Preserving Login glTF handedness for {}", path.generic_string());
+        APPLOG_TRACE("Mesh Importer: Preserving PW glTF handedness for {}", path.generic_string());
     }
 
     if(import_meta.model.weld_vertices)
@@ -5586,19 +5583,16 @@ auto load_mesh_data_from_file(asset_manager& am,
     {
         flags |= aiProcess_FindInvalidData;
     }
-    const bool preserve_login_material_slots = login_open_format_gltf;
-    if(import_meta.materials.remove_redundant_materials && !preserve_login_material_slots)
+    if(import_meta.materials.remove_redundant_materials && !pw_open_format_gltf)
     {
         flags |= aiProcess_RemoveRedundantMaterials;
     }
-    else if(import_meta.materials.remove_redundant_materials && preserve_login_material_slots)
+    else if(import_meta.materials.remove_redundant_materials && pw_open_format_gltf)
     {
-        APPLOG_TRACE("Mesh Importer: Preserving Login glTF material slots for {}", path.generic_string());
+        APPLOG_TRACE("Mesh Importer: Preserving PW glTF material slots for {}", path.generic_string());
     }
 
-    APPLOG_TRACE("Mesh Importer: Loading {}", path.generic_string());
-
-    const aiScene* scene = read_file(importer, path, flags);
+    scene = importer.ApplyPostProcessing(flags);
 
     if(scene == nullptr)
     {
@@ -5618,7 +5612,7 @@ auto load_mesh_data_from_file(asset_manager& am,
                            animations,
                            materials,
                            textures,
-                           !login_open_format_gltf);
+                           !pw_open_format_gltf);
 
     APPLOG_TRACE("Mesh Importer: Done with {}", path.generic_string());
 

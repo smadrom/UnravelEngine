@@ -86,7 +86,6 @@ private:
     std::unordered_map<int32_t, world_marker> world_markers_;
     entt::handle world_self_marker_;
     uint32_t world_epoch_ = 0;
-    uint32_t world_map_loaded_epoch_ = 0; // Last auto-load attempt, including fail-soft failures.
     uint64_t applied_world_seq_ = 0;
     bool mode_active_ = false;
     void* attached_document_ = nullptr; // document the listeners are attached to

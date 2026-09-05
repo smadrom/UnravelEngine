@@ -100,7 +100,7 @@ void log_unknown_protocol_for_key(const std::string& key)
     APPLOG_ERROR("Asset {0} has unknown protocol!", key);
 }
 
-auto validate(const std::string& key, const std::string& compiled_ext, std::string& out) -> bool
+auto validate(const std::string& key, const std::string& compiled_ext, std::string& out, bool allow_raw) -> bool
 {
     if(!fs::has_known_protocol(key))
     {
@@ -113,6 +113,10 @@ auto validate(const std::string& key, const std::string& compiled_ext, std::stri
     fs::error_code err;
     if(!fs::exists(compiled_absolute_path, err))
     {
+        if(!allow_raw)
+        {
+            return false;
+        }
         log_missing_compiled_asset_for_key(compiled_absolute_path);
 
         compiled_absolute_path = resolve_path(key).string();
@@ -133,14 +137,15 @@ namespace detail
 
 template<typename T, typename CreateFromPathFn>
 auto schedule_load(tpp::thread_pool& pool, asset_handle<T>& output, const std::string& key,
-                   const std::string& compiled_ext, CreateFromPathFn create_fn, load_mode mode) -> bool
+                   const std::string& compiled_ext, CreateFromPathFn create_fn, load_mode mode,
+                   bool allow_raw = true) -> bool
 {
     if(mode == load_mode::deferred)
     {
-        auto deferred_fn = [key, compiled_ext, create_fn]() -> std::shared_ptr<T>
+        auto deferred_fn = [key, compiled_ext, create_fn, allow_raw]() -> std::shared_ptr<T>
         {
             std::string path{};
-            if(!validate(key, compiled_ext, path))
+            if(!validate(key, compiled_ext, path, allow_raw))
             {
                 return nullptr;
             }
@@ -151,7 +156,7 @@ auto schedule_load(tpp::thread_pool& pool, asset_handle<T>& output, const std::s
     }
 
     std::string path{};
-    if(!validate(key, compiled_ext, path))
+    if(!validate(key, compiled_ext, path, allow_raw))
     {
         return false;
     }
@@ -205,16 +210,21 @@ template<>
 auto load_from_file<mesh>(tpp::thread_pool& pool, asset_handle<mesh>& output,
                            const std::string& key, load_mode mode) -> bool
 {
+    // External formats need the importer; they are not serialized mesh::load_data.
+    const bool allow_raw = fs::path(key).extension() == ".emesh";
     return detail::schedule_load<mesh>(pool, output, key, {},
-        [](const std::string& path)
+        [](const std::string& path) -> std::shared_ptr<mesh>
         {
             mesh::load_data data;
             load_from_file_bin(path, data);
 
             auto m = std::make_shared<unravel::mesh>();
-            m->load_mesh(std::move(data));
+            if(!m->load_mesh(std::move(data)))
+            {
+                return nullptr;
+            }
             return m;
-        }, mode);
+        }, mode, allow_raw);
 }
 
 template<>

@@ -1,4 +1,5 @@
 #include "engine.h"
+#include <engine/pw/pw_map_loader.h>
 #include <engine/assets/asset_manager.h>
 #include <engine/defaults/defaults.h>
 #include <engine/loading_screen.h>
@@ -186,6 +187,7 @@ auto engine::create(rtti::context& ctx, cmd_line::parser& parser) -> bool
     ctx.add<audio_system>();
     ctx.add<asset_manager>(ctx);
     ctx.add<ecs>();
+    ctx.add<pw_map_loader>();
     ctx.add<rendering_system>();
     ctx.add<surface_cache_system>();
     ctx.add<transform_system>();
@@ -247,6 +249,8 @@ auto engine::init_systems(const cmd_line::parser& parser) -> bool
     {
         return false;
     }
+
+    ctx.get_cached<pw_map_loader>().init(ctx);
 
     ls.begin_module("Rendering");
     if(!ls.check(ctx.get_cached<rendering_system>().init(ctx)))
@@ -343,6 +347,8 @@ auto engine::init_systems(const cmd_line::parser& parser) -> bool
 auto engine::deinit() -> bool
 {
     auto& ctx = engine::context();
+
+    ctx.get_cached<pw_map_loader>().deinit(ctx);
 
     if(!defaults::deinit(ctx))
     {

@@ -3,7 +3,7 @@
 #include "mcp_control_server.h"
 #include "pw_runtime_client.h"
 #include "pw_session_controller.h"
-#include "terrain_height_sampler.h"
+#include <engine/pw/pw_map_loader.h>
 
 #include <base/basetypes.hpp>
 #include <bgfx/bgfx.h>
@@ -20,64 +20,12 @@
 
 namespace unravel
 {
-constexpr int kLoginSceneCameraCount = 39;
-constexpr int kLoginSceneLoginIndex = 0;
-constexpr int kLoginSceneSelcharIndex = 1;
-constexpr int kLoginSceneCreateIndex = 14;
-constexpr int kLoginSceneChooseIndex = 38;
-
-struct login_scene_camera
-{
-    math::vec3 pos{};
-    math::vec3 dir{0.0f, 0.0f, 1.0f};
-    math::vec3 up{0.0f, 1.0f, 0.0f};
-    bool valid = false;
-};
-
-struct login_scene_config
-{
-    std::array<login_scene_camera, kLoginSceneCameraCount> cameras{};
-    std::vector<math::vec3> new_char_positions;
-    math::vec3 new_char_center{};
-    bool loaded = false;
-};
-
 class mcp_system
 {
 public:
     mcp_system();
 
-    struct login_load_status
-    {
-        std::string status = "idle";
-        std::string content_root;
-        std::string map;
-        std::string error;
-        std::string attempted_content_root;
-        std::string attempted_map;
-        std::string start_error;
-        uint32_t done = 0;
-        uint32_t total = 0;
-        uint32_t created = 0;
-        uint32_t skipped = 0;
-        uint32_t foliage_done = 0;
-        uint32_t foliage_total = 0;
-        uint32_t foliage_created = 0;
-        uint32_t foliage_skipped = 0;
-        uint32_t water_total = 0;
-        uint32_t water_created = 0;
-        uint32_t water_skipped = 0;
-        uint32_t current_index = 0;
-        uint32_t current_attempts = 0;
-        std::string current_kind;
-        std::string current_name;
-        std::string current_model;
-        std::string current_texture;
-        math::vec3 current_position{};
-        bool has_current = false;
-        bool terrain = false;
-    };
-
+    using login_load_status = pw_map_loader::login_load_status;
     struct screenshot_status
     {
         std::string status = "idle";
@@ -93,84 +41,22 @@ public:
         uint64_t request_id = 0;
     };
 
-    struct login_building
-    {
-        std::string name;
-        std::string model;
-        std::string texture;
-        std::vector<std::string> textures;
-        math::vec3 position{};
-        math::vec3 forward{0.0f, 0.0f, 1.0f};
-        math::vec3 up{0.0f, 1.0f, 0.0f};
-        bool alpha_blend = false;
-        bool alpha_test = false;
-        float source_position_y = 0.0f;
-        float terrain_surface_y = 0.0f;
-        float local_min_y = 0.0f;
-        bool terrain_sample_valid = false;
-        uint32_t attempts = 0;
-        bool texture_request_logged = false;
-        bool texture_ready_logged = false;
-        bool placement_logged = false;
-    };
-
-    struct login_foliage
-    {
-        std::string name;
-        std::string model;
-        std::string texture;
-        std::vector<std::string> textures;
-        math::vec3 position{};
-        bool alpha_blend = false;
-        bool alpha_test = true;
-        float source_position_y = 0.0f;
-        float terrain_surface_y = 0.0f;
-        float local_min_y = 0.0f;
-        int tree_type = -1;
-        bool terrain_sample_valid = false;
-        uint32_t attempts = 0;
-        bool texture_request_logged = false;
-        bool texture_ready_logged = false;
-        bool placement_logged = false;
-    };
-
-    struct login_water
-    {
-        std::string name;
-        std::string payload;
-        uint32_t visible_cells = 0;
-    };
-
-    struct login_light
-    {
-        enum class kind
-        {
-            directional,
-            point
-        };
-
-        kind type = kind::directional;
-        math::vec3 position{};
-        math::vec3 direction{0.0f, -1.0f, 0.0f};
-        math::color color{1.0f, 1.0f, 1.0f, 1.0f};
-        float intensity = 0.0f;
-        float range = 0.0f;
-        uint32_t source_index = 0;
-        bool has_intensity = false;
-        bool has_range = false;
-    };
+    using login_building = pw_map_loader::login_building;
+    using login_foliage = pw_map_loader::login_foliage;
+    using login_water = pw_map_loader::login_water;
+    using login_light = pw_map_loader::login_light;
 
     auto init(rtti::context& ctx) -> bool;
     auto deinit(rtti::context& ctx) -> bool;
     void on_frame_end(rtti::context& ctx, delta_t dt);
     auto ensure_camera(rtti::context& ctx) -> entt::handle;
-    void invalidate_camera();
+    void invalidate_camera(rtti::context& ctx);
     void request_screenshot(const std::string& path, uint32_t w, uint32_t h, bool render_ui = false);
     void start_map_load(rtti::context& ctx,
                         const std::string& content_root,
                         const std::string& map_slug,
                         uint32_t buildings_per_frame,
-                        bool restart);
+                        bool restart, bool require_full = true);
     void start_login_load(rtti::context& ctx, const std::string& content_root, uint32_t buildings_per_frame, bool restart);
     auto get_login_load_status() const -> login_load_status;
     auto get_screenshot_status() const -> screenshot_status;
@@ -186,11 +72,8 @@ public:
 
 private:
     void service_pending_screenshot(rtti::context& ctx);
-    void service_login_loader(rtti::context& ctx);
     void service_pw_session(rtti::context& ctx);
     void clear_pending_readback();
-    void despawn_loaded_map(rtti::context& ctx);
-    void reset_login_loader_if_scene_changed(rtti::context& ctx);
 
     McpControlServer server_;
     pw_runtime_client pw_runtime_;
@@ -221,45 +104,8 @@ private:
 
     pending_screenshot pending_;
 
-    struct login_loader
-    {
-        std::string content_root;
-        std::string map_slug = "login";
-        std::string status = "idle";
-        std::string error;
-        std::vector<login_building> buildings;
-        std::vector<login_foliage> foliage;
-        std::vector<login_water> water;
-        std::vector<login_light> lights;
-        std::vector<entt::handle> created_entities;
-        std::vector<std::function<void()>> shared_entity_rollbacks;
-        std::vector<std::string> generated_mesh_keys;
-        std::vector<std::string> generated_texture_keys;
-        entt::handle scene_anchor;
-        entt::registry* scene_registry = nullptr;
-        terrain_heightfield terrain;
-        uint64_t generation = 0;
-        uint32_t buildings_per_frame = 3;
-        uint32_t cursor = 0;
-        uint32_t created = 0;
-        uint32_t skipped = 0;
-        uint32_t foliage_cursor = 0;
-        uint32_t foliage_created = 0;
-        uint32_t foliage_skipped = 0;
-        uint32_t water_created = 0;
-        uint32_t water_skipped = 0;
-        bool active = false;
-        bool completed = false;
-        bool terrain_created = false;
-        bool water_created_flag = false;
-        bool environment_created = false;
-        uint32_t character_attempts = 0;
-    };
-
-    login_loader login_;
-    uint64_t next_map_generation_ = 0;
-    std::string attempted_content_root_;
-    std::string attempted_map_slug_;
-    std::string map_start_error_;
+    pw_map_loader* map_loader_ = nullptr;
+    uint64_t observed_map_generation_ = 0;
+    uint32_t world_map_epoch_ = 0;
 };
 } // namespace unravel
