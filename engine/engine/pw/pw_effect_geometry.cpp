@@ -1,5 +1,6 @@
 #include "pw_effect_geometry.h"
 #include "pw_effect_shader.h"
+#include "pw_effect_vertex_upload.h"
 
 #include <engine/ecs/components/transform_component.h>
 #include <engine/ecs/scene.h>
@@ -34,20 +35,6 @@ auto blend_factor(int native) -> uint64_t
         case 11: return BGFX_STATE_BLEND_SRC_ALPHA_SAT;
         default: throw std::runtime_error("unsupported Angelica blend factor");
     }
-}
-
-auto vertex_layout() -> const bgfx::VertexLayout&
-{
-    static const bgfx::VertexLayout value = []
-    {
-        bgfx::VertexLayout layout;
-        layout.begin().add(bgfx::Attrib::Position, 3, bgfx::AttribType::Float)
-            .add(bgfx::Attrib::TexCoord0, 2, bgfx::AttribType::Float)
-            .add(bgfx::Attrib::Color0, 4, bgfx::AttribType::Float)
-            .add(bgfx::Attrib::TexCoord1, 2, bgfx::AttribType::Float).end();
-        return layout;
-    }();
-    return value;
 }
 
 auto projected_extent(const camera& camera, const math::vec3& position, const math::vec2& size) -> math::vec2
@@ -184,7 +171,7 @@ auto render_pw_effect_geometry(scene& scene, const camera& camera, uint16_t view
             (geometry.depth_test ? BGFX_STATE_DEPTH_TEST_LEQUAL : uint64_t(0)) |
             (geometry.depth_write && !warp ? BGFX_STATE_WRITE_Z : uint64_t(0)) |
             (warp ? uint64_t(0) : BGFX_STATE_BLEND_FUNC(blend_factor(geometry.source_blend), blend_factor(geometry.destination_blend)));
-        const auto& layout = vertex_layout();
+        const auto& layout = pw_effect_gpu_vertex_layout();
         const uint32_t count = static_cast<uint32_t>(vertices.size());
         program.set_texture(0, "s_texColor", texture.get());
         program.set_texture(1, "s_shaderTexture", shader_texture.get());
@@ -198,14 +185,16 @@ auto render_pw_effect_geometry(scene& scene, const camera& camera, uint16_t view
         {
             bgfx::TransientVertexBuffer buffer;
             bgfx::allocTransientVertexBuffer(&buffer, count, layout);
-            std::memcpy(buffer.data, vertices.data(), vertices.size() * sizeof(pw_effect_vertex));
+            copy_pw_effect_vertices(buffer.data, vertices.data(), vertices.size());
             bgfx::setVertexBuffer(0, &buffer);
             bgfx::submit(view, program.native_handle());
         }
         else
         {
             // Dedicated storage avoids silently dropping geometry when the shared transient pool is full.
-            const auto buffer = bgfx::createVertexBuffer(bgfx::copy(vertices.data(), count * sizeof(pw_effect_vertex)), layout);
+            const auto* memory = bgfx::alloc(count * sizeof(pw_effect_gpu_vertex));
+            copy_pw_effect_vertices(memory->data, vertices.data(), vertices.size());
+            const auto buffer = bgfx::createVertexBuffer(memory, layout);
             if(!bgfx::isValid(buffer)) continue;
             bgfx::setVertexBuffer(0, buffer);
             bgfx::submit(view, program.native_handle());

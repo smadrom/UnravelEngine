@@ -73,6 +73,11 @@ option(BUILD_ENGINE_TESTS "Build the tests" OFF)
 option(BUILD_ENGINE_WITH_CODE_STYLE_CHECKS "Build with code style checks." OFF)
 option(UNRAVEL_BUILD_PW_RUNTIME_BRIDGE "Build the optional Perfect World headless runtime bridge." OFF)
 
+# Large imported scenes allocate an index buffer for each mesh LOD.
+if(NOT BGFX_CONFIG_MAX_INDEX_BUFFERS)
+    set(BGFX_CONFIG_MAX_INDEX_BUFFERS 16384 CACHE STRING "Maximum live mesh index buffers" FORCE)
+endif()
+
 set(BUILD_ENGINE_SHARED OFF CACHE BOOL "" FORCE)
 if(BUILD_ENGINE_SHARED)
     set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)

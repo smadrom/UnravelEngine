@@ -546,6 +546,7 @@ auto create_program(const pw_effect_document& document, const std::string& proto
         native_element element;
         element.source = &source;
         element.spec = compile_sprite(source);
+        if(element.spec.lightning) sample_pw_effect_lightning_amplitude(source, document.version, 0);
         const bool has_shader_constants = std::any_of(source.base_fields.begin(), source.base_fields.end(),
             [](const auto& field) { return field.name == "PSConstCount"; });
         // Earlier native GFX versions have no pixel-shader section at all.
@@ -1001,22 +1002,7 @@ auto curve_position(const pw_effect_controller& curve, float ratio) -> math::vec
     return math::mix(math::vec3(a[0], a[1], a[2]), math::vec3(b[0], b[1], b[2]), span > 0 ? (ratio - a[3]) / span : 0);
 }
 
-auto animated_amplitude(const fields& data, float elapsed) -> float
-{
-    const int count = int(scalar(data, "DestNum"));
-    float time = elapsed * 1000 - scalar(data, "StartTime");
-    if(time <= 0 || count == 0) return scalar(data, "DestVal");
-    for(int segment = 0; segment < count; ++segment)
-    {
-        const float duration = scalar(data, "TransTime", segment);
-        if(time > duration) { time -= duration; continue; }
-        return math::mix(scalar(data, "DestVal", segment), scalar(data, "DestVal", segment + 1),
-                         duration > 0 ? time / duration : 1);
-    }
-    return scalar(data, "DestVal", count);
-}
-
-void draw_lightning(const native_element& definition, native_element_state& state, const native_state& keypoint,
+void draw_lightning(const native_element& definition, int document_version, native_element_state& state, const native_state& keypoint,
                     const native_frame& parent, pw_effect_geometry_component& geometry)
 {
     const auto& source = *definition.source;
@@ -1047,7 +1033,7 @@ void draw_lightning(const native_element& definition, native_element_state& stat
     }
     const float wavelength = scalar(data, "WaveLen", 1);
     if(wavelength <= 0) throw std::runtime_error("invalid native lightning wavelength");
-    const float amplitude = animated_amplitude(data, state.local_time);
+    const float amplitude = sample_pw_effect_lightning_amplitude(source, document_version, state.local_time);
     for(uint32_t index = 1; index < segments; ++index)
     {
         const auto direction = math::normalize(positions[index] - positions[index - 1]);
@@ -1149,7 +1135,7 @@ void draw_program(native_program& program, native_program_state& state, const en
         else if(definition.spec.ring) draw_ring(definition, keypoint, parent, runtime.texture_time, geometry);
         else if(definition.spec.trail) draw_trail(definition, runtime, keypoint, parent, delta, geometry);
         else if(definition.spec.model) draw_model(definition, runtime, keypoint, parent, entities);
-        else if(definition.spec.lightning) draw_lightning(definition, runtime, keypoint, parent, geometry);
+        else if(definition.spec.lightning) draw_lightning(definition, program.document->version, runtime, keypoint, parent, geometry);
         else
         {
             pw_effect_quad quad;
@@ -1173,6 +1159,40 @@ void draw_program(native_program& program, native_program_state& state, const en
     }
 }
 } // namespace
+
+auto sample_pw_effect_lightning_amplitude(const pw_effect_element& element, int document_version, float elapsed_seconds)
+    -> float
+{
+    const auto& data = element.type_fields;
+    // A3DGFXLightning::Load: pre-102 files contain a second Amplitude after
+    // Width/Alpha. The first Amplitude belongs to the preceding noise table.
+    if(document_version < 102) return scalar(data, "Amplitude", 1);
+
+    const float destinations = scalar(data, "DestNum");
+    if(destinations < 0 || destinations > 5 || std::floor(destinations) != destinations)
+        throw std::runtime_error("invalid native lightning destination count");
+    const size_t count = static_cast<size_t>(destinations);
+    const float start = scalar(data, "StartTime");
+    std::array<float, 6> values{};
+    std::array<float, 5> durations{};
+    // Validate the whole authored track during program creation, including
+    // destinations that are not reached by the first rendered frame.
+    for(size_t index = 0; index <= count; ++index) values[index] = scalar(data, "DestVal", index);
+    for(size_t index = 0; index < count; ++index)
+    {
+        durations[index] = scalar(data, "TransTime", index);
+        if(durations[index] < 0) throw std::runtime_error("negative native lightning transition duration");
+    }
+    float time = elapsed_seconds * 1000 - start;
+    if(time <= 0 || count == 0) return values[0];
+    for(size_t segment = 0; segment < count; ++segment)
+    {
+        const float duration = durations[segment];
+        if(time > duration) { time -= duration; continue; }
+        return math::mix(values[segment], values[segment + 1], duration > 0 ? time / duration : 1);
+    }
+    return values[count];
+}
 
 struct pw_map_effects_runtime::implementation
 {

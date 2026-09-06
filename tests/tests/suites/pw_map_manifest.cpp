@@ -344,6 +344,35 @@ void test_source_and_output_contract()
     check(!duplicate_keys.valid && duplicate_keys.error.find("Duplicate JSON key") != std::string::npos, "duplicate JSON keys rejected before use");
 }
 
+void test_optional_eds_instance_identity()
+{
+    candidate_fixture non_instance;
+    non_instance.request.instance_id = 0;
+    non_instance.manifest["instanceId"] = 0;
+    non_instance.meta.erase("instanceId");
+    non_instance.publish();
+    auto result = non_instance.validate();
+    check(result.valid, "EDS may omit the zero PW_MAP instance ID, as exported for Login: " + result.error);
+    non_instance.meta["instanceId"] = 0;
+    non_instance.publish();
+    check(non_instance.validate().valid, "explicit zero EDS instance ID also agrees with PW_MAP");
+    non_instance.meta["instanceId"] = 7;
+    non_instance.publish();
+    check(!non_instance.validate().valid, "explicit EDS instance must match zero PW_MAP identity");
+    non_instance.meta["instanceId"] = "0";
+    non_instance.publish();
+    check(!non_instance.validate().valid, "optional EDS instance does not accept malformed explicit values");
+    expect_rejection("omitted positive EDS instance", [](candidate_fixture& candidate)
+    {
+        candidate.meta.erase("instanceId");
+        candidate.publish();
+    });
+    expect_rejection("missing authoritative PW_MAP instance", [](candidate_fixture& candidate)
+    {
+        candidate.manifest.erase("instanceId");
+    });
+}
+
 void test_identity_and_reference_closure()
 {
     candidate_fixture shared;
@@ -494,6 +523,7 @@ void test_full_geometry_and_legacy_policy()
         auto layers = json::parse(candidate.payloads.at("terrain/layers.json"));
         layers.erase("bakedAlbedo");
         candidate.payloads["terrain/layers.json"] = layers.dump();
+        candidate.publish();
     });
     expect_rejection("full window with false expectedFull", [](candidate_fixture& candidate)
     {
@@ -699,6 +729,7 @@ auto run_pw_map_manifest(rtti::context&) -> int
     g_checks = 0;
     g_failures = 0;
     test_source_and_output_contract();
+    test_optional_eds_instance_identity();
     test_identity_and_reference_closure();
     test_grass_contract();
     test_effect_dependency_closure();

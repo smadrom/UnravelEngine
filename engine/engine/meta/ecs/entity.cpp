@@ -25,10 +25,71 @@
 #include <algorithm>
 #include <hpp/utility.hpp>
 #include <sstream>
+#include <unordered_set>
+#include <unordered_map>
 #include <utility>
 
 namespace unravel
 {
+namespace
+{
+struct pw_scene_file_filter
+{
+    const entt::registry* registry = nullptr;
+    std::unordered_set<entt::entity> excluded;
+    std::unordered_map<hpp::uuid, bool> authored_active;
+};
+thread_local const pw_scene_file_filter* current_pw_scene_file_filter = nullptr;
+
+// File documents store the map descriptor. Memory checkpoints keep its live
+// expansion and asset references so Play/Stop can rebind the retained resources.
+struct scoped_pw_scene_file_filter
+{
+    explicit scoped_pw_scene_file_filter(const scene& scn)
+        : previous(current_pw_scene_file_filter)
+    {
+        filter.registry = scn.registry.get();
+        std::vector<entt::const_handle> pending;
+        scn.registry->view<pw_map_generated_component>().each([&](auto entity, const auto& marker)
+        {
+            if(marker.descriptor_id.is_nil()) return;
+            pending.emplace_back(*scn.registry, entity);
+            for(const auto& [id, active] : marker.authored_environment_active)
+                filter.authored_active.emplace(id, active);
+        });
+        while(!pending.empty())
+        {
+            const auto entity = pending.back();
+            pending.pop_back();
+            if(!entity.valid() || !filter.excluded.insert(entity.entity()).second) continue;
+            if(const auto* transform = entity.try_get<transform_component>())
+                for(const auto child : transform->get_children()) pending.emplace_back(child);
+        }
+        current_pw_scene_file_filter = &filter;
+    }
+    ~scoped_pw_scene_file_filter() { current_pw_scene_file_filter = previous; }
+    scoped_pw_scene_file_filter(const scoped_pw_scene_file_filter&) = delete;
+    auto operator=(const scoped_pw_scene_file_filter&) -> scoped_pw_scene_file_filter& = delete;
+    pw_scene_file_filter filter;
+    const pw_scene_file_filter* previous;
+};
+
+auto is_excluded_pw_scene_entity(entt::const_handle entity) -> bool
+{
+    return current_pw_scene_file_filter && entity.registry() == current_pw_scene_file_filter->registry &&
+           current_pw_scene_file_filter->excluded.count(entity.entity()) != 0;
+}
+} // namespace
+
+auto scene_file_active_value(entt::const_handle entity, bool runtime_active) -> bool
+{
+    if(!current_pw_scene_file_filter || entity.registry() != current_pw_scene_file_filter->registry || !entity)
+        return runtime_active;
+    const auto* identity = entity.try_get<id_component>();
+    if(!identity) return runtime_active;
+    const auto found = current_pw_scene_file_filter->authored_active.find(identity->id);
+    return found == current_pw_scene_file_filter->authored_active.end() ? runtime_active : found->second;
+}
 
 auto const_handle_cast(entt::const_handle chandle) -> entt::handle
 {
@@ -983,6 +1044,13 @@ void save_entity_uuid(Archive& ar, const entt::const_handle& obj)
 template<typename Archive>
 void save_entity(Archive& ar, const entt::const_handle& obj, entity_flags flags)
 {
+    if(is_excluded_pw_scene_entity(obj))
+    {
+        // Null links as well as omitting records; a saved child/reference UID
+        // would otherwise recreate a phantom entity when this scene reopens.
+        save_entity(ar, entt::const_handle{}, flags);
+        return;
+    }
     auto& save_ctx = get_save_context();
     if(save_ctx.is_saving_to_prefab())
     {
@@ -1647,6 +1715,7 @@ namespace
 
 void flatten_hierarchy(entt::const_handle obj, std::vector<entity_data<entt::const_handle>>& entities)
 {
+    if(is_excluded_pw_scene_entity(obj)) return;
     auto& trans_comp = obj.get<transform_component>();
     const auto& children = trans_comp.get_children();
 
@@ -1785,7 +1854,7 @@ void save_to_archive(Archive& ar, const entt::registry& reg)
     reg.view<root_component, transform_component>().each(
         [&](auto e, auto&& comp1, auto&& comp2)
         {
-            count++;
+            if(!is_excluded_pw_scene_entity(entt::const_handle(reg, e))) count++;
         });
 
     try_save(ar, ser20::make_nvp("entities_count", count));
@@ -1798,7 +1867,8 @@ void save_to_archive(Archive& ar, const entt::registry& reg)
     reg.view<root_component, transform_component>().each(
         [&](auto e, auto&& comp1, auto&& comp2)
         {
-            save_to_archive(ar, entt::const_handle(reg, e));
+            if(!is_excluded_pw_scene_entity(entt::const_handle(reg, e)))
+                save_to_archive(ar, entt::const_handle(reg, e));
         });
 
     pop_save_context(pushed);
@@ -3032,6 +3102,7 @@ void save_to_file(const std::string& absolute_path, const scene& scn)
 {
     // APPLOG_INFO_PERF(std::chrono::microseconds);
 
+    const scoped_pw_scene_file_filter map_filter(scn);
     std::ofstream stream(absolute_path);
     save_to_stream(stream, scn);
 }
@@ -3054,6 +3125,7 @@ void save_to_stream_bin(std::ostream& stream, const scene& scn)
 }
 void save_to_file_bin(const std::string& absolute_path, const scene& scn)
 {
+    const scoped_pw_scene_file_filter map_filter(scn);
     std::ofstream stream(absolute_path, std::ios::binary);
     save_to_stream_bin(stream, scn);
 }

@@ -41,6 +41,8 @@ struct pw_map_ownership
     std::string root_tag;
     hpp::uuid root_id;
     std::vector<hpp::uuid> entity_ids;
+    hpp::uuid descriptor_id;
+    uint64_t generation = 0;
     auto rebind(entt::registry& registry, entt::handle& root, std::vector<entt::handle>& entities,
                 bool require_all = true) const -> bool;
 };
@@ -224,6 +226,8 @@ public:
 private:
     friend struct pw_map_loader_test_access;
     void update_map_effects(rtti::context& ctx, delta_t dt);
+    void service_scene_descriptor(rtti::context& ctx);
+    void update_scene_descriptor_status(rtti::context& ctx);
     void on_skip_next_frame(rtti::context& ctx);
     void service_login_loader(rtti::context& ctx);
     void despawn_loaded_map(rtti::context& ctx);
@@ -258,6 +262,7 @@ private:
         std::vector<entt::handle> created_entities;
         pw_map_environment_state shared_entity_rollbacks;
         pw_map_ownership ownership;
+        hpp::uuid descriptor_id;
         std::vector<std::string> generated_mesh_keys;
         std::vector<std::string> generated_texture_keys;
         entt::handle scene_anchor;
@@ -294,6 +299,7 @@ private:
     void destroy_map(rtti::context& ctx, login_loader& state);
     void install_prepared_map(rtti::context& ctx);
     void fail_candidate(rtti::context& ctx, const std::string& error);
+    void bind_scene_descriptor(rtti::context& ctx, login_loader& state);
     auto active_state() const -> const login_loader&;
     login_loader login_;
     std::unique_ptr<login_loader> previous_;
@@ -309,6 +315,19 @@ private:
     std::string attempted_content_root_;
     std::string attempted_map_slug_;
     std::string map_start_error_;
+    struct scene_descriptor_request
+    {
+        hpp::uuid id;
+        uint64_t instance_token = 0;
+        std::string content_root;
+        std::string map_slug;
+        uint32_t buildings_per_frame = 3;
+        bool require_full = true;
+        auto operator==(const scene_descriptor_request&) const -> bool = default;
+    };
+    scene_descriptor_request scene_descriptor_;
+    uint64_t next_descriptor_token_ = 0;
+    hpp::uuid preparation_descriptor_id_;
 };
 void apply_pw_login_camera_pose(entt::handle camera, const login_scene_config& config);
 } // namespace unravel

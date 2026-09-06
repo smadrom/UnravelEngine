@@ -5524,6 +5524,15 @@ auto load_mesh_data_from_file(asset_manager& am,
         return false;
     }
     const bool pw_open_format_gltf = is_pw_gltf_scene(*scene);
+    bool scene_has_bones = false;
+    for(unsigned int mesh_index = 0; mesh_index < scene->mNumMeshes; ++mesh_index)
+    {
+        if(scene->mMeshes[mesh_index]->HasBones())
+        {
+            scene_has_bones = true;
+            break;
+        }
+    }
     if(source_policy && pw_open_format_gltf)
     {
         aiString usage;
@@ -5563,9 +5572,16 @@ auto load_mesh_data_from_file(asset_manager& am,
         APPLOG_TRACE("Mesh Importer: Preserving PW glTF handedness for {}", path.generic_string());
     }
 
-    if(import_meta.model.weld_vertices)
+    if(import_meta.model.weld_vertices && !scene_has_bones)
     {
         flags |= aiProcess_JoinIdenticalVertices;
+    }
+    else if(import_meta.model.weld_vertices && scene_has_bones)
+    {
+        // Assimp's vertex comparison omits bone weights. Coincident vertices can
+        // belong to different bones, so welding would destroy the authored skin.
+        APPLOG_TRACE("Mesh Importer: Preserving separate vertices and authored bone weights for {}",
+                     path.generic_string());
     }
     if(import_meta.model.optimize_meshes)
     {

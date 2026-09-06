@@ -228,6 +228,78 @@ void test_native_login_shapes()
     check(rejected, "invalid ring sector count fails on CPU before resource staging");
 }
 
+void test_native_lightning_amplitude_versions()
+{
+    pw_effect_element legacy;
+    legacy.type = 150;
+    legacy.type_fields = {{"Amplitude", "2"}, {"Amplitude", "0.625"}};
+    check(sample_pw_effect_lightning_amplitude(legacy, 90, 0) == 0.625f &&
+          sample_pw_effect_lightning_amplitude(legacy, 101, 9) == 0.625f,
+          "pre-102 lightning uses its authored scalar amplitude, not the preceding noise amplitude");
+
+    pw_effect_element animated;
+    animated.type = 150;
+    animated.type_fields = {{"Amplitude", "2"}, {"DestNum", "3"}, {"StartTime", "100"},
+        {"DestVal", "0.2"}, {"DestVal", "0.3"}, {"DestVal", "0.8"}, {"DestVal", "0.4"},
+        {"TransTime", "100"}, {"TransTime", "200"}, {"TransTime", "200"}};
+    const auto close = [](float actual, float expected) { return std::abs(actual - expected) < 0.00001f; };
+    check(close(sample_pw_effect_lightning_amplitude(animated, 102, 0.1f), 0.2f) &&
+          close(sample_pw_effect_lightning_amplitude(animated, 103, 0.15f), 0.25f) &&
+          close(sample_pw_effect_lightning_amplitude(animated, 103, 0.2f), 0.3f) &&
+          close(sample_pw_effect_lightning_amplitude(animated, 103, 0.3f), 0.55f) &&
+          close(sample_pw_effect_lightning_amplitude(animated, 103, 0.5f), 0.6f) &&
+          close(sample_pw_effect_lightning_amplitude(animated, 103, 5), 0.4f),
+          "GFX 102+ follows native start time, transition durations, boundaries, and final hold");
+
+    const auto rejects = [](const pw_effect_element& element, int version)
+    {
+        try { sample_pw_effect_lightning_amplitude(element, version, 0); }
+        catch(const std::exception&) { return true; }
+        return false;
+    };
+    check(rejects(legacy, 102), "modern lightning cannot substitute scalar amplitude for missing DestNum");
+    check(rejects(animated, 101), "legacy lightning requires its second authored Amplitude");
+    auto incomplete = animated;
+    incomplete.type_fields.pop_back();
+    check(rejects(incomplete, 103), "missing final transition fails before the first rendered frame");
+    incomplete = animated;
+    incomplete.type_fields[1].value = "6";
+    check(rejects(incomplete, 103), "lightning transition count respects native five-destination storage");
+
+    pw_effect_preparation prepared;
+    prepared.valid = true;
+    prepared.instances.emplace_back();
+    auto& parent = prepared.instances[0].document;
+    parent.version = 103;
+    pw_effect_element container;
+    container.type = 200;
+    container.base_fields = {{"Name", "Nested"}, {"SrcBlend", "5"}, {"DestBlend", "2"}};
+    pw_effect_keypoint point;
+    point.duration_ms = UINT32_MAX;
+    point.direction = {0, 0, 0, 1};
+    point.scale = 1;
+    point.color_argb = UINT32_MAX;
+    container.keypoints.push_back(point);
+    legacy.base_fields = {{"Name", "Lightning"}, {"SrcBlend", "5"}, {"DestBlend", "2"}};
+    legacy.keypoints.push_back(point);
+    pw_effect_dependency dependency;
+    dependency.kind = "gfx";
+    dependency.nested = std::make_shared<pw_effect_document>();
+    dependency.nested->valid = true;
+    dependency.nested->version = 90;
+    dependency.nested->elements.push_back(legacy);
+    container.dependencies.push_back(dependency);
+    parent.elements.push_back(container);
+    pw_map_effects_runtime valid;
+    valid.begin(prepared, "app:/data/a61", 1);
+    check(valid.error().empty(), "nested lightning uses its own GFX 90 version inside a GFX 103 parent");
+    dependency.nested->version = 103;
+    pw_map_effects_runtime invalid;
+    invalid.begin(std::move(prepared), "app:/data/a61", 2);
+    check(invalid.error().find("DestNum") != std::string::npos,
+          "modern nested lightning missing DestNum fails program creation before publication");
+}
+
 void test_native_login_runtime_contract()
 {
     pw_effect_element ring;
@@ -351,6 +423,7 @@ auto run_pw_map_effects_suite(rtti::context&) -> int
     test_source_instances();
     test_prepared_native_noise_and_curve();
     test_native_login_shapes();
+    test_native_lightning_amplitude_versions();
     test_native_login_runtime_contract();
     test_external_native_candidate();
     std::printf("\n%d checks, %d failures\n", checks, failures);

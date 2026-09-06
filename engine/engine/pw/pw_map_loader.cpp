@@ -1,6 +1,7 @@
 #include "pw_map_loader.h"
 #include "pw_map_manifest.h"
 #include "pw_map_effects.h"
+#include "pw_map_component.h"
 #include <engine/threading/threader.h>
 #include <unordered_set>
 #include <unordered_map>
@@ -203,7 +204,7 @@ auto map_title_from_slug(const std::string& slug) -> std::string
 auto make_generated_map_asset_key(const std::string& map_slug, uint64_t generation, const std::string& suffix)
     -> std::string
 {
-    return "app:/generated/pw_map_" + map_slug + "_" + std::to_string(generation) + "_" + suffix;
+    return "app:/embedded/pw_map_" + map_slug + "_" + std::to_string(generation) + "_" + suffix;
 }
 
 auto make_asset_key(const std::string& content_root, std::string relative) -> std::string
@@ -3093,17 +3094,27 @@ auto pw_map_ownership::rebind(entt::registry& registry, entt::handle& root, std:
             if(id == root_id) root = handle;
         }
     }
-    if(roots != 1 || !root.valid())
+    const bool descriptor_owned = !descriptor_id.is_nil();
+    const auto marker_matches = [&](entt::handle entity)
+    {
+        const auto* marker = entity.try_get<pw_map_generated_component>();
+        return marker && marker->descriptor_id == descriptor_id && marker->generation == generation;
+    };
+    const bool valid_root = roots == 1 && root.valid() && (!descriptor_owned || marker_matches(root));
+    if(!valid_root)
     {
         root = {};
-        return false;
+        // Only cleanup may retire marked members after their anchor was removed.
+        // Strict scene adoption still requires the unique, matching map root.
+        if(require_all || !descriptor_owned) return false;
     }
     std::vector<entt::handle> resolved;
     resolved.reserve(entity_ids.size());
     for(const auto& id : entity_ids)
     {
         const auto found = by_id.find(id);
-        if(found == by_id.end() || !transform_component::is_parent_of(root, found->second))
+        if(found == by_id.end() ||
+           (descriptor_owned ? !marker_matches(found->second) : !transform_component::is_parent_of(root, found->second)))
         {
             if(require_all) return false;
             continue;
@@ -3111,7 +3122,7 @@ auto pw_map_ownership::rebind(entt::registry& registry, entt::handle& root, std:
         resolved.push_back(found->second);
     }
     entities = std::move(resolved);
-    return true;
+    return valid_root || !entities.empty();
 }
 
 void restore_pw_map_environment(entt::registry& registry, pw_map_environment_state& original_states)
@@ -3148,14 +3159,131 @@ auto pw_map_loader::deinit(rtti::context& ctx) -> bool
     attempted_content_root_.clear();
     attempted_map_slug_.clear();
     map_start_error_.clear();
+    scene_descriptor_ = {};
     return true;
 }
 void pw_map_loader::on_frame_end(rtti::context& ctx, delta_t dt)
 {
     reset_login_loader_if_scene_changed(ctx);
+    service_scene_descriptor(ctx);
     install_prepared_map(ctx);
     service_login_loader(ctx);
     update_map_effects(ctx, dt);
+    update_scene_descriptor_status(ctx);
+}
+
+void pw_map_loader::bind_scene_descriptor(rtti::context& ctx, login_loader& state)
+{
+    if(state.descriptor_id.is_nil() || !state.scene_anchor.valid()) return;
+    auto& scn = ctx.get_cached<ecs>().get_scene();
+    auto descriptor = scn.find_entity_by_uuid(state.descriptor_id);
+    if(!descriptor || !descriptor.all_of<pw_map_component, transform_component>()) return;
+    auto& marker = state.scene_anchor.get_or_emplace<pw_map_generated_component>();
+    marker.descriptor_id = state.descriptor_id;
+    marker.generation = state.generation;
+    marker.authored_environment_active = state.shared_entity_rollbacks;
+    state.ownership.descriptor_id = state.descriptor_id;
+    state.ownership.generation = state.generation;
+    for(auto entity : state.created_entities)
+    {
+        if(!entity.valid()) continue;
+        auto& owned_marker = entity.get_or_emplace<pw_map_generated_component>();
+        owned_marker.descriptor_id = state.descriptor_id;
+        owned_marker.generation = state.generation;
+    }
+    auto& transform = state.scene_anchor.get<transform_component>();
+    if(transform.get_parent() != descriptor) transform.set_parent(descriptor, true);
+}
+
+void pw_map_loader::service_scene_descriptor(rtti::context& ctx)
+{
+    auto& scn = ctx.get_cached<ecs>().get_scene();
+    entt::handle descriptor;
+    size_t enabled_count = 0;
+    auto descriptors = scn.registry->view<pw_map_component, id_component>();
+    descriptors.each([&](auto entity, auto& component, auto& identity)
+    {
+        if(!component.auto_load)
+        {
+            component.status = "disabled";
+            component.error.clear();
+            return;
+        }
+        identity.generate_if_nil();
+        if(component.runtime_instance_token == 0) component.runtime_instance_token = ++next_descriptor_token_;
+        descriptor = entt::handle(*scn.registry, entity);
+        ++enabled_count;
+    });
+    if(enabled_count != 1)
+    {
+        if(!scene_descriptor_.id.is_nil())
+        {
+            // Removing/disabling the descriptor retires only the map service's
+            // graph. Other authored scene objects never enter its ownership list.
+            despawn_loaded_map(ctx);
+            login_ = {};
+            attempted_content_root_.clear();
+            attempted_map_slug_.clear();
+            map_start_error_.clear();
+            scene_descriptor_ = {};
+        }
+        if(enabled_count > 1)
+            descriptors.each([](auto, auto& component, auto&)
+            {
+                if(component.auto_load)
+                {
+                    component.status = "error";
+                    component.error = "A scene can contain only one enabled PW map descriptor";
+                }
+            });
+        return;
+    }
+    auto& component = descriptor.get<pw_map_component>();
+    const scene_descriptor_request request{descriptor.get<id_component>().id, component.runtime_instance_token,
+        component.content_root, component.map_slug, component.buildings_per_frame, component.require_full};
+    if(scene_descriptor_ == request)
+    {
+        if(!preparing_ && login_.status == "idle" && map_start_error_.empty())
+            map_start_error_ = "Generated map hierarchy was removed; reopen the scene or edit its map settings to reload";
+        return;
+    }
+    // Record even a rejected configuration: it must not retry each frame. A
+    // config edit or a newly deserialized component creates the next attempt.
+    scene_descriptor_ = request;
+    component.status = "preparing";
+    component.error.clear();
+    if(preparing_) cancel_preparation(ctx);
+    if(login_.active)
+    {
+        destroy_map(ctx, login_);
+        login_ = previous_ ? std::move(*previous_) : login_loader{};
+        previous_.reset();
+    }
+    start_map_load(ctx, request.content_root, request.map_slug, request.buildings_per_frame, false, request.require_full);
+    if(preparing_)
+    {
+        preparation_descriptor_id_ = request.id;
+    }
+    else if(map_start_error_.empty() && (login_.completed || login_.active))
+    {
+        // An accepted map already in a Play checkpoint keeps its real resources.
+        login_.descriptor_id = request.id;
+        login_.buildings_per_frame = std::clamp(request.buildings_per_frame, 1u, 32u);
+        bind_scene_descriptor(ctx, login_);
+    }
+}
+
+void pw_map_loader::update_scene_descriptor_status(rtti::context& ctx)
+{
+    if(scene_descriptor_.id.is_nil()) return;
+    auto& scn = ctx.get_cached<ecs>().get_scene();
+    scn.registry->view<pw_map_component, id_component>().each([&](auto& component, const auto& identity)
+    {
+        if(identity.id != scene_descriptor_.id || component.runtime_instance_token != scene_descriptor_.instance_token) return;
+        component.status = preparing_ ? "preparing" : login_.status;
+        component.error = map_start_error_.empty() ? login_.error : map_start_error_;
+        if(!component.error.empty()) component.status = "error";
+    });
 }
 void pw_map_loader::on_skip_next_frame(rtti::context& ctx)
 {
@@ -3379,6 +3507,7 @@ void pw_map_loader::cancel_preparation(rtti::context& ctx)
         preparation_anchor_.destroy();
     preparation_anchor_ = {};
     preparation_registry_ = nullptr;
+    preparation_descriptor_id_ = {};
 }
 
 void pw_map_loader::despawn_loaded_map(rtti::context& ctx)
@@ -3477,6 +3606,7 @@ void pw_map_loader::start_map_load(rtti::context& ctx,
             preparation_anchor_.destroy();
         }
         preparation_registry_ = scn.registry.get();
+        preparation_descriptor_id_ = {};
         preparation_anchor_ = entt::handle(*scn.registry, scn.registry->create());
         const uint64_t generation = ++next_map_generation_;
         preparation_generation_->store(generation);
@@ -3591,6 +3721,7 @@ void pw_map_loader::install_prepared_map(rtti::context& ctx)
         preparation_ = {};
         preparation_anchor_ = {};
         preparation_registry_ = nullptr;
+        preparation_descriptor_id_ = {};
         attempted_content_root_.clear();
         attempted_map_slug_.clear();
         return;
@@ -3619,6 +3750,8 @@ void pw_map_loader::install_prepared_map(rtti::context& ctx)
             destroy_map(ctx, login_);
         }
         login_ = std::move(next);
+        login_.descriptor_id = preparation_descriptor_id_;
+        preparation_descriptor_id_ = {};
         login_.resource_wait_started = std::chrono::steady_clock::now();
         login_.scene_registry = scn.registry.get();
         login_.scene_anchor = scene::create_entity(*scn.registry, "PW Map " + login_.map_slug);
@@ -3626,6 +3759,7 @@ void pw_map_loader::install_prepared_map(rtti::context& ctx)
         login_.ownership.root_id = login_.scene_anchor.get<id_component>().id;
         login_.scene_anchor.get<tag_component>().tag = login_.ownership.root_tag;
         login_.scene_anchor.get<transform_component>().set_active(false);
+        bind_scene_descriptor(ctx, login_);
         attempted_content_root_.clear();
         attempted_map_slug_.clear();
     }
@@ -3837,6 +3971,12 @@ void pw_map_loader::service_login_loader(rtti::context& ctx)
                     entity.get<transform_component>().set_parent(login_.scene_anchor, true);
                 if(i >= login_.ownership.entity_ids.size())
                     login_.ownership.entity_ids.push_back(entity.get<id_component>().id);
+                if(!login_.descriptor_id.is_nil())
+                {
+                    auto& marker = entity.get_or_emplace<pw_map_generated_component>();
+                    marker.descriptor_id = login_.descriptor_id;
+                    marker.generation = login_.generation;
+                }
             }
         }
     };
@@ -3969,6 +4109,7 @@ void pw_map_loader::service_login_loader(rtti::context& ctx)
         {
             suppress_external_map_environment(ctx, login_.created_entities, login_.shared_entity_rollbacks);
         }
+        bind_scene_descriptor(ctx, login_);
         login_.scene_anchor.get<transform_component>().set_active(true);
         login_.active = false;
         login_.completed = true;

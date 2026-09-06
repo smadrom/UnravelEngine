@@ -133,6 +133,9 @@ auto make_pw_effect_ring(float radius, float height, float pitch, uint32_t secto
     -> std::vector<std::array<float, 3>>;
 auto sample_pw_effect_box(const std::array<float, 3>& size, bool surface, const std::array<float, 4>& random)
     -> std::array<float, 3>;
+/** Native lightning amplitude: scalar before GFX 102, authored transition track from 102 onward. */
+auto sample_pw_effect_lightning_amplitude(const pw_effect_element& element, int document_version, float elapsed_seconds)
+    -> float;
 
 enum class pw_effect_resource_status { waiting, ready, failed };
 

@@ -1,5 +1,6 @@
 #include "../tests.h"
 #include <engine/pw/pw_effect_shader.h>
+#include <engine/pw/pw_effect_vertex_upload.h>
 
 #include <cmath>
 #include <cstdio>
@@ -54,11 +55,38 @@ auto run_pw_effect_shader_suite(rtti::context&) -> int
     rejected = false;
     try { parse_pw_effect_shader_constants(invalid); } catch(const std::runtime_error&) { rejected = true; }
     check(rejected, "interval cannot overflow its native magnitude");
-    const auto small = pw_screen_warp_strength({0.1f, 0.2f}, 0.5f);
-    check(std::abs(small.x - 0.042f) < 0.000001f && std::abs(small.y - 0.084f) < 0.000001f,
+    const auto small_warp = pw_screen_warp_strength({0.1f, 0.2f}, 0.5f);
+    check(std::abs(small_warp.x - 0.042f) < 0.000001f && std::abs(small_warp.y - 0.084f) < 0.000001f,
           "screen warp uses source attenuation and alpha in both UV axes");
     check(pw_screen_warp_strength({0.49f, 0.1f}, 1) == math::vec2{}, "near-fullscreen warp obeys the source attenuation cutoff");
     check(pw_screen_warp_strength({0.1f, 0.2f}, 0) == math::vec2{}, "transparent source produces no displacement");
+    const auto& layout = pw_effect_gpu_vertex_layout();
+    check(layout.getStride() == sizeof(pw_effect_gpu_vertex) && layout.getStride() == 44,
+          "native effect GPU stride is independent of SIMD-aligned CPU vertices");
+    check(layout.getOffset(bgfx::Attrib::Position) == 0 && layout.getOffset(bgfx::Attrib::TexCoord0) == 12 &&
+          layout.getOffset(bgfx::Attrib::Color0) == 20 && layout.getOffset(bgfx::Attrib::TexCoord1) == 36,
+          "native effect attribute offsets match the uploaded byte stream");
+    const std::array<pw_effect_vertex, 2> cpu_vertices{{
+        {{101, -202, 303}, {0.125f, 0.75f}, {0.1f, 0.2f, 0.3f, 0.4f}, {-0.25f, 0.5f}},
+        {{-404, 505, -606}, {0.625f, 0.875f}, {0.6f, 0.7f, 0.8f, 0.9f}, {0.75f, -1.0f}}}};
+    std::array<unsigned char, 2 * sizeof(pw_effect_gpu_vertex) + 16> guarded_bytes;
+    guarded_bytes.fill(0xa5);
+    copy_pw_effect_vertices(guarded_bytes.data() + 8, cpu_vertices.data(), cpu_vertices.size());
+    const float expected[][11] = {
+        {101, -202, 303, 0.125f, 0.75f, 0.1f, 0.2f, 0.3f, 0.4f, -0.25f, 0.5f},
+        {-404, 505, -606, 0.625f, 0.875f, 0.6f, 0.7f, 0.8f, 0.9f, 0.75f, -1.0f}};
+    for(size_t index = 0; index < cpu_vertices.size(); ++index)
+    {
+        float actual[11]{};
+        std::memcpy(actual, guarded_bytes.data() + 8 + index * layout.getStride(), sizeof(actual));
+        bool matches = true;
+        for(size_t field = 0; field < 11; ++field) matches = matches && actual[field] == expected[index][field];
+        check(matches, "consecutive native effect vertices preserve positions, UVs, colors and warp values at GPU stride");
+    }
+    bool guards_intact = true;
+    for(size_t index = 0; index < 8; ++index)
+        guards_intact = guards_intact && guarded_bytes[index] == 0xa5 && guarded_bytes[guarded_bytes.size() - 1 - index] == 0xa5;
+    check(guards_intact, "native effect upload does not write past the GPU allocation");
     std::printf("PW effect shader constants: %d checks, %d failures\n", checks, failures);
     return failures;
 }

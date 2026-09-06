@@ -21,6 +21,8 @@
 #include <engine/engine.h>
 #include <engine/events.h>
 #include <engine/play_mode.h>
+#include <engine/pw/pw_map_component.h>
+#include <engine/rendering/ecs/components/camera_component.h>
 #include <engine/meta/assets/asset_database.hpp>
 #include <engine/meta/assets/asset_importer_meta.hpp>
 #include <engine/meta/ecs/entity.hpp>
@@ -46,6 +48,39 @@ namespace unravel
 
 namespace
 {
+
+void restore_pw_scene_camera(rtti::context& ctx, scene& scn)
+{
+    const auto descriptors = scn.registry->view<pw_map_component>();
+    if(!ctx.has<hub>() || descriptors.begin() == descriptors.end())
+    {
+        return;
+    }
+    entt::handle source;
+    auto cameras = scn.registry->view<transform_component, camera_component>();
+    for(auto entity : cameras)
+    {
+        if(source)
+        {
+            return; // Multiple authored cameras require an explicit user choice.
+        }
+        source = entt::handle{*scn.registry, entity};
+    }
+    auto target = ctx.get_cached<hub>().get_panels().get_scene_panel().get_camera();
+    if(!source || !target || !target.all_of<transform_component, camera_component>())
+    {
+        return;
+    }
+    const auto& source_transform = source.get<transform_component>();
+    const auto& source_camera = source.get<camera_component>();
+    auto& target_transform = target.get<transform_component>();
+    auto& target_camera = target.get<camera_component>();
+    target_transform.set_position_global(source_transform.get_position_global());
+    target_transform.set_rotation_global(source_transform.get_rotation_global());
+    target_camera.set_fov(source_camera.get_fov());
+    target_camera.set_near_clip(source_camera.get_near_clip());
+    target_camera.set_far_clip(source_camera.get_far_clip());
+}
 
 auto get_vscode_executable() -> fs::path
 {
@@ -1489,6 +1524,7 @@ auto editor_actions::load_scene_from_asset(rtti::context& ctx,
     }
 
     em.sync_prefab_instances(ctx, &scene);
+    restore_pw_scene_camera(ctx, scene);
     em.clear_unsaved_changes();
 
     if(ctx.has<project_manager>())

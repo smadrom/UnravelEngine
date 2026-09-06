@@ -116,7 +116,7 @@ SAVE(transform_component)
     try_save(ar, ser20::make_nvp("local_transform",  obj.get_transform_local()));
     try_save(ar, ser20::make_nvp("parent", is_root ? entt::handle{} : obj.get_parent()));
     try_save(ar, ser20::make_nvp("children", obj.get_children()));
-    try_save(ar, ser20::make_nvp("active", obj.is_active()));
+    try_save(ar, ser20::make_nvp("active", scene_file_active_value(obj.get_owner(), obj.is_active())));
 }
 SAVE_INSTANTIATE(transform_component, ser20::oarchive_associative_t);
 SAVE_INSTANTIATE(transform_component, ser20::oarchive_binary_t);

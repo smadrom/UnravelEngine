@@ -1877,7 +1877,13 @@ auto read_importer<animation_clip>(asset_manager& am, const fs::path& key) -> st
                 save_to_file(temp.string(), meta);
             }, err);
 
-            return nullptr;
+            if(err)
+            {
+                APPLOG_ERROR("Failed to save animation importer metadata: {0}: {1}", absolute, err.message());
+                return nullptr;
+            }
+            // The initial watcher scan can run before change notifications are connected.
+            // Compile with the settings just created instead of depending on a second event.
         }
     }
 
@@ -1893,7 +1899,7 @@ auto compile<animation_clip>(asset_manager& am, const fs::path& key, const fs::p
 
     if(!base_importer)
     {
-        return true;
+        return false;
     }
 
     auto importer = std::static_pointer_cast<animation_importer_meta>(base_importer);
@@ -1913,7 +1919,6 @@ auto compile<animation_clip>(asset_manager& am, const fs::path& key, const fs::p
         anim.root_motion.keep_rotation = importer->root_motion.keep_rotation;
         anim.root_motion.keep_in_place = importer->root_motion.keep_in_place;
 
-        fs::error_code err;
         asset_writer::atomic_write_file(output, [&](const fs::path& temp) -> void
         {
             save_to_file_bin(temp.string(), anim);

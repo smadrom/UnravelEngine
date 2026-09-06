@@ -13,6 +13,9 @@
 namespace unravel
 {
 
+/// Disk scene saves restore authored environment flags without changing the live scene.
+auto scene_file_active_value(entt::const_handle entity, bool runtime_active) -> bool;
+
     
 template<typename Entity>
 struct entity_components

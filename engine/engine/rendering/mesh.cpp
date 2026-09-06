@@ -1332,7 +1332,9 @@ void mesh::build_vb(bool hardware_copy)
         const uint16_t vb_flags =
             BGFX_BUFFER_COMPUTE_READ | BGFX_BUFFER_COMPUTE_FORMAT_32X1 | BGFX_BUFFER_COMPUTE_TYPE_FLOAT;
 
-        const gfx::memory_view* mem = gfx::make_ref(system_vb_, buffer_size);
+        // Upload commands outlive this call and can outlive a hot-reloaded mesh.
+        // Give the renderer its own bytes instead of borrowing the CPU buffer.
+        const gfx::memory_view* mem = gfx::copy(system_vb_, buffer_size);
         hardware_vb_ = std::make_shared<gfx::vertex_buffer>(mem, vertex_format_, vb_flags);
 
     } // End if video memory vertex buffer required
@@ -1356,7 +1358,7 @@ void mesh::build_ib(bool hardware_copy)
         // Allocate hardware buffer if required (i.e. it does not already exist).
         if(!hardware_ib_)
         {
-            const gfx::memory_view* mem = gfx::make_ref(system_ib_, buffer_size);
+            const gfx::memory_view* mem = gfx::copy(system_ib_, buffer_size);
             hardware_ib_ = std::make_shared<gfx::index_buffer>(mem, ib_flags);
         } // End if not allocated
         else
@@ -1364,7 +1366,7 @@ void mesh::build_ib(bool hardware_copy)
             auto ib = std::static_pointer_cast<gfx::index_buffer>(hardware_ib_);
             if(!ib->is_valid())
             {
-                const gfx::memory_view* mem = gfx::make_ref(system_ib_, buffer_size);
+                const gfx::memory_view* mem = gfx::copy(system_ib_, buffer_size);
                 hardware_ib_ = std::make_shared<gfx::index_buffer>(mem, ib_flags);
             }
         }
@@ -2194,6 +2196,19 @@ auto mesh::apply_skin_to_load_data(load_data& data) -> bool
         return true; // No skinning needed
     }
 
+    for(const auto& bone : data.skin_data.get_bones())
+    {
+        for(const auto& influence : bone.influences)
+        {
+            if(influence.vertex_index >= data.vertex_count)
+            {
+                APPLOG_ERROR("Skin influence vertex {0} exceeds imported vertex count {1}",
+                             influence.vertex_index, data.vertex_count);
+                return false;
+            }
+        }
+    }
+
     // Build vertex table with bone influences
     skin_bind_data::vertex_data_array_t vertex_table;
     data.skin_data.build_vertex_table(data.vertex_count, {}, vertex_table);
@@ -2781,7 +2796,7 @@ auto mesh::restore_lods_from_load_data(const load_data& data) -> bool
         if(hardware_mesh_ && lod.system_ib_ && lod.face_count_ > 0)
         {
             auto buffer_size = static_cast<uint32_t>(lod.face_count_ * 3 * sizeof(uint32_t));
-            const gfx::memory_view* mem = gfx::make_ref(lod.system_ib_, buffer_size);
+            const gfx::memory_view* mem = gfx::copy(lod.system_ib_, buffer_size);
             // Same compute-read flags as base LOD so any LOD can be used as a
             // read-only buffer inside shaders (e.g. vertex pulling for wireframe overlay).
             const uint16_t ib_flags = BGFX_BUFFER_INDEX32

@@ -567,6 +567,11 @@ auto make_camera_set_result(rtti::context& ctx, mcp_system& sys, const json& par
         camera_comp.set_far_clip(params["far_clip"].get<float>());
     }
 
+    if(params.value("sync_viewport", false))
+    {
+        sys.sync_camera_to_scene_viewport(ctx);
+    }
+
     return make_camera_result(camera);
 }
 
@@ -747,6 +752,33 @@ auto make_load_map_result(rtti::context& ctx, mcp_system& sys, const json& param
 auto make_login_status_result(const mcp_system::login_load_status& status) -> json
 {
     json result;
+    if(const auto* stats = gfx::get_stats())
+    {
+        if(const auto* caps = gfx::get_caps())
+        {
+            result["graphics_resources"] = {
+                {"index_buffers", stats->numIndexBuffers},
+                {"max_index_buffers", caps->limits.maxIndexBuffers},
+                {"vertex_buffers", stats->numVertexBuffers},
+                {"max_vertex_buffers", caps->limits.maxVertexBuffers},
+                {"textures", stats->numTextures},
+                {"max_textures", caps->limits.maxTextures},
+            };
+        }
+        result["frame_stats"] = {{"draw_calls", stats->numDraw}, {"compute_calls", stats->numCompute}};
+        if(stats->cpuTimerFreq > 0 && stats->cpuTimeFrame > 0)
+            result["frame_stats"]["cpu_frame_ms"] = 1000.0 * double(stats->cpuTimeFrame) / double(stats->cpuTimerFreq);
+        if(stats->gpuTimerFreq > 0 && stats->gpuTimeEnd > stats->gpuTimeBegin)
+            result["frame_stats"]["gpu_frame_ms"] = 1000.0 * double(stats->gpuTimeEnd - stats->gpuTimeBegin) / double(stats->gpuTimerFreq);
+        if(stats->textureMemoryUsed >= 0)
+            result["frame_stats"]["texture_bytes_estimate"] = stats->textureMemoryUsed;
+        if(stats->rtMemoryUsed >= 0)
+            result["frame_stats"]["render_target_bytes_estimate"] = stats->rtMemoryUsed;
+        if(stats->gpuMemoryUsed >= 0)
+            result["frame_stats"]["gpu_memory_bytes"] = stats->gpuMemoryUsed;
+        if(stats->gpuMemoryMax >= 0)
+            result["frame_stats"]["gpu_memory_budget_bytes"] = stats->gpuMemoryMax;
+    }
     result["status"] = status.status;
     result["content_root"] = status.content_root;
     result["map"] = status.map;

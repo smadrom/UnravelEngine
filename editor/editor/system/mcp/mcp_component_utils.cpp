@@ -8,6 +8,7 @@
 #include <engine/audio/audio_clip.h>
 #include <engine/audio/ecs/components/audio_source_component.h>
 #include <engine/physics/ecs/components/physics_component.h>
+#include <engine/pw/pw_map_component.h>
 #include <engine/rendering/ecs/components/bloom_component.h>
 #include <engine/rendering/ecs/components/camera_component.h>
 #include <engine/rendering/ecs/components/light_component.h>
@@ -23,6 +24,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <unordered_set>
@@ -3123,6 +3125,100 @@ auto apply_bloom_properties(bloom_component& comp,
     }
 }
 
+auto pw_map_to_json(const pw_map_component& comp, const std::unordered_set<std::string>* filter) -> std::string
+{
+    std::string json = "{";
+    bool first = true;
+    if(wants_key(filter, "content_root"))
+    {
+        append_prop(json, first, "content_root", make_json_string(comp.content_root));
+    }
+    if(wants_key(filter, "map_slug"))
+    {
+        append_prop(json, first, "map_slug", make_json_string(comp.map_slug));
+    }
+    if(wants_key(filter, "auto_load"))
+    {
+        append_prop(json, first, "auto_load", comp.auto_load ? "true" : "false");
+    }
+    if(wants_key(filter, "require_full"))
+    {
+        append_prop(json, first, "require_full", comp.require_full ? "true" : "false");
+    }
+    if(wants_key(filter, "buildings_per_frame"))
+    {
+        append_prop(json, first, "buildings_per_frame", fmt::format("{}", comp.buildings_per_frame));
+    }
+    if(wants_key(filter, "status"))
+    {
+        append_prop(json, first, "status", make_json_string(comp.status));
+    }
+    if(wants_key(filter, "error"))
+    {
+        append_prop(json, first, "error", make_json_string(comp.error));
+    }
+    json += "}";
+    return json;
+}
+
+auto apply_pw_map_properties(pw_map_component& comp,
+                             const simdjson::dom::object& properties,
+                             component_apply_result& result) -> void
+{
+    for(auto field : properties)
+    {
+        const std::string key(field.key);
+        const auto& value = field.value;
+        std::string error;
+        auto fail = [&](const std::string& message)
+        {
+            result.ok = false;
+            result.errors.push_back(key + ": " + message);
+        };
+        auto applied = [&]()
+        {
+            result.applied.push_back(key);
+        };
+        if(key == "content_root")
+        {
+            parse_string(value, comp.content_root, error) ? applied() : fail(error);
+        }
+        else if(key == "map_slug")
+        {
+            parse_string(value, comp.map_slug, error) ? applied() : fail(error);
+        }
+        else if(key == "auto_load")
+        {
+            parse_bool(value, comp.auto_load, error) ? applied() : fail(error);
+        }
+        else if(key == "require_full")
+        {
+            parse_bool(value, comp.require_full, error) ? applied() : fail(error);
+        }
+        else if(key == "buildings_per_frame")
+        {
+            uint64_t count = 0;
+            if(value.get(count) || count == 0 || count > std::numeric_limits<uint32_t>::max())
+            {
+                fail("Expected integer in [1, 4294967295]");
+            }
+            else
+            {
+                comp.buildings_per_frame = static_cast<uint32_t>(count);
+                applied();
+            }
+        }
+        else if(key == "status" || key == "error")
+        {
+            fail("Runtime property is read-only");
+        }
+        else
+        {
+            result.unknown.push_back(key);
+        }
+    }
+}
+
 auto to_filter_set(const std::vector<std::string>* filter) -> std::unique_ptr<std::unordered_set<std::string>>
 {
     if(!filter || filter->empty())
@@ -3310,6 +3406,13 @@ auto list_component_property_schema_json(const std::string& component_filter) ->
     add("Bloom", "clamp", "number");
     add("Bloom", "intensity", "number");
     add("Bloom", "scatter", "number");
+    add("PW Map", "content_root", "string");
+    add("PW Map", "map_slug", "string");
+    add("PW Map", "auto_load", "boolean");
+    add("PW Map", "require_full", "boolean");
+    add("PW Map", "buildings_per_frame", "integer", R"("minimum":1,"maximum":4294967295)");
+    add("PW Map", "status", "string", R"("readOnly":true)");
+    add("PW Map", "error", "string", R"("readOnly":true)");
     if(all || component_filter == "Script")
     {
         if(!first)
@@ -3331,7 +3434,8 @@ auto is_supported_component_pretty_name(const std::string& component_pretty_name
            component_pretty_name == "Volume" || component_pretty_name == "Script" ||
            component_pretty_name == "Particle Emitter" || component_pretty_name == "Physics" ||
            component_pretty_name == "Animation" || component_pretty_name == "Text" ||
-           component_pretty_name == "Reflection Probe" || component_pretty_name == "Bloom";
+           component_pretty_name == "Reflection Probe" || component_pretty_name == "Bloom" ||
+           component_pretty_name == "PW Map";
 }
 
 auto component_properties_to_json(rtti::context& ctx,
@@ -3468,6 +3572,16 @@ auto component_properties_to_json(rtti::context& ctx,
             return {};
         }
         return bloom_to_json(*comp, filter_ptr);
+    }
+    if(component_pretty_name == "PW Map")
+    {
+        auto* comp = entity.try_get<pw_map_component>();
+        if(!comp)
+        {
+            error = "Component not present on entity: PW Map";
+            return {};
+        }
+        return pw_map_to_json(*comp, filter_ptr);
     }
     error = "Unsupported component for typed properties: " + component_pretty_name;
     return {};
@@ -3630,6 +3744,18 @@ auto apply_component_properties(rtti::context& ctx,
         apply_bloom_properties(*comp, properties, result);
         return result;
     }
+    if(component_pretty_name == "PW Map")
+    {
+        auto* comp = entity.try_get<pw_map_component>();
+        if(!comp)
+        {
+            result.ok = false;
+            result.errors.push_back("Component not present on entity: PW Map");
+            return result;
+        }
+        apply_pw_map_properties(*comp, properties, result);
+        return result;
+    }
     result.ok = false;
     result.errors.push_back("Unsupported component for typed properties: " + component_pretty_name);
     return result;
@@ -3685,6 +3811,7 @@ auto entity_supported_component_properties_json(rtti::context& ctx,
     try_add("Text");
     try_add("Reflection Probe");
     try_add("Bloom");
+    try_add("PW Map");
     // For Script, emit one bag per attached scriptable type.
     if(auto* script = entity.try_get<script_component>())
     {

@@ -114,7 +114,10 @@ auto prepare_pw_effect_model(const fs::path& content_root, const json& dependenc
         {
             output->animation_ref = dependency.at("animationRef").get<std::string>();
             output->animation_duration = dependency.at("animationDurationSeconds").get<double>();
+            const fs::path model_path(output->model_ref);
+            const auto imported_animation = model_path.parent_path() / (model_path.stem().string() + "_idle.anim");
             require(safe_path(output->animation_ref) && fs::path(output->animation_ref).extension() == ".anim" &&
+                    output->animation_ref == imported_animation.generic_string() &&
                     dependency.at("animationName") == "idle" && std::isfinite(output->animation_duration) &&
                     output->animation_duration > 0 && dependency.at("frameCount").get<size_t>() >= 2,
                     "GFX model authored action is incomplete");
@@ -238,8 +241,10 @@ auto pw_effect_model_geometry::prepare(mesh& source, const animation_clip* anima
         }
         if(animation)
         {
-            require(animation->name == "idle" && !animation->channels.empty() && std::isfinite(animation->duration.count()) &&
-                    animation->duration.count() > 0, "GFX model action is not the exported idle clip");
+            // The runtime caller validates the imported clip identity against
+            // its descriptor. Geometry sampling validates the actual channels.
+            require(!animation->channels.empty() && std::isfinite(animation->duration.count()) &&
+                    animation->duration.count() > 0, "GFX model action data is empty or invalid");
             output.animation = *animation;
             for(size_t i = 0; i < animation->channels.size(); ++i)
             {
@@ -451,7 +456,12 @@ auto pw_effect_model_runtime::poll(asset_manager& manager) -> pw_effect_resource
         waiting = waiting || !texture || !texture->is_valid() || texture->info.width == 0 || texture->info.height == 0;
     }
     if(waiting) return pw_effect_resource_status::waiting;
-    if(state.animation_resource && std::abs(state.animation_resource->duration.count() - state.prepared->animation_duration) > 0.002)
+    // process_animation names imported clips <model stem>_<source clip name>.
+    // The export descriptor calls the glTF clip "idle" but references the
+    // generated <model stem>_idle.anim sidecar; neither identity is interchangeable.
+    if(state.animation_resource && state.animation_resource->name != fs::path(state.prepared->animation_ref).stem().string())
+        state.error = "GFX model imported action name differs from animation reference";
+    else if(state.animation_resource && std::abs(state.animation_resource->duration.count() - state.prepared->animation_duration) > 0.002)
         state.error = "GFX model imported action duration differs from source manifest";
     else if(state.model_resource->get_skin_bind_data().get_bones().size() > state.prepared->joint_count)
         state.error = "GFX model imported skeleton exceeds source joint inventory";

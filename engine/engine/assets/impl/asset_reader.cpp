@@ -231,13 +231,15 @@ template<>
 auto load_from_file<animation_clip>(tpp::thread_pool& pool, asset_handle<animation_clip>& output,
                                      const std::string& key, load_mode mode) -> bool
 {
+    // Source .anim files use the associative archive. Until their binary cache
+    // exists, wait instead of reading JSON as binary and publishing an empty clip.
     return detail::schedule_load<animation_clip>(pool, output, key, {},
         [](const std::string& path)
         {
             auto anim = std::make_shared<animation_clip>();
             load_from_file_bin(path, *anim);
             return anim;
-        }, mode);
+        }, mode, false);
 }
 
 template<>

@@ -404,8 +404,12 @@ struct manifest_validator
             require(normalize(read_string(*document, "sourceMap")) == normalize(read_string(manifest, "sourceMap")) &&
                     normalize(read_string(*document, "mapName")) == request.slug, "Scene or EDS manifest map tuple mismatch");
         }
-        require(meta.at("status") == "generated" && meta.at("layout") == "content/maps" &&
-                read_count(meta, "instanceId") == read_count(manifest, "instanceId"), "EDS manifest identity mismatch");
+        // EDS metadata emits instanceId only for positive instance IDs. PW_MAP
+        // always carries the authoritative value, including zero for Login.
+        const uint64_t instance = read_count(manifest, "instanceId");
+        const bool same_instance = meta.contains("instanceId") ? read_count(meta, "instanceId") == instance : instance == 0;
+        require(meta.at("status") == "generated" && meta.at("layout") == "content/maps" && same_instance,
+                "EDS manifest identity mismatch");
         require(meta.at("files").at("scene") == "maps/" + request.slug + "/scene.eds.json" &&
                 meta.at("files").at("sourceManifest") == "_meta/source.manifest.json", "EDS manifest file pointers mismatch");
         const json& cache = meta.at("conversionCache");

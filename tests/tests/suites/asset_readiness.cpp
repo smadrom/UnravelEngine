@@ -4,6 +4,7 @@
 #include <engine/assets/impl/asset_reader.h>
 #include <engine/assets/impl/importers/mesh_importer.h>
 #include <engine/ecs/prefab.h>
+#include <engine/meta/animation/animation.hpp>
 #include <engine/meta/rendering/mesh.hpp>
 #include <engine/pw/detail/json.hpp>
 #include <engine/threading/threader.h>
@@ -154,6 +155,63 @@ void test_failed_mesh_load(tpp::thread_pool& pool, const std::string& prefix)
     check(asset_reader::load_from_file(pool, handle, key), "truncated compiled fixture schedules a load");
     check(wait_for_completion(handle), "truncated compiled fixture finishes loading");
     check(!handle.get_if_ready(), "failed binary reading does not publish an empty mesh");
+}
+
+void test_animation_waits_for_compiled_cache(tpp::thread_pool& pool, const std::string& prefix)
+{
+    const std::string key = prefix + "/authored_idle.anim";
+    const auto source = fs::resolve_protocol(key);
+    animation_clip expected;
+    expected.name = "authored_idle";
+    expected.duration = animation_clip::seconds_t(1.25f);
+    animation_channel channel;
+    channel.node_name = "root";
+    channel.position_keys = {{animation_channel::seconds_t(0), {1, 2, 3}}, {expected.duration, {4, 5, 6}}};
+    channel.rotation_keys = {{animation_channel::seconds_t(0), math::identity<math::quat>()}};
+    channel.scaling_keys = {{animation_channel::seconds_t(0), {1, 1, 1}}};
+    expected.channels.push_back(channel);
+    fs::create_directories(source.parent_path());
+    save_to_file(source.string(), expected);
+    animation_clip source_roundtrip;
+    load_from_file(source.string(), source_roundtrip);
+    check(source_roundtrip.name == expected.name && source_roundtrip.duration == expected.duration &&
+          source_roundtrip.channels == expected.channels, "source animation is a valid nonempty associative archive");
+    const auto compiled = asset_reader::resolve_compiled_path<animation_clip>(key);
+    check(!fs::exists(compiled), "source animation starts without its compiled cache");
+    asset_handle<animation_clip> handle;
+    check(!asset_reader::load_from_file(pool, handle, key), "JSON animation is not accepted as binary before compilation");
+    check(!handle.get_if_ready(), "JSON source cannot publish an empty ready animation");
+    check(asset_reader::load_from_file(pool, handle, key, load_mode::deferred), "uncompiled animation can schedule a deferred load");
+    check(wait_for_completion(handle), "uncompiled animation deferred attempt completes");
+    check(!handle.get_if_ready(), "deferred JSON source does not publish an empty ready animation");
+    const auto retained_handle = handle;
+    fs::create_directories(compiled.parent_path());
+    save_to_file_bin(compiled.string(), expected);
+    check(asset_reader::load_from_file(pool, handle, key, load_mode::deferred), "compiled animation schedules a replacement load");
+    check(wait_for_completion(retained_handle), "retained animation handle resolves after binary compilation");
+    const auto ready = retained_handle.get_if_ready();
+    check(ready && ready->name == expected.name && ready->duration == expected.duration &&
+          ready->channels == expected.channels, "compiled animation returns the same authored name, duration and channels");
+}
+
+void test_invalid_skin_vertex_rejected()
+{
+    constexpr uint32_t vertex_count = 3;
+    for(const uint32_t invalid_vertex : {vertex_count, vertex_count + 1})
+    {
+        mesh::load_data data;
+        data.vertex_format = gfx::mesh_vertex::get_layout();
+        data.vertex_count = vertex_count;
+        data.vertex_data.resize(vertex_count * data.vertex_format.getStride());
+        skin_bind_data::bone_influence bone;
+        bone.bone_id = "root";
+        bone.influences = {{invalid_vertex, 1.0f}};
+        data.skin_data.add_bone(bone);
+        const auto original_vertices = data.vertex_data;
+        check(!mesh::apply_skin_to_load_data(data), "skin influence at or beyond vertex_count is rejected: " + std::to_string(invalid_vertex));
+        check(!data.skin_is_prepared && data.vertex_count == vertex_count && data.vertex_data == original_vertices &&
+              data.bone_palette_bones.empty(), "invalid skin does not partially prepare or overwrite geometry");
+    }
 }
 
 auto import_fixture(asset_manager& am, const fs::path& path, mesh::load_data& data,
@@ -313,6 +371,27 @@ void test_external_map_meshes(asset_manager& am)
                                  std::isfinite(influence.weight) && influence.weight >= 0 && influence.weight <= 1;
             }
             check(valid_skin, "Assimp skin targets existing armature nodes and bounded vertices: " + relative);
+            if(valid_skin && data.skin_data.has_bones())
+            {
+                const uint32_t imported_vertices = data.vertex_count;
+                const uint32_t imported_triangles = data.triangle_count;
+                const bool prepared = mesh::apply_skin_to_load_data(data);
+                check(prepared && data.skin_is_prepared, "actual PW skin completes the compiler preparation stage: " + relative);
+                if(prepared)
+                {
+                    check(data.vertex_count >= imported_vertices && data.triangle_count == imported_triangles &&
+                          data.triangle_data.size() == imported_triangles &&
+                          data.vertex_data.size() == size_t(data.vertex_count) * data.vertex_format.getStride(),
+                          "prepared PW skin retains its complete geometry and vertex buffer: " + relative);
+                    bool valid_indices = true;
+                    for(const auto& triangle : data.triangle_data)
+                        for(const uint32_t index : triangle.indices) valid_indices = valid_indices && index < data.vertex_count;
+                    check(valid_indices && data.bone_palette_bones.size() == data.submeshes.size(),
+                          "prepared PW skin has bounded triangles and a palette for every submesh: " + relative);
+                }
+                std::printf("PW skin preparation: %s vertices %u -> %u, triangles %u, prepared %d\n",
+                            relative.c_str(), imported_vertices, data.vertex_count, imported_triangles, prepared ? 1 : 0);
+            }
             if(section == "gfx")
             {
                 check(data.skin_data.get_bones().size() <= entry.at("jointCount").get<size_t>(),
@@ -326,9 +405,9 @@ void test_external_map_meshes(asset_manager& am)
             }
             const auto clip = std::find_if(animations.begin(), animations.end(), [&](const auto& value)
             {
-                return value.name == entry.value("animationName", std::string{});
+                return value.name == fs::path(relative).stem().string() + "_" + entry.value("animationName", std::string{});
             });
-            check(clip != animations.end(), "actual " + section + " retains the authored animation name: " + relative);
+            check(clip != animations.end(), "actual " + section + " retains the imported authored animation name: " + relative);
             if(clip == animations.end()) continue;
             check(std::isfinite(clip->duration.count()) && clip->duration.count() > 0 &&
                   std::abs(clip->duration.count() - entry.value("animationDurationSeconds", 0.0f)) < 0.002f,
@@ -361,7 +440,8 @@ void test_cpu_terrain_preparation()
     check(terrain.get_vertex_count() == 9 && terrain.get_face_count() == 8,
           "CPU terrain retains its complete geometry for later upload");
     check(terrain.get_system_vb() && terrain.get_system_ib(), "CPU terrain owns both source buffers");
-    check(!terrain.get_hardware_vb()->is_valid() && !terrain.get_hardware_ib()->is_valid(),
+    check((!terrain.get_hardware_vb() || !terrain.get_hardware_vb()->is_valid()) &&
+          (!terrain.get_hardware_ib() || !terrain.get_hardware_ib()->is_valid()),
           "CPU terrain preparation does not allocate GPU buffers");
     check(terrain.get_sdf_count() > 0 && terrain.get_sdf(0).is_valid(), "CPU terrain retains the normal SDF bake");
 }
@@ -378,6 +458,8 @@ auto run_asset_readiness_suite(rtti::context& ctx) -> int
     const auto compiled_root = asset_reader::resolve_compiled_path<mesh>(prefix + "/fixture.glb").parent_path();
     test_nonblocking_handle(pool);
     test_failed_mesh_load(pool, prefix);
+    test_animation_waits_for_compiled_cache(pool, prefix);
+    test_invalid_skin_vertex_rejected();
     test_pw_gltf_convention(am, source_root);
     test_cpu_terrain_preparation();
     test_external_map_meshes(am);

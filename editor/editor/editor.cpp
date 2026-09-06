@@ -267,6 +267,13 @@ auto editor::deinit() -> bool
         return false;
     }
 
+    // Project settings hold asset handles: save their UIDs before unwatch invalidates
+    // them, while project-close callbacks still have live panels and ImGui resources.
+    if(!ctx.get_cached<project_manager>().deinit(ctx))
+    {
+        return false;
+    }
+
     if(!ctx.get_cached<thumbnail_manager>().deinit(ctx))
     {
         return false;
@@ -294,11 +301,6 @@ auto editor::deinit() -> bool
 
     
     if(!ctx.get_cached<asset_watcher>().deinit(ctx))
-    {
-        return false;
-    }
-
-    if(!ctx.get_cached<project_manager>().deinit(ctx))
     {
         return false;
     }
