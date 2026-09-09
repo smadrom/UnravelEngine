@@ -804,6 +804,9 @@ auto make_login_status_result(const mcp_system::login_load_status& status) -> js
     result["ecmodels_created"] = status.ecmodels_created;
     result["effects_total"] = status.effects_total;
     result["effects_created"] = status.effects_created;
+    result["effects_updated"] = status.effects_updated;
+    result["effects_frozen"] = status.effects_frozen;
+    result["effects_deferred"] = status.effects_deferred;
     result["ready_effect_ids"] = status.ready_effect_ids;
     result["ready_grass_ids"] = status.ready_grass_ids;
     result["ready_ecmodel_ids"] = status.ready_ecmodel_ids;

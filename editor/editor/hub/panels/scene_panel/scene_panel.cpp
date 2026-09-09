@@ -27,6 +27,7 @@
 #include <engine/rendering/ecs/systems/ik_solvers.h>
 #include <engine/rendering/ecs/systems/model_system.h>
 #include <engine/rendering/ecs/systems/rendering_system.h>
+#include <engine/pw/pw_map_loader.h>
 #include <engine/rendering/material.h>
 #include <engine/rendering/mesh.h>
 #include <engine/rendering/model.h>
@@ -1416,9 +1417,22 @@ void scene_panel::on_frame_update(rtti::context& ctx, delta_t dt)
 {
     handle_prefab_mode_changes(ctx);
 
+    auto& map_loader = ctx.get_cached<pw_map_loader>();
     if(!is_visible())
     {
+        map_loader.set_effect_observer(nullptr);
         return;
+    }
+
+    // The Scene camera is not a game-scene camera; hand its position to the PW map effect culling.
+    if(auto camera = get_camera(); camera && camera.all_of<transform_component>())
+    {
+        const auto position = camera.get<transform_component>().get_position_global();
+        map_loader.set_effect_observer(&position);
+    }
+    else
+    {
+        map_loader.set_effect_observer(nullptr);
     }
 
     auto& path = ctx.get_cached<rendering_system>();

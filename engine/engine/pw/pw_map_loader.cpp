@@ -3294,6 +3294,17 @@ void pw_map_loader::update_map_effects(rtti::context& ctx, delta_t dt)
     auto& accepted = previous_ ? *previous_ : login_;
     if(accepted.completed && accepted.effects)
     {
+        std::vector<std::array<float, 3>> observers;
+        if(has_effect_observer_)
+            observers.push_back({effect_observer_.x, effect_observer_.y, effect_observer_.z});
+        auto& scn = ctx.get_cached<ecs>().get_scene();
+        scn.registry->view<camera_component, transform_component>().each(
+            [&](auto, const auto&, const auto& transform)
+            {
+                const auto& position = transform.get_position_global();
+                observers.push_back({position.x, position.y, position.z});
+            });
+        accepted.effects->set_observers(std::move(observers));
         accepted.effects->update(ctx, dt.count());
         if(!accepted.effects->error().empty() && accepted.error != accepted.effects->error())
         {
@@ -3303,6 +3314,12 @@ void pw_map_loader::update_map_effects(rtti::context& ctx, delta_t dt)
         }
     }
 }
+void pw_map_loader::set_effect_observer(const math::vec3* position)
+{
+    has_effect_observer_ = position != nullptr;
+    if(position) effect_observer_ = *position;
+}
+
 void pw_map_loader::on_play_transition(rtti::context& ctx)
 {
     // A splash scene can temporarily remove the game graph before on_play_begin.
@@ -3835,6 +3852,13 @@ auto pw_map_loader::get_login_load_status() const -> login_load_status
     result.effects_total = login_.manifest ? static_cast<uint32_t>(login_.manifest->effect_ids.size()) : 0;
     if(login_.effects) result.ready_effect_ids = login_.effects->ready_ids();
     result.effects_created = static_cast<uint32_t>(result.ready_effect_ids.size());
+    if(login_.effects)
+    {
+        const auto& plan = login_.effects->last_update_plan();
+        result.effects_updated = static_cast<uint32_t>(plan.update.size());
+        result.effects_frozen = static_cast<uint32_t>(plan.freeze.size());
+        result.effects_deferred = static_cast<uint32_t>(plan.deferred);
+    }
     for(const auto& item : login_.grass)
         if(item.ready) result.ready_grass_ids.push_back(item.source_id);
     for(const auto& item : login_.ecmodels)

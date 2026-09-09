@@ -506,4 +506,56 @@ auto poll_pw_effect_textures(asset_manager& manager, const std::string& content_
     }
     return waiting ? pw_effect_resource_status::waiting : pw_effect_resource_status::ready;
 }
+
+auto plan_pw_effect_updates(const std::vector<pw_effect_instance>& instances,
+                            const std::vector<std::array<float, 3>>& observers,
+                            const pw_effect_update_policy& policy, size_t& cursor) -> pw_effect_update_plan
+{
+    pw_effect_update_plan plan;
+    const size_t count = instances.size();
+    if(count == 0)
+    {
+        cursor = 0;
+        return plan;
+    }
+    const bool cull = policy.update_radius > 0.0f && !observers.empty();
+    const float radius_sq = policy.update_radius * policy.update_radius;
+    std::vector<size_t> near_set;
+    near_set.reserve(count);
+    for(size_t index = 0; index < count; ++index)
+    {
+        bool is_near = !cull;
+        if(cull)
+        {
+            const auto& p = instances[index].position;
+            for(const auto& o : observers)
+            {
+                const float dx = p[0] - o[0];
+                const float dy = p[1] - o[1];
+                const float dz = p[2] - o[2];
+                if(dx * dx + dy * dy + dz * dz <= radius_sq)
+                {
+                    is_near = true;
+                    break;
+                }
+            }
+        }
+        if(is_near) near_set.push_back(index);
+        else plan.freeze.push_back(index);
+    }
+    if(near_set.empty())
+    {
+        cursor = 0;
+        return plan;
+    }
+    const size_t budget = policy.max_updates_per_frame == 0
+                              ? near_set.size()
+                              : std::min<size_t>(near_set.size(), policy.max_updates_per_frame);
+    cursor %= near_set.size();
+    plan.update.reserve(budget);
+    for(size_t k = 0; k < budget; ++k) plan.update.push_back(near_set[(cursor + k) % near_set.size()]);
+    plan.deferred = near_set.size() - budget;
+    cursor = budget < near_set.size() ? (cursor + budget) % near_set.size() : 0;
+    return plan;
+}
 } // namespace unravel

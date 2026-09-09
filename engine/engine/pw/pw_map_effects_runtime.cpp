@@ -1208,6 +1208,15 @@ struct pw_map_effects_runtime::implementation
     std::vector<std::vector<native_element*>> elements;
     size_t instance_index = 0;
     size_t element_index = 0;
+    // Per-frame simulation policy: only instances near an observer simulate, within a budget.
+    pw_effect_update_policy policy;
+    std::vector<std::array<float, 3>> observers;
+    size_t update_cursor = 0;
+    pw_effect_update_plan last_plan;
+    std::vector<uint8_t> frozen;       // per instance: geometry already cleared while far
+    std::vector<float> pending_delta;  // per instance: time not yet simulated (budget deferral)
+    entity_index entity_cache;         // uuid -> handle, rebuilt only when a lookup goes stale
+    const entt::registry* cached_registry = nullptr;
 };
 
 pw_map_effects_runtime::pw_map_effects_runtime() : impl_(std::make_unique<implementation>()) {}
@@ -1319,29 +1328,73 @@ void pw_map_effects_runtime::update(rtti::context& context, float delta_seconds)
     auto& current_scene = context.get_cached<ecs>().get_scene();
     try
     {
-        entity_index entities;
-        const auto view = current_scene.registry->view<id_component>();
-        entities.reserve(view.size());
-        for(const auto entity : view)
-            entities.emplace(view.get<id_component>(entity).id, entt::handle{*current_scene.registry, entity});
-        for(const auto& instance_elements : impl_->elements)
-            for(const auto* element : instance_elements)
+        const size_t count = std::min(impl_->programs.size(), impl_->prepared.instances.size());
+        impl_->frozen.resize(count, 0);
+        impl_->pending_delta.resize(count, 0.0f);
+
+        // The uuid index is rebuilt at most once per frame, and only when a lookup finds a dead handle
+        // or the registry changed. Building it every frame over the whole scene was a per-frame O(N).
+        auto& entities = impl_->entity_cache;
+        bool rebuilt = false;
+        const auto rebuild_index = [&]
+        {
+            entities.clear();
+            const auto view = current_scene.registry->view<id_component>();
+            entities.reserve(view.size());
+            for(const auto entity : view)
+                entities.emplace(view.get<id_component>(entity).id, entt::handle{*current_scene.registry, entity});
+            impl_->cached_registry = current_scene.registry.get();
+            rebuilt = true;
+        };
+        if(impl_->cached_registry != current_scene.registry.get()) rebuild_index();
+        const auto resolve = [&](const hpp::uuid& id) -> entt::handle
+        {
+            auto entity = resolve_entity(entities, id);
+            if(entity && entity.valid()) return entity;
+            if(rebuilt) return entt::handle{};
+            rebuild_index();
+            entity = resolve_entity(entities, id);
+            return entity && entity.valid() ? entity : entt::handle{};
+        };
+        const auto clear_instance = [&](size_t index, bool configure)
+        {
+            for(const auto* element : impl_->elements[index])
             {
-                const auto entity = resolve_entity(entities, element->entity_id);
+                const auto entity = resolve(element->entity_id);
                 if(!entity) continue;
                 auto& geometry = entity.get_or_emplace<pw_effect_geometry_component>();
                 geometry.triangles.clear();
                 geometry.quads.clear();
                 geometry.ribbons.clear();
-                configure_geometry(geometry, *element, 0);
+                if(configure) configure_geometry(geometry, *element, 0);
                 for(const auto& id : element->model_entities)
                 {
-                    const auto part = resolve_entity(entities, id);
+                    const auto part = resolve(id);
                     if(part) part.get_or_emplace<pw_effect_geometry_component>().triangles.clear();
                 }
             }
-        for(size_t index = 0; index < impl_->programs.size(); ++index)
+        };
+
+        impl_->last_plan = plan_pw_effect_updates(impl_->prepared.instances, impl_->observers, impl_->policy,
+                                                  impl_->update_cursor);
+        std::vector<uint8_t> updated(count, 0);
+        for(const size_t index : impl_->last_plan.freeze)
         {
+            if(index >= count) continue;
+            updated[index] = 1;
+            impl_->pending_delta[index] = 0.0f;
+            if(impl_->frozen[index]) continue;
+            clear_instance(index, false);
+            impl_->frozen[index] = 1;
+        }
+        for(const size_t index : impl_->last_plan.update)
+        {
+            if(index >= count) continue;
+            updated[index] = 1;
+            clear_instance(index, true);
+            impl_->frozen[index] = 0;
+            const float step = std::min(impl_->pending_delta[index], 1.0f) + delta_seconds;
+            impl_->pending_delta[index] = 0.0f;
             const auto& instance = impl_->prepared.instances[index];
             const float factor = impl_->prepared.day_night_factor;
             if(instance.valid_time != 2 && !((instance.valid_time == 0 && factor < 0.5f) ||
@@ -1353,11 +1406,23 @@ void pw_map_effects_runtime::update(rtti::context& context, float delta_seconds)
             frame.scale = instance.scale * instance.document.default_scale;
             frame.alpha = instance.alpha * instance.document.default_alpha;
             draw_program(*impl_->programs[index], *impl_->states[index], entities, frame,
-                         delta_seconds * instance.speed * instance.document.default_speed);
+                         step * instance.speed * instance.document.default_speed);
         }
+        // Near instances the budget postponed keep last frame's geometry and accumulate time.
+        for(size_t index = 0; index < count; ++index)
+            if(!updated[index]) impl_->pending_delta[index] += delta_seconds;
     }
     catch(const std::exception& error) { impl_->failure = error.what(); }
 }
+
+void pw_map_effects_runtime::set_observers(std::vector<std::array<float, 3>> observers)
+{
+    impl_->observers = std::move(observers);
+}
+
+void pw_map_effects_runtime::set_update_policy(const pw_effect_update_policy& policy) { impl_->policy = policy; }
+
+auto pw_map_effects_runtime::last_update_plan() const -> const pw_effect_update_plan& { return impl_->last_plan; }
 
 void pw_map_effects_runtime::destroy(rtti::context& context)
 {

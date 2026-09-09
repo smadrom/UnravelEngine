@@ -152,6 +152,30 @@ auto poll_pw_effect_textures(asset_manager& manager, const std::string& content_
 
 enum class pw_effect_stage { waiting, ready, failed };
 
+/** Per-frame simulation policy for placed effects. Distances are metres in map space. */
+struct pw_effect_update_policy
+{
+    /** Instances farther than this from every observer are frozen and hidden. <= 0 disables culling. */
+    float update_radius = 200.0f;
+    /** Upper bound on instances simulated in one frame; 0 means unlimited. Near instances rotate fairly. */
+    uint32_t max_updates_per_frame = 128;
+};
+
+struct pw_effect_update_plan
+{
+    /** Instance indices to simulate this frame. */
+    std::vector<size_t> update;
+    /** Instances outside the radius: geometry is cleared once, state is kept. */
+    std::vector<size_t> freeze;
+    /** Near instances postponed to a later frame by the budget. */
+    size_t deferred = 0;
+};
+
+/** Pure planning step without engine access. `cursor` persists across frames for round-robin fairness. */
+auto plan_pw_effect_updates(const std::vector<pw_effect_instance>& instances,
+                            const std::vector<std::array<float, 3>>& observers,
+                            const pw_effect_update_policy& policy, size_t& cursor) -> pw_effect_update_plan;
+
 /** Map-owned native effect runtime. Candidate creation stays inactive until its owner is published. */
 class pw_map_effects_runtime
 {
@@ -170,6 +194,11 @@ public:
                std::vector<std::string>& generated_mesh_keys) -> pw_effect_stage;
     /** Advance authored timelines/particles after publication. Never performs asset loading. */
     void update(rtti::context& context, float delta_seconds);
+    /** Observer positions (cameras) for distance culling in the next update; empty simulates everything. */
+    void set_observers(std::vector<std::array<float, 3>> observers);
+    void set_update_policy(const pw_effect_update_policy& policy);
+    /** Plan applied by the most recent update, for diagnostics. */
+    auto last_update_plan() const -> const pw_effect_update_plan&;
     /** Remove only entities/resources created by this runtime; safe after parent cleanup. */
     void destroy(rtti::context& context);
     auto error() const -> const std::string&;

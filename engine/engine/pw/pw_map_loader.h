@@ -99,6 +99,9 @@ public:
         uint32_t ecmodels_created = 0;
         uint32_t effects_total = 0;
         uint32_t effects_created = 0;
+        uint32_t effects_updated = 0;   // simulated in the last frame
+        uint32_t effects_frozen = 0;    // outside the update radius of every observer
+        uint32_t effects_deferred = 0;  // near, but postponed by the per-frame budget
         std::vector<std::string> ready_effect_ids;
         std::vector<std::string> ready_grass_ids;
         std::vector<std::string> ready_ecmodel_ids;
@@ -223,6 +226,9 @@ public:
     auto get_login_terrain() const -> const terrain_heightfield&;
     auto get_login_scene_config() const -> login_scene_config;
     auto get_login_content_root() const -> const std::string&;
+    /** Extra observer for effect distance culling (the editor's Scene camera lives outside the game scene).
+     *  Pass nullptr to clear. Scene cameras are always observers. */
+    void set_effect_observer(const math::vec3* position);
 private:
     friend struct pw_map_loader_test_access;
     void update_map_effects(rtti::context& ctx, delta_t dt);
@@ -303,6 +309,8 @@ private:
     auto active_state() const -> const login_loader&;
     login_loader login_;
     std::unique_ptr<login_loader> previous_;
+    bool has_effect_observer_ = false;
+    math::vec3 effect_observer_{};
     std::unique_ptr<play_checkpoint> play_checkpoint_;
     bool play_session_ = false;
     tpp::job_future<login_loader> preparation_;
