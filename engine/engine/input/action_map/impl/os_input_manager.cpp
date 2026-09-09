@@ -77,7 +77,24 @@ void os_input_manager::before_events_update()
     mouse_->update();
 
     auto pos = os::mouse::get_position();
-    mouse_->set_position(remap_to_work_zone({pos.x, pos.y}));
+    const auto remapped = remap_to_work_zone({pos.x, pos.y});
+    // The cursor position is polled globally, so the Mouse X/Y axes must only carry deltas
+    // while the pointer is inside the work zone or a drag that started there is still held.
+    // Otherwise a camera keeps following a pointer that left the game view or the window.
+    const bool dragging = mouse_->get_left_button_state() == button_state::down ||
+                          mouse_->get_left_button_state() == button_state::pressed ||
+                          mouse_->get_right_button_state() == button_state::down ||
+                          mouse_->get_right_button_state() == button_state::pressed ||
+                          mouse_->get_middle_button_state() == button_state::down ||
+                          mouse_->get_middle_button_state() == button_state::pressed;
+    if(dragging || is_inside_work_zone(remapped))
+    {
+        mouse_->set_position(remapped);
+    }
+    else
+    {
+        mouse_->set_position_silent(remapped);
+    }
 }
 
 void os_input_manager::after_events_update()
@@ -192,7 +209,9 @@ void os_input_manager::on_os_event(const os::event& e)
                     break;
             }
 
-            if(is_inside_work_zone(mouse_->get_position()))
+            // Presses only count inside the work zone; releases must always be applied, or a
+            // button released outside the zone stays "down" and the drag never ends.
+            if(state == button_state::released || is_inside_work_zone(mouse_->get_position()))
             {
                 state_map.set_state(static_cast<uint32_t>(mouse_button), state);
             }

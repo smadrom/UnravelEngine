@@ -198,7 +198,7 @@ add_custom_target(engine_data
                   ALL
                   COMMAND ${CMAKE_COMMAND} -E copy ${BGFX_DIR}/src/bgfx_shader.sh ${PROJECT_SOURCE_DIR}/engine_data/data/shaders
                   COMMAND ${CMAKE_COMMAND} -E copy ${BGFX_DIR}/src/bgfx_compute.sh ${PROJECT_SOURCE_DIR}/engine_data/data/shaders
-                  COMMAND ${CMAKE_COMMAND} -E copy_directory ${PROJECT_SOURCE_DIR}/engine_data ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/data/engine
+                  COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different ${PROJECT_SOURCE_DIR}/engine_data ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/data/engine
 
                   SOURCES ${SOURCES}
                   COMMENT "Copying engine data..."
@@ -210,7 +210,7 @@ add_custom_target(engine_data
 file(GLOB_RECURSE SOURCES ${PROJECT_SOURCE_DIR}/editor_data/data/shaders/* )
 add_custom_target(editor_data
                   ALL
-                  COMMAND ${CMAKE_COMMAND} -E copy_directory ${PROJECT_SOURCE_DIR}/editor_data ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/data/editor
+                  COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different ${PROJECT_SOURCE_DIR}/editor_data ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/data/editor
 
                   SOURCES
                   ${SOURCES}

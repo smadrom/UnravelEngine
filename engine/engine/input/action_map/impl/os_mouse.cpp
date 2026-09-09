@@ -107,6 +107,13 @@ void os_mouse::set_position(coord pos)
 }
 
 //  ----------------------------------------------------------------------------
+void os_mouse::set_position_silent(coord pos)
+{
+    // Track the pointer without producing axis deltas (pointer outside the work zone).
+    position_ = pos;
+}
+
+//  ----------------------------------------------------------------------------
 void os_mouse::set_scroll(float scroll)
 {
     axis_map_[int(mouse_axis::scroll)] = scroll - scroll_;

@@ -27,6 +27,7 @@ public:
     auto is_released(uint32_t button) const -> bool override;
 
     void set_position(coord pos);
+    void set_position_silent(coord pos);
     void set_scroll(float scroll);
     void update();    
 };
