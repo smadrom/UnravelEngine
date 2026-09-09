@@ -28,6 +28,7 @@ void register_ui_event_script_bindings();
 void register_assets_script_bindings();
 void register_input_script_bindings();
 void register_physics_script_bindings();
+void register_pw_map_script_bindings();
 void register_ik_script_bindings();
 void register_gizmos_script_bindings();
 void register_math_script_bindings();
