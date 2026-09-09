@@ -58,3 +58,7 @@ docs/_site/
 docs/_generated/
 
 tasks/
+
+# local PW probe artifacts
+artifacts/
+pw_fake_env_probe.json
